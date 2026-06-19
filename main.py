@@ -118,7 +118,7 @@ def get_prices(symbols):
 
 async def monitor():
 
-    symbols = get_symbols()
+    global signal_count
 
     send_message("✅ Бот запущен", config.CHAT_ID)
 
@@ -128,8 +128,9 @@ async def monitor():
 
             now = time.time()
 
+            # Обновляем список монет Bybit
             symbols = get_symbols()
-            
+
             prices = get_prices(symbols)
 
             for sym, price in prices.items():
@@ -165,34 +166,27 @@ async def monitor():
 
                     if change > 0:
 
-                        global signal_count
-
-send_message(
-    f"🚀 РОСТ\n\n"
-    f"🪙 Монета: {sym}\n"
-    f"💰 Цена: {price}\n"
-    f"📈 Изменение: +{change:.2f}%\n"
-    f"⏱ Период: {current_window // 60} мин",
-    config.CHAT_ID
-)
-
-signal_count += 1
+                        send_message(
+                            f"🚀 РОСТ\n\n"
+                            f"🪙 Монета: {sym}\n"
+                            f"💰 Цена: {price}\n"
+                            f"📈 Изменение: +{change:.2f}%\n"
+                            f"⏱ Период: {current_window // 60} мин",
+                            config.CHAT_ID
+                        )
 
                     else:
 
-                        global signal_count
+                        send_message(
+                            f"📉 ПАДЕНИЕ\n\n"
+                            f"🪙 Монета: {sym}\n"
+                            f"💰 Цена: {price}\n"
+                            f"📉 Изменение: {change:.2f}%\n"
+                            f"⏱ Период: {current_window // 60} мин",
+                            config.CHAT_ID
+                        )
 
-send_message(
-    f"📉 ПАДЕНИЕ\n\n"
-    f"🪙 Монета: {sym}\n"
-    f"💰 Цена: {price}\n"
-    f"📉 Изменение: {change:.2f}%\n"
-    f"⏱ Период: {current_window // 60} мин",
-    config.CHAT_ID
-)
-
-signal_count += 1
-
+                    signal_count += 1
                     last_alert[sym] = now
 
             await asyncio.sleep(60)
@@ -202,7 +196,6 @@ signal_count += 1
             print("Ошибка monitor:", e)
 
             await asyncio.sleep(60)
-
 
 def get_updates():
     global offset
@@ -251,17 +244,20 @@ def handle_message(msg):
             f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
             chat_id
         )
-elif text == "/stats":
 
-    send_message(
-        f"📊 Статистика\n\n"
-        f"🪙 Монет отслеживается: {len(price_history)}\n"
-        f"📈 Порог: {current_percent}%\n"
-        f"⏱ Период: {current_window // 60} мин\n"
-        f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин\n"
-        f"📨 Отправлено сигналов: {signal_count}",
-        chat_id
-    )
+    elif text == "/stats":
+
+        send_message(
+            f"📊 Статистика\n\n"
+            f"🪙 Монет отслеживается: {len(price_history)}\n"
+            f"📈 Порог: {current_percent}%\n"
+            f"⏱ Период: {current_window // 60} мин\n"
+            f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин\n"
+            f"📨 Отправлено сигналов: {signal_count}",
+            chat_id
+        )
+
+
 def handle_callback(callback):
 
     global current_percent
@@ -297,7 +293,10 @@ def handle_callback(callback):
             "reply_markup": get_keyboard()
         }
     )
+
+
 async def telegram_loop():
+
     global offset
 
     while True:
@@ -316,7 +315,9 @@ async def telegram_loop():
 
         await asyncio.sleep(1)
 
+
 async def main():
+
     await asyncio.gather(
         monitor(),
         telegram_loop()
