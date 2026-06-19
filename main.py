@@ -1,17 +1,8 @@
 import asyncio
-import time
 import requests
 from bs4 import BeautifulSoup
 
-import config
-
-from telegram import (
-    Bot,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update
-)
-
+from telegram import Bot, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,194 +10,157 @@ from telegram.ext import (
     ContextTypes
 )
 
+import config
+
+BOT = Bot(token=config.BOT_TOKEN)
+
 price_history = {}
 last_alert = {}
 
 current_percent = config.PERCENT
 current_window = config.WINDOW
 
-bot = Bot(token=config.BOT_TOKEN)
 
+# -------------------- TELEGRAM UI --------------------
 
 def get_keyboard():
-    keyboard = [
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("5%", callback_data="p_5"),
             InlineKeyboardButton("10%", callback_data="p_10"),
-            InlineKeyboardButton("15%", callback_data="p_15")
+            InlineKeyboardButton("15%", callback_data="p_15"),
         ],
         [
             InlineKeyboardButton("20%", callback_data="p_20"),
             InlineKeyboardButton("25%", callback_data="p_25"),
-            InlineKeyboardButton("30%", callback_data="p_30")
+            InlineKeyboardButton("30%", callback_data="p_30"),
         ],
         [
-            InlineKeyboardButton("15 мин", callback_data="t_15m"),
-            InlineKeyboardButton("30 мин", callback_data="t_30m")
+            InlineKeyboardButton("15m", callback_data="t_15m"),
+            InlineKeyboardButton("30m", callback_data="t_30m"),
+            InlineKeyboardButton("1h", callback_data="t_1h"),
         ],
         [
-            InlineKeyboardButton("1 час", callback_data="t_1h"),
-            InlineKeyboardButton("2 часа", callback_data="t_2h"),
-            InlineKeyboardButton("4 часа", callback_data="t_4h")
+            InlineKeyboardButton("2h", callback_data="t_2h"),
+            InlineKeyboardButton("4h", callback_data="t_4h"),
         ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    text = (
-        "✅ Бот запущен\n\n"
-        f"Рост: {current_percent}%\n"
-        f"Период: {current_window // 60} мин"
-    )
-
     await update.message.reply_text(
-        text,
+        f"🚀 Бот запущен\n\nРост: {current_percent}%\nПериод: {current_window//60} мин",
         reply_markup=get_keyboard()
     )
 
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global current_percent, current_window
 
-    global current_percent
-    global current_window
+    q = update.callback_query
+    await q.answer()
 
-    query = update.callback_query
-
-    await query.answer()
-
-    data = query.data
+    data = q.data
 
     if data.startswith("p_"):
         current_percent = int(data.split("_")[1])
 
-    elif data.startswith("t_"):
-        key = data.split("_")[1]
-        current_window = config.WINDOWS[key]
+    if data.startswith("t_"):
+        current_window = config.WINDOWS[data.split("_")[1]]
 
-    await query.edit_message_text(
-        text=(
-            f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин"
-        ),
+    await q.edit_message_text(
+        f"📊 Настройки\nРост: {current_percent}%\nПериод: {current_window//60} мин",
         reply_markup=get_keyboard()
     )
 
+
+# -------------------- MARKET --------------------
+
 def get_bybit_symbols():
     symbols = set()
-
     try:
-        response = requests.get(
-            "https://public.bybit.com/spot/",
-            timeout=20
-        )
+        r = requests.get("https://public.bybit.com/spot/", timeout=20)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        for link in soup.find_all("a"):
-            symbol = link.text.strip("/")
-
-            if symbol.endswith("USDT"):
-                symbols.add(symbol)
-
-        print("Монет Bybit:", len(symbols))
-
-    except Exception as e:
-        print("Ошибка Bybit:", e)
+        for a in soup.find_all("a"):
+            s = a.text.strip("/")
+            if s.endswith("USDT"):
+                symbols.add(s)
+    except:
+        pass
 
     return symbols
 
 
-def get_mexc_prices(bybit_symbols):
+def get_prices(symbols):
     prices = {}
 
     try:
-        response = requests.get(
-            "https://contract.mexc.com/api/v1/contract/ticker",
-            timeout=20
-        )
-
-        data = response.json()
+        r = requests.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=20)
+        data = r.json()
 
         if data["success"]:
-            for item in data["data"]:
-                symbol = item["symbol"].replace("_", "")
-
-                if symbol in bybit_symbols:
-                    prices[symbol] = float(item["lastPrice"])
-
-    except Exception as e:
-        print("Ошибка MEXC:", e)
+            for i in data["data"]:
+                sym = i["symbol"].replace("_", "")
+                if sym in symbols:
+                    prices[sym] = float(i["lastPrice"])
+    except:
+        pass
 
     return prices
 
 
+# -------------------- LOOP --------------------
+
 async def monitor():
-
-    global current_percent
-    global current_window
-
-    bybit_symbols = get_bybit_symbols()
+    symbols = get_bybit_symbols()
 
     while True:
+        now = asyncio.get_event_loop().time()
+        prices = get_prices(symbols)
 
-        try:
-            now = time.time()
+        for sym, price in prices.items():
 
-            prices = get_mexc_prices(bybit_symbols)
+            if sym not in price_history:
+                price_history[sym] = []
 
-            for symbol, price in prices.items():
+            price_history[sym].append((now, price))
 
-                if symbol not in price_history:
-                    price_history[symbol] = []
+            price_history[sym] = [
+                x for x in price_history[sym]
+                if now - x[0] <= current_window
+            ]
 
-                price_history[symbol].append((now, price))
+            if len(price_history[sym]) < 2:
+                continue
 
-                price_history[symbol] = [
-                    x for x in price_history[symbol]
-                    if now - x[0] <= current_window
-                ]
+            old = price_history[sym][0][1]
+            growth = ((price - old) / old) * 100
 
-                if len(price_history[symbol]) < 2:
+            if growth >= current_percent:
+
+                if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
                     continue
 
-                old_price = price_history[symbol][0][1]
+                await BOT.send_message(
+                    config.CHAT_ID,
+                    f"🚀 Сигнал\n{sym}\nРост: +{growth:.2f}%"
+                )
 
-                growth = ((price - old_price) / old_price) * 100
+                last_alert[sym] = now
 
-                if growth >= current_percent:
+        await asyncio.sleep(60)
 
-                    if symbol in last_alert:
-                        if now - last_alert[symbol] < config.COOLDOWN:
-                            continue
 
-                    await bot.send_message(
-                        chat_id=config.CHAT_ID,
-                        text=(
-                            f"🚀 Сигнал\n\n"
-                            f"Монета: {symbol}\n"
-                            f"Цена: {price}\n"
-                            f"Рост: +{growth:.2f}%\n"
-                            f"Период: {current_window // 60} мин"
-                        )
-                    )
+# -------------------- MAIN --------------------
 
-                    last_alert[symbol] = now
-
-            await asyncio.sleep(config.INTERVAL)
-
-        except Exception as e:
-            print("Ошибка:", e)
-            await asyncio.sleep(config.INTERVAL)
-
-async def post_init(application: Application):
+async def post_init(app):
     asyncio.create_task(monitor())
 
 
 def main():
-
     app = (
         Application.builder()
         .token(config.BOT_TOKEN)
@@ -217,9 +171,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button))
 
-    print("Бот запущен")
-
-    app.run_polling()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=8080,
+        url_path=config.BOT_TOKEN,
+        webhook_url=f"https://YOUR-RAILWAY-URL/{config.BOT_TOKEN}"
+    )
 
 
 if __name__ == "__main__":
