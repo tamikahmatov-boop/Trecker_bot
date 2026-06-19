@@ -166,37 +166,56 @@ async def monitor():
 
                     if change > 0:
 
-                        send_message(
-                            f"🚀 РОСТ\n\n"
-                            f"🪙 Монета: {sym}\n"
-                            f"💰 Цена: {price}\n"
-                            f"📈 Изменение: +{change:.2f}%\n"
-                            f"⏱ Период: {current_window // 60} мин",
-                            config.CHAT_ID
+                        requests.post(
+                            f"{URL}/sendMessage",
+                            json={
+                                "chat_id": config.CHAT_ID,
+                                "text":
+                                    f"🚀 РОСТ\n\n"
+                                    f"🪙 Монета: {sym}\n"
+                                    f"💰 Цена: {price}\n"
+                                    f"📈 Изменение: +{change:.2f}%\n"
+                                    f"⏱ Период: {current_window // 60} мин",
+                                "reply_markup": {
+                                    "inline_keyboard": [
+                                        [
+                                            {
+                                                "text": f"📈 Открыть {sym} на Bybit",
+                                                "url": f"https://www.bybit.com/trade/usdt/{sym}"
+                                            }
+                                        ]
+                                    ]
+                                }
+                            }
                         )
 
                     else:
 
-                        send_message(
-                            f"📉 ПАДЕНИЕ\n\n"
-                            f"🪙 Монета: {sym}\n"
-                            f"💰 Цена: {price}\n"
-                            f"📉 Изменение: {change:.2f}%\n"
-                            f"⏱ Период: {current_window // 60} мин",
-                            config.CHAT_ID
+                        requests.post(
+                            f"{URL}/sendMessage",
+                            json={
+                                "chat_id": config.CHAT_ID,
+                                "text":
+                                    f"📉 ПАДЕНИЕ\n\n"
+                                    f"🪙 Монета: {sym}\n"
+                                    f"💰 Цена: {price}\n"
+                                    f"📉 Изменение: {change:.2f}%\n"
+                                    f"⏱ Период: {current_window // 60} мин",
+                                "reply_markup": {
+                                    "inline_keyboard": [
+                                        [
+                                            {
+                                                "text": f"📈 Открыть {sym} на Bybit",
+                                                "url": f"https://www.bybit.com/trade/usdt/{sym}"
+                                            }
+                                        ]
+                                    ]
+                                }
+                            }
                         )
 
                     signal_count += 1
                     last_alert[sym] = now
-
-            await asyncio.sleep(60)
-
-        except Exception as e:
-
-            print("Ошибка monitor:", e)
-
-            await asyncio.sleep(60)
-
 def get_updates():
     global offset
 
