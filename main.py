@@ -93,5 +93,115 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏱ Период: {current_window // 60} мин"
         ),
         reply_markup=get_keyboard()
-    )
+    )```python
+def get_bybit_symbols():
+    symbols = set()
+
+    try:
+        response = requests.get(
+            "https://public.bybit.com/spot/",
+            timeout=20
+        )
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        for link in soup.find_all("a"):
+            symbol = link.text.strip("/")
+
+            if symbol.endswith("USDT"):
+                symbols.add(symbol)
+
+        print("Монет Bybit:", len(symbols))
+
+    except Exception as e:
+        print("Ошибка Bybit:", e)
+
+    return symbols
+
+
+def get_mexc_prices(bybit_symbols):
+    prices = {}
+
+    try:
+        response = requests.get(
+            "https://contract.mexc.com/api/v1/contract/ticker",
+            timeout=20
+        )
+
+        data = response.json()
+
+        if data["success"]:
+            for item in data["data"]:
+                symbol = item["symbol"].replace("_", "")
+
+                if symbol in bybit_symbols:
+                    prices[symbol] = float(item["lastPrice"])
+
+    except Exception as e:
+        print("Ошибка MEXC:", e)
+
+    return prices
+
+
+async def monitor():
+
+    global current_percent
+    global current_window
+
+    bybit_symbols = get_bybit_symbols()
+
+    while True:
+
+        try:
+            now = time.time()
+
+            prices = get_mexc_prices(bybit_symbols)
+
+            for symbol, price in prices.items():
+
+                if symbol not in price_history:
+                    price_history[symbol] = []
+
+                price_history[symbol].append((now, price))
+
+                price_history[symbol] = [
+                    x for x in price_history[symbol]
+                    if now - x[0] <= current_window
+                ]
+
+                if len(price_history[symbol]) < 2:
+                    continue
+
+                old_price = price_history[symbol][0][1]
+
+                growth = ((price - old_price) / old_price) * 100
+
+                if growth >= current_percent:
+
+                    if symbol in last_alert:
+                        if now - last_alert[symbol] < config.COOLDOWN:
+                            continue
+
+                    await bot.send_message(
+                        chat_id=config.CHAT_ID,
+                        text=(
+                            f"🚀 Сигнал\n\n"
+                            f"Монета: {symbol}\n"
+                            f"Цена: {price}\n"
+                            f"Рост: +{growth:.2f}%\n"
+                            f"Период: {current_window // 60} мин"
+                        )
+                    )
+
+                    last_alert[symbol] = now
+
+            await asyncio.sleep(config.INTERVAL)
+
+        except Exception as e:
+            print("Ошибка:", e)
+            await asyncio.sleep(config.INTERVAL)
 ```
+
+``` 
+
+
