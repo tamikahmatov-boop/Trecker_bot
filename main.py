@@ -331,32 +331,33 @@ async def telegram_loop():
 
         try:
 
-        updates = get_updates()
+            updates = get_updates()
 
-        for update in updates:
+            for update in updates:
 
-            offset = update["update_id"] + 1
+                offset = update["update_id"] + 1
 
-            if "message" in update:
-                handle_message(update["message"])
+                if "message" in update:
+                    handle_message(update["message"])
 
-            if "callback_query" in update:
-                handle_callback(update["callback_query"])
+                if "callback_query" in update:
+                    handle_callback(update["callback_query"])
 
-        await asyncio.sleep(1)
+            await asyncio.sleep(1)
 
-    except Exception as e:
+        except Exception as e:
 
-        print("Ошибка telegram_loop:", e)
+            print("Ошибка telegram_loop:", e)
 
-        await asyncio.sleep(5)
+            await asyncio.sleep(5)
+
 
 async def main():
 
-await asyncio.gather(
-    monitor(),
-    telegram_loop()
-)
+    await asyncio.gather(
+        monitor(),
+        telegram_loop()
+    )
 
 
 requests.get(f"{URL}/deleteWebhook")
