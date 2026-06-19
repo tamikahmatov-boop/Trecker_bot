@@ -1,86 +1,77 @@
+# bot.py
+
+```python
 import time
 import requests
+from bs4 import BeautifulSoup
 from telegram import Bot
 
-# Вставь свои данные
-BOT_TOKEN = "8626739818:AAFt7kmdfTgTVlXD-5FnKOVYq1fvNW9hUAw"
-CHAT_ID = "6716942872"
+# ВСТАВЬ СВОИ ДАННЫЕ
+BOT_TOKEN = "ТВОЙ_BOT_TOKEN"
+CHAT_ID = "ТВОЙ_CHAT_ID"
 
 bot = Bot(token=BOT_TOKEN)
 
-# Хранение истории цен за 5 минут
 price_history = {}
-
-# Монеты Bybit
-bybit_symbols = set()
+last_alert = {}
 
 
 def get_bybit_symbols():
-    global bybit_symbols
+    symbols = set()
 
     try:
-        url = "https://api.bybit.com/v5/market/instruments-info?category=spot&limit=1000"
-        response = requests.get(url, timeout=10)
+        url = "https://public.bybit.com/spot/"
+        response = requests.get(url, timeout=20)
 
-        if response.status_code != 200:
-            print("Ошибка Bybit:", response.text)
-            return
+        soup = BeautifulSoup(response.text, "html.parser")
 
-        data = response.json()
+        for link in soup.find_all("a"):
+            symbol = link.text.strip("/")
 
-        if data.get("retCode") == 0:
-            symbols = set()
-
-            for item in data["result"]["list"]:
-                symbol = item["symbol"]
-
-                if symbol.endswith("USDT"):
-                    symbols.add(symbol)
-
-            bybit_symbols = symbols
-            print("Загружено монет Bybit:", len(bybit_symbols))
+            if symbol.endswith("USDT"):
+                symbols.add(symbol)
 
     except Exception as e:
         print("Ошибка получения монет Bybit:", e)
 
+    return symbols
 
-def get_prices():
+
+def get_mexc_prices():
     prices = {}
 
     try:
         response = requests.get(
             "https://api.mexc.com/api/v3/ticker/price",
-            timeout=10
+            timeout=20
         )
-
-        if response.status_code != 200:
-            print("Ошибка MEXC:", response.text)
-            return prices
 
         data = response.json()
 
         for item in data:
-            symbol = item.get("symbol")
+            symbol = item["symbol"]
 
-            if symbol in bybit_symbols:
+            if symbol in BYBIT_SYMBOLS:
                 try:
                     prices[symbol] = float(item["price"])
                 except:
                     pass
 
     except Exception as e:
-        print("Ошибка получения цен:", e)
+        print("Ошибка MEXC:", e)
 
     return prices
 
 
-# Загружаем монеты Bybit один раз
-get_bybit_symbols()
+print("Загружаем список монет Bybit...")
+BYBIT_SYMBOLS = get_bybit_symbols()
+print("Монет найдено:", len(BYBIT_SYMBOLS))
 
 while True:
     try:
         now = time.time()
-        prices = get_prices()
+
+        prices = get_mexc_prices()
 
         for symbol, price in prices.items():
 
@@ -89,36 +80,45 @@ while True:
 
             price_history[symbol].append((now, price))
 
-            # оставляем только последние 5 минут
+            # история только за последние 5 минут
             price_history[symbol] = [
                 x for x in price_history[symbol]
                 if now - x[0] <= 300
             ]
 
-            if len(price_history[symbol]) > 1:
-                old_price = price_history[symbol][0][1]
+            if len(price_history[symbol]) < 2:
+                continue
 
-                growth = ((price - old_price) / old_price) * 100
+            old_price = price_history[symbol][0][1]
 
-                if growth >= 0.3:
+            growth = ((price - old_price) / old_price) * 100
 
-                    text = (
-                        f"🚀 Рост за 5 минут\n\n"
-                        f"Монета: {symbol}\n"
-                        f"Цена: {price}\n"
-                        f"Рост: +{growth:.2f}%"
+            if growth >= 0.3:
+
+                # защита от спама: не чаще одного сообщения в 10 минут
+                if symbol in last_alert:
+                    if now - last_alert[symbol] < 600:
+                        continue
+
+                text = (
+                    f"🚀 Рост за 5 минут\n\n"
+                    f"Монета: {symbol}\n"
+                    f"Цена: {price}\n"
+                    f"Рост: +{growth:.2f}%"
+                )
+
+                try:
+                    bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=text
                     )
 
-                    try:
-                        bot.send_message(
-                            chat_id=CHAT_ID,
-                            text=text
-                        )
-                    except Exception as e:
-                        print("Ошибка Telegram:", e)
+                    print(text)
 
-                    # сброс после отправки
-                    price_history[symbol] = [(now, price)]
+                    last_alert[symbol] = now
+
+                except Exception as e:
+                    print("Ошибка Telegram:", e)
 
         time.sleep(60)
 
