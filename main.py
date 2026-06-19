@@ -124,21 +124,35 @@ async def monitor():
 
                 growth = ((price - old) / old) * 100
 
-                if growth >= current_percent:
+                change = ((price - old) / old) * 100
 
-                    if sym in last_alert:
-                        if now - last_alert[sym] < config.COOLDOWN:
-                            continue
+if abs(change) >= current_percent:
 
-                    send_message(
-                        f"🚀 СИГНАЛ\n\n"
-                        f"Монета: {sym}\n"
-                        f"Цена: {price}\n"
-                        f"Рост: +{growth:.2f}%",
-                        config.CHAT_ID
-                    )
+    if sym in last_alert:
+        if now - last_alert[sym] < config.COOLDOWN:
+            continue
 
-                    last_alert[sym] = now
+    if change > 0:
+
+        send_message(
+            f"🚀 РОСТ\n\n"
+            f"Монета: {sym}\n"
+            f"Цена: {price}\n"
+            f"Изменение: +{change:.2f}%",
+            config.CHAT_ID
+        )
+
+    else:
+
+        send_message(
+            f"📉 ПАДЕНИЕ\n\n"
+            f"Монета: {sym}\n"
+            f"Цена: {price}\n"
+            f"Изменение: {change:.2f}%",
+            config.CHAT_ID
+        )
+
+    last_alert[sym] = now
 
             await asyncio.sleep(60)
 
