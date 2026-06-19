@@ -280,10 +280,11 @@ def handle_callback(callback):
     global current_window
 
     data = callback["data"]
+
     chat_id = callback["message"]["chat"]["id"]
     message_id = callback["message"]["message_id"]
 
-    print("CALLBACK:", data)  # debug
+    print("CALLBACK:", data)
 
     # ===== процент =====
     if data.startswith("p_"):
@@ -299,7 +300,7 @@ def handle_callback(callback):
         json={"callback_query_id": callback["id"]}
     )
 
-    # обновляем сообщение
+    # обновляем сообщение с настройками
     requests.post(
         f"{URL}/editMessageText",
         json={
@@ -335,20 +336,5 @@ async def telegram_loop():
             await asyncio.sleep(1)
 
         except Exception as e:
-
-            print("Ошибка telegram_loop:", e)
-
+            print("telegram_loop error:", e)
             await asyncio.sleep(5)
-
-
-async def main():
-
-    await asyncio.gather(
-        monitor(),
-        telegram_loop()
-    )
-
-
-requests.get(f"{URL}/deleteWebhook")
-
-asyncio.run(main())
