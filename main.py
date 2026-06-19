@@ -1,59 +1,37 @@
 
 import time
 import requests
-from bs4 import BeautifulSoup
 from telegram import Bot
 
-# ВСТАВЬ СВОИ ДАННЫЕ
-BOT_TOKEN = "ТВОЙ_BOT_TOKEN"
-CHAT_ID = "ТВОЙ_CHAT_ID"
+BOT_TOKEN = "8626739818:AAFt7kmdfTgTVlXD-5FnKOVYq1fvNW9hUAw"
+CHAT_ID = "6716942872"
 
 bot = Bot(token=BOT_TOKEN)
 
 price_history = {}
 last_alert = {}
 
-
-def get_bybit_symbols():
-    symbols = set()
-
-    try:
-        url = "https://public.bybit.com/spot/"
-        response = requests.get(url, timeout=20)
-
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        for link in soup.find_all("a"):
-            symbol = link.text.strip("/")
-
-            if symbol.endswith("USDT"):
-                symbols.add(symbol)
-
-    except Exception as e:
-        print("Ошибка получения монет Bybit:", e)
-
-    return symbols
+PERCENT = 0.3      # рост в %
+INTERVAL = 60      # проверка каждую минуту
+WINDOW = 300       # 5 минут
+COOLDOWN = 600     # повторное уведомление через 10 минут
 
 
-def get_mexc_prices():
+def get_futures_prices():
     prices = {}
 
     try:
-        response = requests.get(
-            "https://api.mexc.com/api/v3/ticker/price",
-            timeout=20
-        )
-
+        url = "https://contract.mexc.com/api/v1/contract/ticker"
+        response = requests.get(url, timeout=20)
         data = response.json()
 
-        for item in data:
-            symbol = item["symbol"]
+        if data["success"]:
+            for item in data["data"]:
+                symbol = item["symbol"].replace("_", "")
+                price = float(item["lastPrice"])
 
-            if symbol in BYBIT_SYMBOLS:
-                try:
-                    prices[symbol] = float(item["price"])
-                except:
-                    pass
+                if symbol.endswith("USDT"):
+                    prices[symbol] = price
 
     except Exception as e:
         print("Ошибка MEXC:", e)
@@ -61,15 +39,13 @@ def get_mexc_prices():
     return prices
 
 
-print("Загружаем список монет Bybit...")
-BYBIT_SYMBOLS = get_bybit_symbols()
-print("Монет найдено:", len(BYBIT_SYMBOLS))
+print("Бот запущен")
 
 while True:
     try:
         now = time.time()
 
-        prices = get_mexc_prices()
+        prices = get_futures_prices()
 
         for symbol, price in prices.items():
 
@@ -78,10 +54,10 @@ while True:
 
             price_history[symbol].append((now, price))
 
-            # история только за последние 5 минут
+            # оставляем историю только за 5 минут
             price_history[symbol] = [
                 x for x in price_history[symbol]
-                if now - x[0] <= 300
+                if now - x[0] <= WINDOW
             ]
 
             if len(price_history[symbol]) < 2:
@@ -91,16 +67,15 @@ while True:
 
             growth = ((price - old_price) / old_price) * 100
 
-            if growth >= 0.3:
+            if growth >= PERCENT:
 
-                # защита от спама: не чаще одного сообщения в 10 минут
                 if symbol in last_alert:
-                    if now - last_alert[symbol] < 600:
+                    if now - last_alert[symbol] < COOLDOWN:
                         continue
 
                 text = (
                     f"🚀 Рост за 5 минут\n\n"
-                    f"Монета: {symbol}\n"
+                    f"Фьючерс: {symbol}\n"
                     f"Цена: {price}\n"
                     f"Рост: +{growth:.2f}%"
                 )
@@ -118,8 +93,8 @@ while True:
                 except Exception as e:
                     print("Ошибка Telegram:", e)
 
-        time.sleep(60)
+        time.sleep(INTERVAL)
 
     except Exception as e:
         print("Основная ошибка:", e)
-        time.sleep(60)
+        time.sleep(INTERVAL)
