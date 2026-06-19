@@ -259,12 +259,57 @@ def get_updates():
 
 
 def handle_message(msg):
+    global current_percent
+
     text = msg.get("text", "")
     chat_id = msg["chat"]["id"]
 
     if text == "/start":
-        send_message("🚀 Бот запущен (без webhook)", chat_id)
 
+        send_message(
+            f"🚀 Бот запущен\n\n"
+            f"Рост: {current_percent}%\n"
+            f"Период: {current_window // 60} мин\n\n"
+            f"Команды:\n"
+            f"/percent 0.3 - изменить процент\n"
+            f"/status - текущие настройки",
+            chat_id
+        )
+
+    elif text.startswith("/percent"):
+
+        try:
+            value = float(text.split()[1])
+
+            if value <= 0:
+                send_message(
+                    "❌ Процент должен быть больше 0",
+                    chat_id
+                )
+                return
+
+            current_percent = value
+
+            send_message(
+                f"✅ Новый процент: {current_percent}%",
+                chat_id
+            )
+
+        except:
+
+            send_message(
+                "Пример:\n/percent 0.3",
+                chat_id
+            )
+
+    elif text == "/status":
+
+        send_message(
+            f"📊 Настройки\n\n"
+            f"Рост: {current_percent}%\n"
+            f"Период: {current_window // 60} мин",
+            chat_id
+        )
 
 async def telegram_loop():
     global offset
