@@ -216,18 +216,19 @@ def handle_message(msg):
 
     if text == "/start":
 
-    requests.post(
-        f"{URL}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text":
-                f"🚀 Бот запущен\n\n"
-                f"📈 Порог: {current_percent}%\n"
-                f"⏱ Период: {current_window // 60} мин\n\n"
-                f"Выберите настройки:",
-            "reply_markup": get_keyboard()
-        }
-    )
+        requests.post(
+            f"{URL}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text":
+                    f"🚀 Бот запущен\n\n"
+                    f"📈 Порог: {current_percent}%\n"
+                    f"⏱ Период: {current_window // 60} мин\n\n"
+                    f"Выберите настройки:",
+                "reply_markup": get_keyboard()
+            }
+        )
+
     elif text == "/status":
 
         send_message(
@@ -237,7 +238,6 @@ def handle_message(msg):
             f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
             chat_id
         )
-
 def handle_callback(callback):
 
     global current_percent
@@ -287,10 +287,10 @@ async def telegram_loop():
             if "message" in update:
                 handle_message(update["message"])
 
-if "callback_query" in update:
-    handle_callback(update["callback_query"])
-        await asyncio.sleep(1)
+            if "callback_query" in update:
+                handle_callback(update["callback_query"])
 
+        await asyncio.sleep(1)
 
 async def main():
     await asyncio.gather(
