@@ -15,7 +15,37 @@ last_alert = {}
 current_percent = config.PERCENT
 current_window = config.WINDOW
 
+def get_keyboard():
 
+    keyboard = []
+
+    row = []
+
+    for i in range(1, 31):
+
+        row.append({
+            "text": f"{i}%",
+            "callback_data": f"p_{i}"
+        })
+
+        if len(row) == 5:
+            keyboard.append(row)
+            row = []
+
+    keyboard.append([
+        {"text": "15 мин", "callback_data": "w_15"},
+        {"text": "30 мин", "callback_data": "w_30"},
+        {"text": "1 час", "callback_data": "w_60"}
+    ])
+
+    keyboard.append([
+        {"text": "2 часа", "callback_data": "w_120"},
+        {"text": "4 часа", "callback_data": "w_240"}
+    ])
+
+    return {
+        "inline_keyboard": keyboard
+    }
 def send_message(text, chat_id):
     try:
         requests.post(
@@ -186,14 +216,18 @@ def handle_message(msg):
 
     if text == "/start":
 
-        send_message(
-            f"🚀 Бот запущен\n\n"
-            f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n\n"
-            f"/status - настройки",
-            chat_id
-        )
-
+    requests.post(
+        f"{URL}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text":
+                f"🚀 Бот запущен\n\n"
+                f"📈 Порог: {current_percent}%\n"
+                f"⏱ Период: {current_window // 60} мин\n\n"
+                f"Выберите настройки:",
+            "reply_markup": get_keyboard()
+        }
+    )
     elif text == "/status":
 
         send_message(
@@ -204,7 +238,41 @@ def handle_message(msg):
             chat_id
         )
 
+def handle_callback(callback):
 
+    global current_percent
+    global current_window
+
+    data = callback["data"]
+
+    chat_id = callback["message"]["chat"]["id"]
+    message_id = callback["message"]["message_id"]
+
+    if data.startswith("p_"):
+        current_percent = float(data.split("_")[1])
+
+    elif data.startswith("w_"):
+        current_window = int(data.split("_")[1]) * 60
+
+    requests.post(
+        f"{URL}/answerCallbackQuery",
+        json={
+            "callback_query_id": callback["id"]
+        }
+    )
+
+    requests.post(
+        f"{URL}/editMessageText",
+        json={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text":
+                f"⚙ Настройки\n\n"
+                f"📈 Порог: {current_percent}%\n"
+                f"⏱ Период: {current_window // 60} мин",
+            "reply_markup": get_keyboard()
+        }
+    )
 async def telegram_loop():
     global offset
 
@@ -219,6 +287,8 @@ async def telegram_loop():
             if "message" in update:
                 handle_message(update["message"])
 
+if "callback_query" in update:
+    handle_callback(update["callback_query"])
         await asyncio.sleep(1)
 
 
