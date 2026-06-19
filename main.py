@@ -326,9 +326,11 @@ def handle_callback(callback):
 
 async def telegram_loop():
 
-    global offset
+global offset
 
-    while True:
+while True:
+
+    try:
 
         updates = get_updates()
 
@@ -344,6 +346,12 @@ async def telegram_loop():
 
         await asyncio.sleep(1)
 
+    except Exception as e:
+
+        print("Ошибка telegram_loop:", e)
+
+        await asyncio.sleep(5)
+```
 
 async def main():
 
