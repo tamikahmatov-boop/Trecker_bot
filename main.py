@@ -164,6 +164,7 @@ async def monitor():
                         if now - last_alert[sym] < config.COOLDOWN:
                             continue
 
+                    # ===== РОСТ =====
                     if change > 0:
 
                         requests.post(
@@ -189,6 +190,7 @@ async def monitor():
                             }
                         )
 
+                    # ===== ПАДЕНИЕ =====
                     else:
 
                         requests.post(
@@ -216,6 +218,14 @@ async def monitor():
 
                     signal_count += 1
                     last_alert[sym] = now
+
+            await asyncio.sleep(60)
+
+        except Exception as e:
+
+            print("Ошибка monitor:", e)
+            await asyncio.sleep(60)
+            
 def get_updates():
     global offset
 
