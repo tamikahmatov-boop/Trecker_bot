@@ -14,36 +14,6 @@ last_alert = {}
 
 current_percent = config.PERCENT
 current_window = config.WINDOW
-def get_keyboard():
-    keyboard = []
-
-    row = []
-
-    for i in range(1, 31):
-
-        row.append({
-            "text": f"{i}%",
-            "callback_data": f"p_{i}"
-        })
-
-        if len(row) == 5:
-            keyboard.append(row)
-            row = []
-
-    keyboard.append([
-        {"text": "15 мин", "callback_data": "w_15"},
-        {"text": "30 мин", "callback_data": "w_30"},
-        {"text": "1 час", "callback_data": "w_60"}
-    ])
-
-    keyboard.append([
-        {"text": "2 часа", "callback_data": "w_120"},
-        {"text": "4 часа", "callback_data": "w_240"}
-    ])
-
-    return {
-        "inline_keyboard": keyboard
-    } 
 
 
 def send_message(text, chat_id):
@@ -196,20 +166,11 @@ def get_updates():
         return []
 
 
-if text == "/start":
+def handle_message(msg):
+    text = msg.get("text", "")
+    chat_id = msg["chat"]["id"]
 
-    requests.post(
-        f"{URL}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text":
-                f"🚀 Бот запущен\n\n"
-                f"📈 Рост: {current_percent}%\n"
-                f"⏱ Период: {current_window // 60} мин\n\n"
-                f"Выбери настройки:",
-            "reply_markup": get_keyboard()
-        }
-    )
+    if text == "/start":
 
         send_message(
             f"🚀 Бот запущен\n\n"
