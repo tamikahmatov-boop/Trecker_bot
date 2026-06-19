@@ -1,18 +1,12 @@
 import asyncio
+import time
 import requests
-from bs4 import BeautifulSoup
-
-from telegram import Bot, Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes
-)
+from aiohttp import web
 
 import config
 
-BOT = Bot(token=config.BOT_TOKEN)
+TOKEN = config.BOT_TOKEN
+URL = f"https://api.telegram.org/bot{TOKEN}"
 
 price_history = {}
 last_alert = {}
@@ -21,104 +15,77 @@ current_percent = config.PERCENT
 current_window = config.WINDOW
 
 
-# -------------------- TELEGRAM UI --------------------
+# ---------------- TELEGRAM ----------------
 
-def get_keyboard():
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("5%", callback_data="p_5"),
-            InlineKeyboardButton("10%", callback_data="p_10"),
-            InlineKeyboardButton("15%", callback_data="p_15"),
-        ],
-        [
-            InlineKeyboardButton("20%", callback_data="p_20"),
-            InlineKeyboardButton("25%", callback_data="p_25"),
-            InlineKeyboardButton("30%", callback_data="p_30"),
-        ],
-        [
-            InlineKeyboardButton("15m", callback_data="t_15m"),
-            InlineKeyboardButton("30m", callback_data="t_30m"),
-            InlineKeyboardButton("1h", callback_data="t_1h"),
-        ],
-        [
-            InlineKeyboardButton("2h", callback_data="t_2h"),
-            InlineKeyboardButton("4h", callback_data="t_4h"),
-        ]
-    ])
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🚀 Бот запущен\n\nРост: {current_percent}%\nПериод: {current_window//60} мин",
-        reply_markup=get_keyboard()
+def send_message(text):
+    requests.post(
+        f"{URL}/sendMessage",
+        json={
+            "chat_id": config.CHAT_ID,
+            "text": text
+        }
     )
 
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_percent, current_window
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text
+    }
 
-    q = update.callback_query
-    await q.answer()
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
 
-    data = q.data
-
-    if data.startswith("p_"):
-        current_percent = int(data.split("_")[1])
-
-    if data.startswith("t_"):
-        current_window = config.WINDOWS[data.split("_")[1]]
-
-    await q.edit_message_text(
-        f"📊 Настройки\nРост: {current_percent}%\nПериод: {current_window//60} мин",
-        reply_markup=get_keyboard()
-    )
+    requests.post(f"{URL}/editMessageText", json=payload)
 
 
-# -------------------- MARKET --------------------
+# ---------------- BYBIT SYMBOLS ----------------
 
-def get_bybit_symbols():
-    symbols = set()
+def get_symbols():
     try:
         r = requests.get("https://public.bybit.com/spot/", timeout=20)
+        from bs4 import BeautifulSoup
+
         soup = BeautifulSoup(r.text, "html.parser")
 
-        for a in soup.find_all("a"):
-            s = a.text.strip("/")
-            if s.endswith("USDT"):
-                symbols.add(s)
+        return {
+            a.text.strip("/")
+            for a in soup.find_all("a")
+            if a.text.strip("/").endswith("USDT")
+        }
     except:
-        pass
+        return set()
 
-    return symbols
 
+# ---------------- MEXC PRICES ----------------
 
 def get_prices(symbols):
-    prices = {}
-
     try:
         r = requests.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=20)
         data = r.json()
+
+        prices = {}
 
         if data["success"]:
             for i in data["data"]:
                 sym = i["symbol"].replace("_", "")
                 if sym in symbols:
                     prices[sym] = float(i["lastPrice"])
+
+        return prices
     except:
-        pass
-
-    return prices
+        return {}
 
 
-# -------------------- LOOP --------------------
+# ---------------- MONITOR ----------------
 
 async def monitor():
-    symbols = get_bybit_symbols()
+    symbols = get_symbols()
+    send_message("🚀 aiohttp бот запущен")
 
     while True:
-        now = asyncio.get_event_loop().time()
+        now = time.time()
         prices = get_prices(symbols)
 
         for sym, price in prices.items():
@@ -144,9 +111,8 @@ async def monitor():
                 if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
                     continue
 
-                await BOT.send_message(
-                    config.CHAT_ID,
-                    f"🚀 Сигнал\n{sym}\nРост: +{growth:.2f}%"
+                send_message(
+                    f"🚀 СИГНАЛ\n{sym}\nРост: +{growth:.2f}%"
                 )
 
                 last_alert[sym] = now
@@ -154,30 +120,33 @@ async def monitor():
         await asyncio.sleep(60)
 
 
-# -------------------- MAIN --------------------
+# ---------------- WEBHOOK HANDLER ----------------
 
-async def post_init(app):
+async def handle(request):
+    data = await request.json()
+
+    if "message" in data:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"].get("text", "")
+
+        if text == "/start":
+            send_message("🚀 Бот работает (aiohttp версия)")
+
+    return web.Response(text="OK")
+
+
+# ---------------- APP ----------------
+
+app = web.Application()
+app.router.add_post(f"/{TOKEN}", handle)
+
+
+async def start_background(app):
     asyncio.create_task(monitor())
 
 
-def main():
-    app = (
-        Application.builder()
-        .token(config.BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button))
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=8080,
-        url_path=config.BOT_TOKEN,
-        webhook_url=f"https://YOUR-RAILWAY-URL/{config.BOT_TOKEN}"
-    )
+app.on_startup.append(start_background)
 
 
 if __name__ == "__main__":
-    main()
+    web.run_app(app, host="0.0.0.0", port=8080)
