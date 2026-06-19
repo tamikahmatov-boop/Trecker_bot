@@ -19,7 +19,6 @@ current_window = config.WINDOW
 def get_keyboard():
 
     keyboard = []
-
     row = []
 
     for i in range(1, 31):
@@ -33,6 +32,9 @@ def get_keyboard():
             keyboard.append(row)
             row = []
 
+    if row:
+        keyboard.append(row)
+
     keyboard.append([
         {"text": "15 мин", "callback_data": "w_15"},
         {"text": "30 мин", "callback_data": "w_30"},
@@ -44,9 +46,7 @@ def get_keyboard():
         {"text": "4 часа", "callback_data": "w_240"}
     ])
 
-    return {
-        "inline_keyboard": keyboard
-    }
+    return {"inline_keyboard": keyboard}
 def send_message(text, chat_id):
     try:
         requests.post(
