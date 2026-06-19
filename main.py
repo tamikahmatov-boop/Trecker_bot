@@ -280,23 +280,26 @@ def handle_callback(callback):
     global current_window
 
     data = callback["data"]
-
     chat_id = callback["message"]["chat"]["id"]
     message_id = callback["message"]["message_id"]
 
-    if data.startswith("p_"):
-        current_percent = float(data.split("_")[1])
+    print("CALLBACK:", data)  # debug
 
+    # ===== процент =====
+    if data.startswith("p_"):
+        current_percent = int(data.split("_")[1])
+
+    # ===== время =====
     elif data.startswith("w_"):
         current_window = int(data.split("_")[1]) * 60
 
+    # ответ Telegram (обязательно)
     requests.post(
         f"{URL}/answerCallbackQuery",
-        json={
-            "callback_query_id": callback["id"]
-        }
+        json={"callback_query_id": callback["id"]}
     )
 
+    # обновляем сообщение
     requests.post(
         f"{URL}/editMessageText",
         json={
@@ -309,8 +312,6 @@ def handle_callback(callback):
             "reply_markup": get_keyboard()
         }
     )
-
-
 async def telegram_loop():
 
     global offset
