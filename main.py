@@ -122,39 +122,42 @@ async def monitor():
                 if old <= 0:
                     continue
 
-change = ((price - old) / old) * 100
+                change = ((price - old) / old) * 100
 
-if abs(change) >= current_percent:
+                if abs(change) >= current_percent:
 
-    if sym in last_alert:
-        if now - last_alert[sym] < config.COOLDOWN:
-            continue
+                    if sym in last_alert:
+                        if now - last_alert[sym] < config.COOLDOWN:
+                            continue
 
-    if change > 0:
+                    if change > 0:
 
-        send_message(
-            f"🚀 РОСТ\n\n"
-            f"Монета: {sym}\n"
-            f"Цена: {price}\n"
-            f"Изменение: +{change:.2f}%",
-            config.CHAT_ID
-        )
+                        send_message(
+                            f"🚀 РОСТ\n\n"
+                            f"Монета: {sym}\n"
+                            f"Цена: {price}\n"
+                            f"Изменение: +{change:.2f}%",
+                            config.CHAT_ID
+                        )
 
-    else:
+                    else:
 
-        send_message(
-            f"📉 ПАДЕНИЕ\n\n"
-            f"Монета: {sym}\n"
-            f"Цена: {price}\n"
-            f"Изменение: {change:.2f}%",
-            config.CHAT_ID
-        )
+                        send_message(
+                            f"📉 ПАДЕНИЕ\n\n"
+                            f"Монета: {sym}\n"
+                            f"Цена: {price}\n"
+                            f"Изменение: {change:.2f}%",
+                            config.CHAT_ID
+                        )
 
-    last_alert[sym] = now
+                    last_alert[sym] = now
+
             await asyncio.sleep(60)
 
         except Exception as e:
+
             print("Ошибка monitor:", e)
+
             await asyncio.sleep(60)
 
 
