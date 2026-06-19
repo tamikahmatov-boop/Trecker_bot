@@ -1,6 +1,4 @@
-# bot.py
 
-```python
 import time
 import requests
 from bs4 import BeautifulSoup
