@@ -7,7 +7,14 @@ BOT_TOKEN = "8626739818:AAFt7kmdfTgTVlXD-5FnKOVYq1fvNW9hUAw"
 CHAT_ID = "6716942872"
 
 bot = Bot(token=BOT_TOKEN)
-
+try:
+    bot.send_message(
+        chat_id=CHAT_ID,
+        text="✅ Тестовое уведомление\n\nБот успешно запущен и может отправлять сообщения."
+    )
+    print("Тестовое сообщение отправлено")
+except Exception as e:
+    print("Ошибка Telegram:", e)
 price_history = {}
 last_alert = {}
 
