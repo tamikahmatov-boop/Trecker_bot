@@ -330,9 +330,6 @@ async def telegram_loop():
                 if "message" in update:
                     handle_message(update["message"])
 
-                if "callback_query" in update:
-                    handle_callback(update["callback_query"])
-
             await asyncio.sleep(1)
 
         except Exception as e:
