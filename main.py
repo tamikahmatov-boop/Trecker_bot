@@ -162,6 +162,22 @@ async def monitor():
                         if now - last_alert[sym] < config.COOLDOWN:
                             continue
 
+                    # ===== КНОПКИ (БЕЗ ССЫЛОК) =====
+                    keyboard = {
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": f"📊 {sym}",
+                                    "callback_data": f"info_{sym}"
+                                },
+                                {
+                                    "text": "⚙ Настройки",
+                                    "callback_data": "settings"
+                                }
+                            ]
+                        ]
+                    }
+
                     # ===== РОСТ =====
                     if change > 0:
 
@@ -175,21 +191,7 @@ async def monitor():
                                     f"💰 Цена: {price}\n"
                                     f"📈 Изменение: +{change:.2f}%\n"
                                     f"⏱ Период: {current_window // 60} мин",
-
-                                "reply_markup": {
-                                    "inline_keyboard": [
-                                        [
-                                            {
-                                                "text": "📱 Bybit App",
-                                                "url": f"bybit://trade?symbol={sym}"
-                                            },
-                                            {
-                                                "text": "🌐 Web",
-                                                "url": f"https://www.bybit.com/trade/usdt/{sym}"
-                                            }
-                                        ]
-                                    ]
-                                }
+                                "reply_markup": keyboard
                             }
                         )
 
@@ -206,21 +208,7 @@ async def monitor():
                                     f"💰 Цена: {price}\n"
                                     f"📉 Изменение: {change:.2f}%\n"
                                     f"⏱ Период: {current_window // 60} мин",
-
-                                "reply_markup": {
-                                    "inline_keyboard": [
-                                        [
-                                            {
-                                                "text": "📱 Bybit App",
-                                                "url": f"bybit://trade?symbol={sym}"
-                                            },
-                                            {
-                                                "text": "🌐 Web",
-                                                "url": f"https://www.bybit.com/trade/usdt/{sym}"
-                                            }
-                                        ]
-                                    ]
-                                }
+                                "reply_markup": keyboard
                             }
                         )
 
@@ -229,6 +217,9 @@ async def monitor():
 
             await asyncio.sleep(60)
 
+        except Exception as e:
+            print("Ошибка monitor:", e)
+            await asyncio.sleep(60)
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(60)
