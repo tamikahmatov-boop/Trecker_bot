@@ -244,10 +244,13 @@ def get_updates():
 
 
 def handle_message(msg):
+
     text = msg.get("text", "")
     chat_id = msg["chat"]["id"]
 
-    if text == "/start":
+    print("MESSAGE:", text)  # debug
+
+    if text.startswith("/start"):
 
         requests.post(
             f"{URL}/sendMessage",
@@ -267,23 +270,9 @@ def handle_message(msg):
         send_message(
             f"📊 Настройки\n\n"
             f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n"
-            f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
+            f"⏱ Период: {current_window // 60} мин",
             chat_id
         )
-
-    elif text == "/stats":
-
-        send_message(
-            f"📊 Статистика\n\n"
-            f"🪙 Монет отслеживается: {len(price_history)}\n"
-            f"📈 Порог: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n"
-            f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин\n"
-            f"📨 Отправлено сигналов: {signal_count}",
-            chat_id
-        )
-
 
 def handle_callback(callback):
 
