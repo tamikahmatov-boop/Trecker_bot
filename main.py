@@ -1,4 +1,4 @@
-import asyncio
+mport asyncio
 import requests
 import time
 from bs4 import BeautifulSoup
@@ -11,42 +11,11 @@ offset = 0
 
 price_history = {}
 last_alert = {}
-signal_count = 0
 
 current_percent = config.PERCENT
 current_window = config.WINDOW
 
-def get_keyboard():
 
-    keyboard = []
-    row = []
-
-    for i in range(1, 31):
-
-        row.append({
-            "text": f"{i}%",
-            "callback_data": f"p_{i}"
-        })
-
-        if len(row) == 5:
-            keyboard.append(row)
-            row = []
-
-    if row:
-        keyboard.append(row)
-
-    keyboard.append([
-        {"text": "15 мин", "callback_data": "w_15"},
-        {"text": "30 мин", "callback_data": "w_30"},
-        {"text": "1 час", "callback_data": "w_60"}
-    ])
-
-    keyboard.append([
-        {"text": "2 часа", "callback_data": "w_120"},
-        {"text": "4 часа", "callback_data": "w_240"}
-    ])
-
-    return {"inline_keyboard": keyboard}
 def send_message(text, chat_id):
     try:
         requests.post(
@@ -118,7 +87,7 @@ def get_prices(symbols):
 
 async def monitor():
 
-    global signal_count
+    symbols = get_symbols()
 
     send_message("✅ Бот запущен", config.CHAT_ID)
 
@@ -128,7 +97,6 @@ async def monitor():
 
             now = time.time()
 
-            symbols = get_symbols()
             prices = get_prices(symbols)
 
             for sym, price in prices.items():
@@ -154,65 +122,22 @@ async def monitor():
                 if old <= 0:
                     continue
 
-                change = ((price - old) / old) * 100
+                growth = ((price - old) / old) * 100
 
-                if abs(change) >= current_percent:
+                if growth >= current_percent:
 
                     if sym in last_alert:
                         if now - last_alert[sym] < config.COOLDOWN:
                             continue
 
-                    # ===== КНОПКИ (БЕЗ ССЫЛОК) =====
-                    keyboard = {
-                        "inline_keyboard": [
-                            [
-                                {
-                                    "text": f"📊 {sym}",
-                                    "callback_data": f"info_{sym}"
-                                },
-                                {
-                                    "text": "⚙ Настройки",
-                                    "callback_data": "settings"
-                                }
-                            ]
-                        ]
-                    }
+                    send_message(
+                        f"🚀 СИГНАЛ\n\n"
+                        f"Монета: {sym}\n"
+                        f"Цена: {price}\n"
+                        f"Рост: +{growth:.2f}%",
+                        config.CHAT_ID
+                    )
 
-                    # ===== РОСТ =====
-                    if change > 0:
-
-                        requests.post(
-                            f"{URL}/sendMessage",
-                            json={
-                                "chat_id": config.CHAT_ID,
-                                "text":
-                                    f"🚀 РОСТ\n\n"
-                                    f"🪙 Монета: {sym}\n"
-                                    f"💰 Цена: {price}\n"
-                                    f"📈 Изменение: +{change:.2f}%\n"
-                                    f"⏱ Период: {current_window // 60} мин",
-                                "reply_markup": keyboard
-                            }
-                        )
-
-                    # ===== ПАДЕНИЕ =====
-                    else:
-
-                        requests.post(
-                            f"{URL}/sendMessage",
-                            json={
-                                "chat_id": config.CHAT_ID,
-                                "text":
-                                    f"📉 ПАДЕНИЕ\n\n"
-                                    f"🪙 Монета: {sym}\n"
-                                    f"💰 Цена: {price}\n"
-                                    f"📉 Изменение: {change:.2f}%\n"
-                                    f"⏱ Период: {current_window // 60} мин",
-                                "reply_markup": keyboard
-                            }
-                        )
-
-                    signal_count += 1
                     last_alert[sym] = now
 
             await asyncio.sleep(60)
@@ -220,10 +145,8 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(60)
-        except Exception as e:
-            print("Ошибка monitor:", e)
-            await asyncio.sleep(60)
-            
+
+
 def get_updates():
     global offset
 
@@ -244,25 +167,17 @@ def get_updates():
 
 
 def handle_message(msg):
-
     text = msg.get("text", "")
     chat_id = msg["chat"]["id"]
 
-    print("MESSAGE:", text)  # debug
+    if text == "/start":
 
-    if text.startswith("/start"):
-
-        requests.post(
-            f"{URL}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text":
-                    f"🚀 Бот запущен\n\n"
-                    f"📈 Порог: {current_percent}%\n"
-                    f"⏱ Период: {current_window // 60} мин\n\n"
-                    f"Выберите настройки:",
-                "reply_markup": get_keyboard()
-            }
+        send_message(
+            f"🚀 Бот запущен\n\n"
+            f"📈 Рост: {current_percent}%\n"
+            f"⏱ Период: {current_window // 60} мин\n\n"
+            f"/status - настройки",
+            chat_id
         )
 
     elif text == "/status":
@@ -270,68 +185,34 @@ def handle_message(msg):
         send_message(
             f"📊 Настройки\n\n"
             f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин",
+            f"⏱ Период: {current_window // 60} мин\n"
+            f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
             chat_id
         )
 
-def handle_callback(callback):
 
-    global current_percent
-    global current_window
-
-    data = callback["data"]
-
-    chat_id = callback["message"]["chat"]["id"]
-    message_id = callback["message"]["message_id"]
-
-    print("CALLBACK:", data)
-
-    # ===== процент =====
-    if data.startswith("p_"):
-        current_percent = int(data.split("_")[1])
-
-    # ===== время =====
-    elif data.startswith("w_"):
-        current_window = int(data.split("_")[1]) * 60
-
-    # ответ Telegram (обязательно)
-    requests.post(
-        f"{URL}/answerCallbackQuery",
-        json={"callback_query_id": callback["id"]}
-    )
-
-    # обновляем сообщение с настройками
-    requests.post(
-        f"{URL}/editMessageText",
-        json={
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text":
-                f"⚙ Настройки\n\n"
-                f"📈 Порог: {current_percent}%\n"
-                f"⏱ Период: {current_window // 60} мин",
-            "reply_markup": get_keyboard()
-        }
-    )
 async def telegram_loop():
-
     global offset
 
     while True:
 
-        try:
+        updates = get_updates()
 
-            updates = get_updates()
+        for update in updates:
 
-            for update in updates:
+            offset = update["update_id"] + 1
 
-                offset = update["update_id"] + 1
+            if "message" in update:
+                handle_message(update["message"])
 
-                if "message" in update:
-                    handle_message(update["message"])
+        await asyncio.sleep(1)
 
-            await asyncio.sleep(1)
 
-        except Exception as e:
-            print("telegram_loop error:", e)
-            await asyncio.sleep(5)
+async def main():
+    await asyncio.gather(
+        monitor(),
+        telegram_loop()
+    )
+
+
+asyncio.run(main())
