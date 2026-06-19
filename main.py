@@ -289,48 +289,47 @@ def handle_message(msg):
 
 def handle_callback(callback):
 
-    global current_percent
-    global current_window
+```
+global current_percent
+global current_window
 
-    data = callback["data"]
+data = callback["data"]
 
-    chat_id = callback["message"]["chat"]["id"]
-    message_id = callback["message"]["message_id"]
+chat_id = callback["message"]["chat"]["id"]
+message_id = callback["message"]["message_id"]
 
-    if data.startswith("p_"):
-        current_percent = float(data.split("_")[1])
+if data.startswith("p_"):
+    current_percent = float(data.split("_")[1])
 
-    elif data.startswith("w_"):
-        current_window = int(data.split("_")[1]) * 60
+elif data.startswith("w_"):
+    current_window = int(data.split("_")[1]) * 60
 
-    requests.post(
-        f"{URL}/answerCallbackQuery",
-        json={
-            "callback_query_id": callback["id"]
-        }
-    )
+requests.post(
+    f"{URL}/answerCallbackQuery",
+    json={
+        "callback_query_id": callback["id"]
+    }
+)
 
-    requests.post(
-        f"{URL}/editMessageText",
-        json={
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text":
-                f"⚙ Настройки\n\n"
-                f"📈 Порог: {current_percent}%\n"
-                f"⏱ Период: {current_window // 60} мин",
-            "reply_markup": get_keyboard()
-        }
-    )
-
-
+requests.post(
+    f"{URL}/editMessageText",
+    json={
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text":
+            f"⚙ Настройки\n\n"
+            f"📈 Порог: {current_percent}%\n"
+            f"⏱ Период: {current_window // 60} мин",
+        "reply_markup": get_keyboard()
+    }
+)
 async def telegram_loop():
 
-global offset
+    global offset
 
-while True:
+    while True:
 
-    try:
+        try:
 
         updates = get_updates()
 
@@ -351,14 +350,15 @@ while True:
         print("Ошибка telegram_loop:", e)
 
         await asyncio.sleep(5)
-```
 
 async def main():
 
-    await asyncio.gather(
-        monitor(),
-        telegram_loop()
-    )
+await asyncio.gather(
+    monitor(),
+    telegram_loop()
+)
 
+
+requests.get(f"{URL}/deleteWebhook")
 
 asyncio.run(main())
