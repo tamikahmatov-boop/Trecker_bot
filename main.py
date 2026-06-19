@@ -1,4 +1,3 @@
-```python
 import asyncio
 import time
 import requests
@@ -93,7 +92,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏱ Период: {current_window // 60} мин"
         ),
         reply_markup=get_keyboard()
-    )```python
+    )
+
 def get_bybit_symbols():
     symbols = set()
 
@@ -200,8 +200,27 @@ async def monitor():
         except Exception as e:
             print("Ошибка:", e)
             await asyncio.sleep(config.INTERVAL)
-```
 
-``` 
+async def post_init(application: Application):
+    asyncio.create_task(monitor())
 
 
+def main():
+
+    app = (
+        Application.builder()
+        .token(config.BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button))
+
+    print("Бот запущен")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
