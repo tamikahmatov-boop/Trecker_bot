@@ -122,9 +122,7 @@ async def monitor():
                 if old <= 0:
                     continue
 
-                growth = ((price - old) / old) * 100
-
-                change = ((price - old) / old) * 100
+change = ((price - old) / old) * 100
 
 if abs(change) >= current_percent:
 
@@ -153,7 +151,6 @@ if abs(change) >= current_percent:
         )
 
     last_alert[sym] = now
-
             await asyncio.sleep(60)
 
         except Exception as e:
