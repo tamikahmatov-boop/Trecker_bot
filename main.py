@@ -289,7 +289,6 @@ def handle_message(msg):
 
 def handle_callback(callback):
 
-```
 global current_percent
 global current_window
 
