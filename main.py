@@ -11,6 +11,7 @@ offset = 0
 
 price_history = {}
 last_alert = {}
+signal_count = 0
 
 current_percent = config.PERCENT
 current_window = config.WINDOW
@@ -127,6 +128,8 @@ async def monitor():
 
             now = time.time()
 
+            symbols = get_symbols()
+            
             prices = get_prices(symbols)
 
             for sym, price in prices.items():
@@ -162,23 +165,33 @@ async def monitor():
 
                     if change > 0:
 
-                        send_message(
-                            f"🚀 РОСТ\n\n"
-                            f"Монета: {sym}\n"
-                            f"Цена: {price}\n"
-                            f"Изменение: +{change:.2f}%",
-                            config.CHAT_ID
-                        )
+                        global signal_count
+
+send_message(
+    f"🚀 РОСТ\n\n"
+    f"🪙 Монета: {sym}\n"
+    f"💰 Цена: {price}\n"
+    f"📈 Изменение: +{change:.2f}%\n"
+    f"⏱ Период: {current_window // 60} мин",
+    config.CHAT_ID
+)
+
+signal_count += 1
 
                     else:
 
-                        send_message(
-                            f"📉 ПАДЕНИЕ\n\n"
-                            f"Монета: {sym}\n"
-                            f"Цена: {price}\n"
-                            f"Изменение: {change:.2f}%",
-                            config.CHAT_ID
-                        )
+                        global signal_count
+
+send_message(
+    f"📉 ПАДЕНИЕ\n\n"
+    f"🪙 Монета: {sym}\n"
+    f"💰 Цена: {price}\n"
+    f"📉 Изменение: {change:.2f}%\n"
+    f"⏱ Период: {current_window // 60} мин",
+    config.CHAT_ID
+)
+
+signal_count += 1
 
                     last_alert[sym] = now
 
@@ -238,6 +251,17 @@ def handle_message(msg):
             f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
             chat_id
         )
+elif text == "/stats":
+
+    send_message(
+        f"📊 Статистика\n\n"
+        f"🪙 Монет отслеживается: {len(price_history)}\n"
+        f"📈 Порог: {current_percent}%\n"
+        f"⏱ Период: {current_window // 60} мин\n"
+        f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин\n"
+        f"📨 Отправлено сигналов: {signal_count}",
+        chat_id
+    )
 def handle_callback(callback):
 
     global current_percent
