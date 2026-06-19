@@ -1,12 +1,14 @@
 import asyncio
-import time
 import requests
-from aiohttp import web
+import time
+from bs4 import BeautifulSoup
 
 import config
 
 TOKEN = config.BOT_TOKEN
 URL = f"https://api.telegram.org/bot{TOKEN}"
+
+offset = 0
 
 price_history = {}
 last_alert = {}
@@ -17,36 +19,18 @@ current_window = config.WINDOW
 
 # ---------------- TELEGRAM ----------------
 
-def send_message(text):
+def send_message(text, chat_id):
     requests.post(
         f"{URL}/sendMessage",
-        json={
-            "chat_id": config.CHAT_ID,
-            "text": text
-        }
+        json={"chat_id": chat_id, "text": text}
     )
 
 
-def edit_message(chat_id, message_id, text, reply_markup=None):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text
-    }
-
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
-    requests.post(f"{URL}/editMessageText", json=payload)
-
-
-# ---------------- BYBIT SYMBOLS ----------------
+# ---------------- SYMBOLS ----------------
 
 def get_symbols():
     try:
         r = requests.get("https://public.bybit.com/spot/", timeout=20)
-        from bs4 import BeautifulSoup
-
         soup = BeautifulSoup(r.text, "html.parser")
 
         return {
@@ -58,7 +42,7 @@ def get_symbols():
         return set()
 
 
-# ---------------- MEXC PRICES ----------------
+# ---------------- PRICES ----------------
 
 def get_prices(symbols):
     try:
@@ -78,11 +62,13 @@ def get_prices(symbols):
         return {}
 
 
-# ---------------- MONITOR ----------------
+# ---------------- BOT LOOP ----------------
 
 async def monitor():
+    global current_percent, current_window
+
     symbols = get_symbols()
-    send_message("🚀 aiohttp бот запущен")
+    print("Бот запущен")
 
     while True:
         now = time.time()
@@ -112,7 +98,8 @@ async def monitor():
                     continue
 
                 send_message(
-                    f"🚀 СИГНАЛ\n{sym}\nРост: +{growth:.2f}%"
+                    f"🚀 СИГНАЛ\n{sym}\n+{growth:.2f}%",
+                    config.CHAT_ID
                 )
 
                 last_alert[sym] = now
@@ -120,33 +107,51 @@ async def monitor():
         await asyncio.sleep(60)
 
 
-# ---------------- WEBHOOK HANDLER ----------------
+# ---------------- LONG POLLING ----------------
 
-async def handle(request):
-    data = await request.json()
+def get_updates():
+    global offset
 
-    if "message" in data:
-        chat_id = data["message"]["chat"]["id"]
-        text = data["message"].get("text", "")
-
-        if text == "/start":
-            send_message("🚀 Бот работает (aiohttp версия)")
-
-    return web.Response(text="OK")
-
-
-# ---------------- APP ----------------
-
-app = web.Application()
-app.router.add_post(f"/{TOKEN}", handle)
+    try:
+        r = requests.get(
+            f"{URL}/getUpdates",
+            params={"timeout": 10, "offset": offset}
+        )
+        return r.json()["result"]
+    except:
+        return []
 
 
-async def start_background(app):
-    asyncio.create_task(monitor())
+def handle_message(msg):
+    text = msg.get("text", "")
+    chat_id = msg["chat"]["id"]
+
+    if text == "/start":
+        send_message("🚀 Бот запущен (без webhook)", chat_id)
 
 
-app.on_startup.append(start_background)
+async def telegram_loop():
+    global offset
+
+    while True:
+        updates = get_updates()
+
+        for u in updates:
+            offset = u["update_id"] + 1
+
+            if "message" in u:
+                handle_message(u["message"])
+
+        await asyncio.sleep(1)
 
 
-if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=8080)
+# ---------------- MAIN ----------------
+
+async def main():
+    await asyncio.gather(
+        monitor(),
+        telegram_loop()
+    )
+
+
+asyncio.run(main())
