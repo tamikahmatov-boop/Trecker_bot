@@ -19,29 +19,19 @@ current_window = config.WINDOW
 
 
 def send_message(text, chat_id):
-    keyboard = {
-        "keyboard": [
-            ["0.3%", "5%", "10%", "15%"],
-            ["5 мин", "15 мин", "1 час"],
-            ["4 часа", "12 часов", "1 день"],
-            ["/status"]
-        ],
-        "resize_keyboard": True
-    }
-
     try:
         requests.post(
             f"{URL}/sendMessage",
             json={
                 "chat_id": chat_id,
-                "text": text,
-                "reply_markup": keyboard
+                "text": text
             },
             timeout=20
         )
     except Exception as e:
         print("Ошибка Telegram:", e)
-        
+
+
 def get_symbols():
     try:
         r = requests.get("https://public.bybit.com/spot/", timeout=20)
@@ -116,7 +106,77 @@ def calculate_rsi(prices, window=5):
         print("Ошибка RSI:", e)
         return None
         
-continue
+async def monitor():
+
+    symbols = get_symbols()
+
+    send_message("✅ Бот запущен", config.CHAT_ID)
+
+    while True:
+
+        try:
+            now = time.time()
+            prices = get_prices(symbols)
+
+            for sym, price in prices.items():
+
+                if price <= 0:
+                    continue
+
+                if sym not in price_history:
+                    price_history[sym] = []
+
+                # Добавляем новую цену
+                price_history[sym].append((now, price))
+
+                # Храним максимум 100 значений
+                if len(price_history[sym]) > 100:
+                    price_history[sym] = price_history[sym][-100:]
+
+                # Цены за период WINDOW для расчёта роста
+                recent_prices = [
+                    x for x in price_history[sym]
+                    if now - x[0] <= current_window
+                ]
+
+                if len(recent_prices) < 2:
+                    continue
+
+                old_price = recent_prices[0][1]
+
+                if old_price <= 0:
+                    continue
+
+                growth = ((price - old_price) / old_price) * 100
+
+                # RSI
+                prices_list = [x[1] for x in price_history[sym][-100:]]
+                rsi = calculate_rsi(prices_list, window=5)
+
+                if growth >= current_percent:
+
+                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
+                        continue
+
+                    text = (
+                        f"🚀 СИГНАЛ\n\n"
+                        f"Монета: {sym}\n"
+                        f"Цена: {price}\n"
+                        f"Рост: +{growth:.2f}%\n"
+                    )
+
+                    if rsi is not None:
+                        text += f"📊 RSI: {rsi:.2f}\n"
+                    else:
+                        text += "📊 RSI: ожидание данных\n"
+
+                    send_message(text, config.CHAT_ID)
+                    last_alert[sym] = now
+
+                elif growth <= -current_percent:
+
+                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
+                        continue
 
                     text = (
                         f"📉 СИГНАЛ\n\n"
@@ -134,10 +194,12 @@ continue
                     last_alert[sym] = now
 
             await asyncio.sleep(config.INTERVAL)
-    
-def handle_message(msg):
-    global current_percent, current_window
 
+        except Exception as e:
+            print("Ошибка monitor:", e)
+            await asyncio.sleep(config.INTERVAL)
+
+def handle_message(msg):
     text = msg.get("text", "")
     chat_id = msg["chat"]["id"]
 
@@ -147,7 +209,7 @@ def handle_message(msg):
             f"🚀 Бот запущен\n\n"
             f"📈 Рост: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n\n"
-            f"Выберите настройки кнопками ниже.",
+            f"/status - настройки",
             chat_id
         )
 
@@ -160,48 +222,8 @@ def handle_message(msg):
             f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
             chat_id
         )
+offset = 0
 
-    # Процент роста
-    elif text == "0.3%":
-        current_percent = 0.3
-        send_message("✅ Рост изменён: 0.3%", chat_id)
-
-    elif text == "5%":
-        current_percent = 5
-        send_message("✅ Рост изменён: 5%", chat_id)
-
-    elif text == "10%":
-        current_percent = 10
-        send_message("✅ Рост изменён: 10%", chat_id)
-
-    elif text == "15%":
-        current_percent = 15
-        send_message("✅ Рост изменён: 15%", chat_id)
-
-    # Период
-    elif text == "5 мин":
-        current_window = 5 * 60
-        send_message("⏱ Период изменён: 5 минут", chat_id)
-
-    elif text == "15 мин":
-        current_window = 15 * 60
-        send_message("⏱ Период изменён: 15 минут", chat_id)
-
-    elif text == "1 час":
-        current_window = 60 * 60
-        send_message("⏱ Период изменён: 1 час", chat_id)
-
-    elif text == "4 часа":
-        current_window = 4 * 60 * 60
-        send_message("⏱ Период изменён: 4 часа", chat_id)
-
-    elif text == "12 часов":
-        current_window = 12 * 60 * 60
-        send_message("⏱ Период изменён: 12 часов", chat_id)
-
-    elif text == "1 день":
-        current_window = 24 * 60 * 60
-        send_message("⏱ Период изменён: 1 день", chat_id)
 def get_updates():
     global offset
 
