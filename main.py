@@ -153,7 +153,6 @@ async def monitor():
                         f"Монета: {sym}\n"
                         f"Цена: {price}\n"
                         f"Рост: +{growth:.2f}%",
-                        f"📈 Изменение: +{change:.2f}%\n"
                         f"📊 RSI: {rsi}\n"
                         config.CHAT_ID
                     )
