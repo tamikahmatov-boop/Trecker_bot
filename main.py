@@ -134,7 +134,7 @@ async def monitor():
                 rsi = calculate_rsi(prices_list)
 
                 if rsi is None:
-                continue   
+                    continue   
                 old = price_history[sym][0][1]
 
                 if old <= 0:
