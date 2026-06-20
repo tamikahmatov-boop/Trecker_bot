@@ -126,14 +126,15 @@ async def monitor():
                 if sym not in price_history:
                     price_history[sym] = []
 
-                # Добавляем новую цену
+                # добавляем цену
                 price_history[sym].append((now, price))
 
-                # Храним максимум 100 значений
-                if len(price_history[sym]) > 100:
-                    price_history[sym] = price_history[sym][-100:]
+                # оставляем только данные за последние 2 WINDOW
+                price_history[sym] = [
+                    x for x in price_history[sym]
+                    if now - x[0] <= current_window * 2
+                ]
 
-                # Цены за период WINDOW для расчёта роста
                 recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
@@ -147,48 +148,36 @@ async def monitor():
                 if old_price <= 0:
                     continue
 
-                growth = ((price - old_price) / old_price) * 100
+                growth = (price - old_price) / old_price * 100
 
-                # RSI
-                prices_list = [x[1] for x in price_history[sym][-100:]]
+                prices_list = [x[1] for x in price_history[sym]]
                 rsi = calculate_rsi(prices_list, window=5)
 
-                if growth >= current_percent:
+                if abs(growth) >= current_percent:
 
-                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
-                        continue
+                    if sym in last_alert:
+                        if now - last_alert[sym] < config.COOLDOWN:
+                            continue
 
-                    text = (
-                        f"🚀 СИГНАЛ\n\n"
-                        f"Монета: {sym}\n"
-                        f"Цена: {price}\n"
-                        f"Рост: +{growth:.2f}%\n"
-                    )
+                    if growth > 0:
+                        text = (
+                            f"🚀 СИГНАЛ\n\n"
+                            f"Монета: {sym}\n"
+                            f"Цена: {price}\n"
+                            f"Рост: +{growth:.2f}%\n"
+                        )
+                    else:
+                        text = (
+                            f"📉 СИГНАЛ\n\n"
+                            f"Монета: {sym}\n"
+                            f"Цена: {price}\n"
+                            f"Падение: {growth:.2f}%\n"
+                        )
 
                     if rsi is not None:
-                        text += f"📊 RSI: {rsi:.2f}\n"
+                        text += f"📊 RSI: {rsi:.2f}"
                     else:
-                        text += "📊 RSI: ожидание данных\n"
-
-                    send_message(text, config.CHAT_ID)
-                    last_alert[sym] = now
-
-                elif growth <= -current_percent:
-
-                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
-                        continue
-
-                    text = (
-                        f"📉 СИГНАЛ\n\n"
-                        f"Монета: {sym}\n"
-                        f"Цена: {price}\n"
-                        f"Падение: {growth:.2f}%\n"
-                    )
-
-                    if rsi is not None:
-                        text += f"📊 RSI: {rsi:.2f}\n"
-                    else:
-                        text += "📊 RSI: ожидание данных\n"
+                        text += "📊 RSI: ожидание данных"
 
                     send_message(text, config.CHAT_ID)
                     last_alert[sym] = now
@@ -198,32 +187,82 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(config.INTERVAL)
+from telegram import ReplyKeyboardMarkup
+
+def send_keyboard(chat_id):
+    keyboard = {
+        "keyboard": [
+            ["📈 5%", "📈 10%", "📈 20%"],
+            ["⏱ 1 мин", "⏱ 5 мин", "⏱ 15 мин"],
+            ["/status"]
+        ],
+        "resize_keyboard": True
+    }
+
+    requests.post(
+        f"{URL}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": "Выберите настройки:",
+            "reply_markup": keyboard
+        }
+    )
+
 
 def handle_message(msg):
+    global current_percent, current_window
+
     text = msg.get("text", "")
     chat_id = msg["chat"]["id"]
 
     if text == "/start":
 
-        send_message(
-            f"🚀 Бот запущен\n\n"
-            f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n\n"
-            f"/status - настройки",
-            chat_id
+        requests.post(
+            f"{URL}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text":
+                f"🚀 Бот запущен\n\n"
+                f"📈 Рост: {current_percent}%\n"
+                f"⏱ Период: {current_window//60} мин"
+            }
         )
+
+        send_keyboard(chat_id)
 
     elif text == "/status":
 
         send_message(
             f"📊 Настройки\n\n"
             f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n"
-            f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
+            f"⏱ Период: {current_window//60} мин\n"
+            f"🔔 Повтор сигнала: {config.COOLDOWN//60} мин",
             chat_id
         )
-offset = 0
 
+    elif text == "📈 5%":
+        current_percent = 5
+        send_message("✅ Рост установлен: 5%", chat_id)
+
+    elif text == "📈 10%":
+        current_percent = 10
+        send_message("✅ Рост установлен: 10%", chat_id)
+
+    elif text == "📈 20%":
+        current_percent = 20
+        send_message("✅ Рост установлен: 20%", chat_id)
+
+    elif text == "⏱ 1 мин":
+        current_window = 60
+        send_message("✅ Период установлен: 1 мин", chat_id)
+
+    elif text == "⏱ 5 мин":
+        current_window = 300
+        send_message("✅ Период установлен: 5 мин", chat_id)
+
+    elif text == "⏱ 15 мин":
+        current_window = 900
+        send_message("✅ Период установлен: 15 мин", chat_id)
 def get_updates():
     global offset
 
