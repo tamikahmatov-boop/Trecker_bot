@@ -1,6 +1,8 @@
 import asyncio
 import requests
 import time
+import pandas as pd
+from ta.momentum import RSIIndicator
 from bs4 import BeautifulSoup
 import config
 
@@ -84,6 +86,17 @@ def get_prices(symbols):
 
     return prices
 
+def calculate_rsi(prices, period=14):
+
+    if len(prices) < period + 1:
+        return None
+
+    close_series = pd.Series(prices)
+
+    rsi = RSIIndicator(close_series, window=period).rsi()
+
+    return round(rsi.iloc[-1], 2)
+
 
 async def monitor():
 
@@ -116,7 +129,12 @@ async def monitor():
 
                 if len(price_history[sym]) < 2:
                     continue
+                prices_list = [x[1] for x in price_history[sym]]
 
+                rsi = calculate_rsi(prices_list)
+
+                if rsi is None:
+                continue   
                 old = price_history[sym][0][1]
 
                 if old <= 0:
