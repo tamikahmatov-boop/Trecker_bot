@@ -237,6 +237,29 @@ def handle_message(msg):
             f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
             chat_id
         )
+offset = 0
+
+def get_updates():
+    global offset
+
+    try:
+        response = requests.get(
+            f"{URL}/getUpdates",
+            params={
+                "timeout": 30,
+                "offset": offset
+            }
+        )
+
+        data = response.json()
+
+        if data["ok"]:
+            return data["result"]
+
+    except Exception as e:
+        print("Ошибка get_updates:", e)
+
+    return []
 async def telegram_loop():
     global offset
 
