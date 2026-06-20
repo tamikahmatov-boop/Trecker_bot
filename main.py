@@ -116,77 +116,7 @@ def calculate_rsi(prices, window=5):
         print("Ошибка RSI:", e)
         return None
         
-async def monitor():
-
-    symbols = get_symbols()
-
-    send_message("✅ Бот запущен", config.CHAT_ID)
-
-    while True:
-
-        try:
-            now = time.time()
-            prices = get_prices(symbols)
-
-            for sym, price in prices.items():
-
-                if price <= 0:
-                    continue
-
-                if sym not in price_history:
-                    price_history[sym] = []
-
-                # Добавляем новую цену
-                price_history[sym].append((now, price))
-
-                # Храним максимум 100 значений
-                if len(price_history[sym]) > 100:
-                    price_history[sym] = price_history[sym][-100:]
-
-                # Цены за период WINDOW для расчёта роста
-                recent_prices = [
-                    x for x in price_history[sym]
-                    if now - x[0] <= current_window
-                ]
-
-                if len(recent_prices) < 2:
-                    continue
-
-                old_price = recent_prices[0][1]
-
-                if old_price <= 0:
-                    continue
-
-                growth = ((price - old_price) / old_price) * 100
-
-                # RSI
-                prices_list = [x[1] for x in price_history[sym][-100:]]
-                rsi = calculate_rsi(prices_list, window=5)
-
-                if growth >= current_percent:
-
-                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
-                        continue
-
-                    text = (
-                        f"🚀 СИГНАЛ\n\n"
-                        f"Монета: {sym}\n"
-                        f"Цена: {price}\n"
-                        f"Рост: +{growth:.2f}%\n"
-                    )
-
-                    if rsi is not None:
-                        text += f"📊 RSI: {rsi:.2f}\n"
-                    else:
-                        text += "📊 RSI: ожидание данных\n"
-
-                    send_message(text, config.CHAT_ID)
-                    last_alert[sym] = now
-
-                elif growth <= -current_percent:
-
-                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
-                        continue
+continue
 
                     text = (
                         f"📉 СИГНАЛ\n\n"
@@ -203,10 +133,6 @@ async def monitor():
                     send_message(text, config.CHAT_ID)
                     last_alert[sym] = now
 
-            await asyncio.sleep(config.INTERVAL)
-
-     except Exception as e:
-                    print("Ошибка monitor:", e)
             await asyncio.sleep(config.INTERVAL)
     
 def handle_message(msg):
