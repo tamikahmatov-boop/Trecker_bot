@@ -216,15 +216,11 @@ def handle_message(msg):
 
     if text == "/start":
 
-        requests.post(
-            f"{URL}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text":
-                f"🚀 Бот запущен\n\n"
-                f"📈 Рост: {current_percent}%\n"
-                f"⏱ Период: {current_window//60} мин"
-            }
+        send_message(
+            f"🚀 Бот запущен\n\n"
+            f"📈 Рост: {current_percent}%\n"
+            f"⏱ Период: {current_window // 60} мин\n",
+            chat_id
         )
 
         send_keyboard(chat_id)
@@ -234,34 +230,39 @@ def handle_message(msg):
         send_message(
             f"📊 Настройки\n\n"
             f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window//60} мин\n"
-            f"🔔 Повтор сигнала: {config.COOLDOWN//60} мин",
+            f"⏱ Период: {current_window // 60} мин\n"
+            f"🔔 Кулдаун: {config.COOLDOWN // 60} мин",
             chat_id
         )
 
+    # --- ПРОЦЕНТЫ ---
     elif text == "📈 5%":
         current_percent = 5
-        send_message("✅ Рост установлен: 5%", chat_id)
+        send_message("✅ Установлено: 5%", chat_id)
 
     elif text == "📈 10%":
         current_percent = 10
-        send_message("✅ Рост установлен: 10%", chat_id)
+        send_message("✅ Установлено: 10%", chat_id)
 
     elif text == "📈 20%":
         current_percent = 20
-        send_message("✅ Рост установлен: 20%", chat_id)
+        send_message("✅ Установлено: 20%", chat_id)
 
+    # --- ВРЕМЯ ---
     elif text == "⏱ 1 мин":
         current_window = 60
-        send_message("✅ Период установлен: 1 мин", chat_id)
+        send_message("✅ Период: 1 мин", chat_id)
 
     elif text == "⏱ 5 мин":
         current_window = 300
-        send_message("✅ Период установлен: 5 мин", chat_id)
+        send_message("✅ Период: 5 мин", chat_id)
 
     elif text == "⏱ 15 мин":
         current_window = 900
-        send_message("✅ Период установлен: 15 мин", chat_id)
+        send_message("✅ Период: 15 мин", chat_id)
+
+    else:
+        send_message("❓ Неизвестная команда", chat_id)
 def get_updates():
     global offset
 
