@@ -89,12 +89,13 @@ def get_prices(symbols):
 from ta.momentum import RSIIndicator
 import pandas as pd
 
-def calculate_rsi(prices, window=14):
+def calculate_rsi(prices, window=5):
     try:
         if len(prices) < window + 1:
             return None
 
-        rsi = RSIIndicator(pd.Series(prices), window=window).rsi().iloc[-1]
+        series = pd.Series(prices)
+        rsi = RSIIndicator(close=series, window=window).rsi().iloc[-1]
 
         if pd.isna(rsi):
             return None
@@ -104,7 +105,7 @@ def calculate_rsi(prices, window=14):
     except Exception as e:
         print("Ошибка RSI:", e)
         return None
-
+        
 async def monitor():
 
     symbols = get_symbols()
@@ -128,11 +129,11 @@ async def monitor():
                 # Добавляем новую цену
                 price_history[sym].append((now, price))
 
-                # Оставляем только последние 100 значений
+                # Храним максимум 100 значений
                 if len(price_history[sym]) > 100:
                     price_history[sym] = price_history[sym][-100:]
 
-                # Для роста используем окно current_window секунд
+                # Цены за период WINDOW для расчёта роста
                 recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
@@ -141,23 +142,21 @@ async def monitor():
                 if len(recent_prices) < 2:
                     continue
 
-                old = recent_prices[0][1]
+                old_price = recent_prices[0][1]
 
-                if old <= 0:
+                if old_price <= 0:
                     continue
 
-                growth = ((price - old) / old) * 100
+                growth = ((price - old_price) / old_price) * 100
 
-                # Цены для RSI
-                prices_list = [x[1] for x in price_history[sym]]
-
-                rsi = calculate_rsi(prices_list)
+                # RSI
+                prices_list = [x[1] for x in price_history[sym][-100:]]
+                rsi = calculate_rsi(prices_list, window=5)
 
                 if growth >= current_percent:
 
-                    if sym in last_alert:
-                        if now - last_alert[sym] < config.COOLDOWN:
-                            continue
+                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
+                        continue
 
                     text = (
                         f"🚀 СИГНАЛ\n\n"
@@ -168,15 +167,16 @@ async def monitor():
 
                     if rsi is not None:
                         text += f"📊 RSI: {rsi:.2f}\n"
+                    else:
+                        text += "📊 RSI: ожидание данных\n"
 
                     send_message(text, config.CHAT_ID)
                     last_alert[sym] = now
 
                 elif growth <= -current_percent:
 
-                    if sym in last_alert:
-                        if now - last_alert[sym] < config.COOLDOWN:
-                            continue
+                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
+                        continue
 
                     text = (
                         f"📉 СИГНАЛ\n\n"
@@ -187,32 +187,17 @@ async def monitor():
 
                     if rsi is not None:
                         text += f"📊 RSI: {rsi:.2f}\n"
+                    else:
+                        text += "📊 RSI: ожидание данных\n"
 
                     send_message(text, config.CHAT_ID)
                     last_alert[sym] = now
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(config.INTERVAL)
 
         except Exception as e:
             print("Ошибка monitor:", e)
-            await asyncio.sleep(60)
-    global offset
-
-    try:
-        r = requests.get(
-            f"{URL}/getUpdates",
-            params={
-                "timeout": 10,
-                "offset": offset
-            },
-            timeout=20
-        )
-
-        return r.json()["result"]
-
-    except:
-        return []
-
+            await asyncio.sleep(config.INTERVAL)
 
 def handle_message(msg):
     text = msg.get("text", "")
