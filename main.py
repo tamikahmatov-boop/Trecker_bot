@@ -106,9 +106,9 @@ def calculate_rsi(prices, window=5):
 
 
 async def monitor():
+    global current_percent, current_window
 
     symbols = get_symbols()
-
     send_message("✅ Бот запущен", config.CHAT_ID)
 
     while True:
@@ -124,13 +124,16 @@ async def monitor():
                 if sym not in price_history:
                     price_history[sym] = []
 
+                # добавляем цену
                 price_history[sym].append((now, price))
 
+                # чистим историю (2 окна)
                 price_history[sym] = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window * 2
                 ]
 
+                # окно для роста
                 recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
@@ -141,16 +144,20 @@ async def monitor():
 
                 old_price = recent_prices[0][1]
 
+                if old_price <= 0:
+                    continue
+
                 growth = ((price - old_price) / old_price) * 100
 
-                prices_list = [x[1] for x in price_history[sym]]
+                # RSI (ограничиваем историю)
+                prices_list = [x[1] for x in price_history[sym][-100:]]
                 rsi = calculate_rsi(prices_list, window=5)
 
                 if abs(growth) >= current_percent:
 
-                    if sym in last_alert:
-                        if now - last_alert[sym] < config.COOLDOWN:
-                            continue
+                    # антиспам
+                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
+                        continue
 
                     if growth > 0:
                         text = (
@@ -180,8 +187,6 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(config.INTERVAL)
-
-
 def send_keyboard(chat_id):
     keyboard = {
         "keyboard": [
@@ -273,6 +278,28 @@ def handle_message(msg):
 
     else:
         send_message("❓ Неизвестная команда", chat_id)
+def get_updates():
+    global offset
+
+    try:
+        response = requests.get(
+            f"{URL}/getUpdates",
+            params={
+                "timeout": 30,
+                "offset": offset
+            }
+        )
+
+        data = response.json()
+
+        if data["ok"]:
+            return data["result"]
+
+    except Exception as e:
+        print("Ошибка get_updates:", e)
+
+    return []
+
 async def telegram_loop():
     global offset
 
