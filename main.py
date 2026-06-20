@@ -86,8 +86,6 @@ def get_prices(symbols):
 
     return prices
 
-from ta.momentum import RSIIndicator
-import pandas as pd
 
 def calculate_rsi(prices, window=5):
     try:
@@ -105,14 +103,15 @@ def calculate_rsi(prices, window=5):
     except Exception as e:
         print("Ошибка RSI:", e)
         return None
-        async def monitor():
+
+
+async def monitor():
 
     symbols = get_symbols()
 
     send_message("✅ Бот запущен", config.CHAT_ID)
 
     while True:
-
         try:
             now = time.time()
             prices = get_prices(symbols)
@@ -125,16 +124,13 @@ def calculate_rsi(prices, window=5):
                 if sym not in price_history:
                     price_history[sym] = []
 
-                # добавляем новую цену
                 price_history[sym].append((now, price))
 
-                # храним только данные за последние 2 периода
                 price_history[sym] = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window * 2
                 ]
 
-                # цены за текущий период
                 recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
@@ -145,18 +141,13 @@ def calculate_rsi(prices, window=5):
 
                 old_price = recent_prices[0][1]
 
-                if old_price <= 0:
-                    continue
-
                 growth = ((price - old_price) / old_price) * 100
 
-                # RSI
                 prices_list = [x[1] for x in price_history[sym]]
                 rsi = calculate_rsi(prices_list, window=5)
 
                 if abs(growth) >= current_percent:
 
-                    # антиспам
                     if sym in last_alert:
                         if now - last_alert[sym] < config.COOLDOWN:
                             continue
@@ -189,6 +180,8 @@ def calculate_rsi(prices, window=5):
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(config.INTERVAL)
+
+
 def send_keyboard(chat_id):
     keyboard = {
         "keyboard": [
@@ -208,6 +201,60 @@ def send_keyboard(chat_id):
         }
     )
 
+
+def handle_message(msg):
+    global current_percent, current_window
+
+    text = msg.get("text", "")
+    chat_id = msg["chat"]["id"]
+
+    if text == "/start":
+
+        send_message(
+            f"🚀 Бот запущен\n\n"
+            f"📈 Рост: {current_percent}%\n"
+            f"⏱ Период: {current_window // 60} мин\n",
+            chat_id
+        )
+
+        send_keyboard(chat_id)
+
+    elif text == "/status":
+
+        send_message(
+            f"📊 Настройки\n\n"
+            f"📈 Рост: {current_percent}%\n"
+            f"⏱ Период: {current_window // 60} мин\n"
+            f"🔔 Кулдаун: {config.COOLDOWN // 60} мин",
+            chat_id
+        )
+
+    elif text == "📈 5%":
+        current_percent = 5
+        send_message("✅ Установлено: 5%", chat_id)
+
+    elif text == "📈 10%":
+        current_percent = 10
+        send_message("✅ Установлено: 10%", chat_id)
+
+    elif text == "📈 20%":
+        current_percent = 20
+        send_message("✅ Установлено: 20%", chat_id)
+
+    elif text == "⏱ 1 мин":
+        current_window = 60
+        send_message("✅ Период: 1 мин", chat_id)
+
+    elif text == "⏱ 5 мин":
+        current_window = 300
+        send_message("✅ Период: 5 мин", chat_id)
+
+    elif text == "⏱ 15 мин":
+        current_window = 900
+        send_message("✅ Период: 15 мин", chat_id)
+
+    else:
+        send_message("❓ Неизвестная команда", chat_id)
 
 def handle_message(msg):
     global current_percent, current_window
