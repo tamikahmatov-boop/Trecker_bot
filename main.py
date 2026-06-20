@@ -226,60 +226,53 @@ def handle_message(msg):
         send_message(
             f"📊 Настройки\n\n"
             f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n"
+            f"⏱ Период: {current_window} сек\n"
             f"🔔 Кулдаун: {config.COOLDOWN // 60} мин",
             chat_id
         )
 
-    # --- ПРОЦЕНТЫ ---
+    # ---------------- ПРОЦЕНТЫ ----------------
+
+    elif text == "📈 0.2%":
+        current_percent = 0.2
+        send_message("✅ 0.2%", chat_id)
+
     elif text == "📈 5%":
         current_percent = 5
-        send_message("✅ Установлено: 5%", chat_id)
+        send_message("✅ 5%", chat_id)
 
     elif text == "📈 10%":
         current_percent = 10
-        send_message("✅ Установлено: 10%", chat_id)
+        send_message("✅ 10%", chat_id)
+
+    elif text == "📈 15%":
+        current_percent = 15
+        send_message("✅ 15%", chat_id)
 
     elif text == "📈 20%":
         current_percent = 20
-        send_message("✅ Установлено: 20%", chat_id)
+        send_message("✅ 20%", chat_id)
 
-    # --- ВРЕМЯ ---
-    elif text == "⏱ 1 мин":
-        current_window = 60
-        send_message("✅ Период: 1 мин", chat_id)
+    # ---------------- ВРЕМЯ ----------------
 
     elif text == "⏱ 5 мин":
         current_window = 300
-        send_message("✅ Период: 5 мин", chat_id)
+        send_message("✅ 5 мин", chat_id)
 
-    elif text == "⏱ 15 мин":
-        current_window = 900
-        send_message("✅ Период: 15 мин", chat_id)
+    elif text == "⏱ 1 час":
+        current_window = 3600
+        send_message("✅ 1 час", chat_id)
+
+    elif text == "⏱ 4 часа":
+        current_window = 14400
+        send_message("✅ 4 часа", chat_id)
+
+    elif text == "⏱ 1 день":
+        current_window = 86400
+        send_message("✅ 1 день", chat_id)
 
     else:
         send_message("❓ Неизвестная команда", chat_id)
-def get_updates():
-    global offset
-
-    try:
-        response = requests.get(
-            f"{URL}/getUpdates",
-            params={
-                "timeout": 30,
-                "offset": offset
-            }
-        )
-
-        data = response.json()
-
-        if data["ok"]:
-            return data["result"]
-
-    except Exception as e:
-        print("Ошибка get_updates:", e)
-
-    return []
 async def telegram_loop():
     global offset
 
