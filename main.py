@@ -19,19 +19,29 @@ current_window = config.WINDOW
 
 
 def send_message(text, chat_id):
+    keyboard = {
+        "keyboard": [
+            ["0.3%", "5%", "10%", "15%"],
+            ["5 мин", "15 мин", "1 час"],
+            ["4 часа", "12 часов", "1 день"],
+            ["/status"]
+        ],
+        "resize_keyboard": True
+    }
+
     try:
         requests.post(
             f"{URL}/sendMessage",
             json={
                 "chat_id": chat_id,
-                "text": text
+                "text": text,
+                "reply_markup": keyboard
             },
             timeout=20
         )
     except Exception as e:
         print("Ошибка Telegram:", e)
-
-
+        
 def get_symbols():
     try:
         r = requests.get("https://public.bybit.com/spot/", timeout=20)
@@ -200,6 +210,8 @@ async def monitor():
             await asyncio.sleep(config.INTERVAL)
 
 def handle_message(msg):
+    global current_percent, current_window
+
     text = msg.get("text", "")
     chat_id = msg["chat"]["id"]
 
@@ -209,7 +221,7 @@ def handle_message(msg):
             f"🚀 Бот запущен\n\n"
             f"📈 Рост: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n\n"
-            f"/status - настройки",
+            f"Выберите настройки кнопками ниже.",
             chat_id
         )
 
@@ -222,8 +234,48 @@ def handle_message(msg):
             f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
             chat_id
         )
-offset = 0
 
+    # Процент роста
+    elif text == "0.3%":
+        current_percent = 0.3
+        send_message("✅ Рост изменён: 0.3%", chat_id)
+
+    elif text == "5%":
+        current_percent = 5
+        send_message("✅ Рост изменён: 5%", chat_id)
+
+    elif text == "10%":
+        current_percent = 10
+        send_message("✅ Рост изменён: 10%", chat_id)
+
+    elif text == "15%":
+        current_percent = 15
+        send_message("✅ Рост изменён: 15%", chat_id)
+
+    # Период
+    elif text == "5 мин":
+        current_window = 5 * 60
+        send_message("⏱ Период изменён: 5 минут", chat_id)
+
+    elif text == "15 мин":
+        current_window = 15 * 60
+        send_message("⏱ Период изменён: 15 минут", chat_id)
+
+    elif text == "1 час":
+        current_window = 60 * 60
+        send_message("⏱ Период изменён: 1 час", chat_id)
+
+    elif text == "4 часа":
+        current_window = 4 * 60 * 60
+        send_message("⏱ Период изменён: 4 часа", chat_id)
+
+    elif text == "12 часов":
+        current_window = 12 * 60 * 60
+        send_message("⏱ Период изменён: 12 часов", chat_id)
+
+    elif text == "1 день":
+        current_window = 24 * 60 * 60
+        send_message("⏱ Период изменён: 1 день", chat_id)
 def get_updates():
     global offset
 
