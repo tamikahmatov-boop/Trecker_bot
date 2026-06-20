@@ -187,7 +187,6 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(config.INTERVAL)
-from telegram import ReplyKeyboardMarkup
 
 def send_keyboard(chat_id):
     keyboard = {
