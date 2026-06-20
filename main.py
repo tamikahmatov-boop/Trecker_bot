@@ -129,12 +129,11 @@ async def monitor():
 
                 if len(price_history[sym]) < 2:
                     continue
+
                 prices_list = [x[1] for x in price_history[sym]]
 
                 rsi = calculate_rsi(prices_list)
 
-                if rsi is None:
-                    continue   
                 old = price_history[sym][0][1]
 
                 if old <= 0:
@@ -148,14 +147,37 @@ async def monitor():
                         if now - last_alert[sym] < config.COOLDOWN:
                             continue
 
-                    send_message(
+                    text = (
                         f"🚀 СИГНАЛ\n\n"
                         f"Монета: {sym}\n"
                         f"Цена: {price}\n"
-                        f"Рост: +{growth:.2f}%",
-                        f"📊 RSI: {rsi}\n"
-                        config.CHAT_ID
+                        f"Рост: +{growth:.2f}%\n"
                     )
+
+                    if rsi is not None:
+                        text += f"📊 RSI: {rsi}\n"
+
+                    send_message(text, config.CHAT_ID)
+
+                    last_alert[sym] = now
+
+                elif growth <= -current_percent:
+
+                    if sym in last_alert:
+                        if now - last_alert[sym] < config.COOLDOWN:
+                            continue
+
+                    text = (
+                        f"📉 СИГНАЛ\n\n"
+                        f"Монета: {sym}\n"
+                        f"Цена: {price}\n"
+                        f"Падение: {growth:.2f}%\n"
+                    )
+
+                    if rsi is not None:
+                        text += f"📊 RSI: {rsi}\n"
+
+                    send_message(text, config.CHAT_ID)
 
                     last_alert[sym] = now
 
@@ -164,8 +186,6 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(60)
-
-
 def get_updates():
     global offset
 
@@ -196,8 +216,6 @@ def handle_message(msg):
             f"📈 Рост: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n\n"
             f"/status - настройки",
-            f"📈 Изменение: +{change:.2f}%\n"
-            f"📊 RSI: {rsi}\n"
             chat_id
         )
 
@@ -210,8 +228,6 @@ def handle_message(msg):
             f"🔔 Повтор сигнала: {config.COOLDOWN // 60} мин",
             chat_id
         )
-
-
 async def telegram_loop():
     global offset
 
