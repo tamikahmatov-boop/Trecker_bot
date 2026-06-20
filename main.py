@@ -153,6 +153,8 @@ async def monitor():
                         f"Монета: {sym}\n"
                         f"Цена: {price}\n"
                         f"Рост: +{growth:.2f}%",
+                        f"📈 Изменение: +{change:.2f}%\n"
+                        f"📊 RSI: {rsi}\n"
                         config.CHAT_ID
                     )
 
@@ -195,6 +197,8 @@ def handle_message(msg):
             f"📈 Рост: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n\n"
             f"/status - настройки",
+            f"📈 Изменение: +{change:.2f}%\n"
+            f"📊 RSI: {rsi}\n"
             chat_id
         )
 
