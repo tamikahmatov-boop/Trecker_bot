@@ -205,9 +205,9 @@ async def monitor():
 
             await asyncio.sleep(config.INTERVAL)
 
-        except Exception as e:
-    print("Ошибка monitor:", e)
-    await asyncio.sleep(config.INTERVAL)
+     except Exception as e:
+                    print("Ошибка monitor:", e)
+            await asyncio.sleep(config.INTERVAL)
     
 def handle_message(msg):
     global current_percent, current_window
