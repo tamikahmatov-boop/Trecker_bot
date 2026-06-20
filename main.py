@@ -105,8 +105,7 @@ def calculate_rsi(prices, window=5):
     except Exception as e:
         print("Ошибка RSI:", e)
         return None
-        
-async def monitor():
+        async def monitor():
 
     symbols = get_symbols()
 
@@ -126,15 +125,16 @@ async def monitor():
                 if sym not in price_history:
                     price_history[sym] = []
 
-                # добавляем цену
+                # добавляем новую цену
                 price_history[sym].append((now, price))
 
-                # оставляем только данные за последние 2 WINDOW
+                # храним только данные за последние 2 периода
                 price_history[sym] = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window * 2
                 ]
 
+                # цены за текущий период
                 recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
@@ -148,13 +148,15 @@ async def monitor():
                 if old_price <= 0:
                     continue
 
-                growth = (price - old_price) / old_price * 100
+                growth = ((price - old_price) / old_price) * 100
 
+                # RSI
                 prices_list = [x[1] for x in price_history[sym]]
                 rsi = calculate_rsi(prices_list, window=5)
 
                 if abs(growth) >= current_percent:
 
+                    # антиспам
                     if sym in last_alert:
                         if now - last_alert[sym] < config.COOLDOWN:
                             continue
@@ -187,7 +189,6 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(config.INTERVAL)
-
 def send_keyboard(chat_id):
     keyboard = {
         "keyboard": [
