@@ -203,75 +203,7 @@ def send_keyboard(chat_id):
         }
     )
 
-def handle_message(msg):
-    global current_percent, current_window
 
-    text = msg.get("text", "")
-    chat_id = msg["chat"]["id"]
-
-    if text == "/start":
-
-        send_message(
-            f"🚀 Бот запущен\n\n"
-            f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n",
-            chat_id
-        )
-
-        send_keyboard(chat_id)
-
-    elif text == "/status":
-
-        send_message(
-            f"📊 Настройки\n\n"
-            f"📈 Рост: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} сек\n"
-            f"🔔 Кулдаун: {config.COOLDOWN // 60} мин",
-            chat_id
-        )
-
-    # ---------------- ПРОЦЕНТЫ ----------------
-
-    elif text == "📈 0.2%":
-        current_percent = 0.2
-        send_message("✅ Установлено: 0.2%", chat_id)
-
-    elif text == "📈 5%":
-        current_percent = 5
-        send_message("✅ Установлено: 5%", chat_id)
-
-    elif text == "📈 10%":
-        current_percent = 10
-        send_message("✅ Установлено: 10%", chat_id)
-
-    elif text == "📈 15%":
-        current_percent = 15
-        send_message("✅ Установлено: 15%", chat_id)
-
-    elif text == "📈 20%":
-        current_percent = 20
-        send_message("✅ Установлено: 20%", chat_id)
-
-    # ---------------- ВРЕМЯ ----------------
-
-    elif text == "⏱ 5 мин":
-        current_window = 300
-        send_message("✅ Период: 5 минут", chat_id)
-
-    elif text == "⏱ 1 час":
-        current_window = 3600
-        send_message("✅ Период: 1 час", chat_id)
-
-    elif text == "⏱ 4 часа":
-        current_window = 14400
-        send_message("✅ Период: 4 часа", chat_id)
-
-    elif text == "⏱ 1 день":
-        current_window = 86400
-        send_message("✅ Период: 1 день", chat_id)
-
-    else:
-        send_message("❓ Неизвестная команда", chat_id)
 def handle_message(msg):
     global current_percent, current_window
 
