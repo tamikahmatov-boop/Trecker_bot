@@ -86,17 +86,24 @@ def get_prices(symbols):
 
     return prices
 
-def calculate_rsi(prices, period=14):
+from ta.momentum import RSIIndicator
+import pandas as pd
 
-    if len(prices) < period + 1:
+def calculate_rsi(prices, window=14):
+    try:
+        if len(prices) < window + 1:
+            return None
+
+        rsi = RSIIndicator(pd.Series(prices), window=window).rsi().iloc[-1]
+
+        if pd.isna(rsi):
+            return None
+
+        return round(float(rsi), 2)
+
+    except Exception as e:
+        print("Ошибка RSI:", e)
         return None
-
-    close_series = pd.Series(prices)
-
-    rsi = RSIIndicator(close_series, window=period).rsi()
-
-    return round(rsi.iloc[-1], 2)
-
 
 async def monitor():
 
@@ -107,9 +114,7 @@ async def monitor():
     while True:
 
         try:
-
             now = time.time()
-
             prices = get_prices(symbols)
 
             for sym, price in prices.items():
@@ -120,26 +125,33 @@ async def monitor():
                 if sym not in price_history:
                     price_history[sym] = []
 
+                # Добавляем новую цену
                 price_history[sym].append((now, price))
 
-                price_history[sym] = [
+                # Оставляем только последние 100 значений
+                if len(price_history[sym]) > 100:
+                    price_history[sym] = price_history[sym][-100:]
+
+                # Для роста используем окно current_window секунд
+                recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
                 ]
 
-                if len(price_history[sym]) < 2:
+                if len(recent_prices) < 2:
                     continue
 
-                prices_list = [x[1] for x in price_history[sym]]
-
-                rsi = calculate_rsi(prices_list)
-
-                old = price_history[sym][0][1]
+                old = recent_prices[0][1]
 
                 if old <= 0:
                     continue
 
                 growth = ((price - old) / old) * 100
+
+                # Цены для RSI
+                prices_list = [x[1] for x in price_history[sym]]
+
+                rsi = calculate_rsi(prices_list)
 
                 if growth >= current_percent:
 
@@ -155,10 +167,9 @@ async def monitor():
                     )
 
                     if rsi is not None:
-                        text += f"📊 RSI: {rsi}\n"
+                        text += f"📊 RSI: {rsi:.2f}\n"
 
                     send_message(text, config.CHAT_ID)
-
                     last_alert[sym] = now
 
                 elif growth <= -current_percent:
@@ -175,10 +186,9 @@ async def monitor():
                     )
 
                     if rsi is not None:
-                        text += f"📊 RSI: {rsi}\n"
+                        text += f"📊 RSI: {rsi:.2f}\n"
 
                     send_message(text, config.CHAT_ID)
-
                     last_alert[sym] = now
 
             await asyncio.sleep(60)
@@ -186,7 +196,6 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(60)
-def get_updates():
     global offset
 
     try:
