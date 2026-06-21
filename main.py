@@ -34,38 +34,29 @@ def send_message(text, chat_id):
 
     except Exception as e:
         print("Ошибка Telegram:", e)
-def get_bybit_symbols():
-    urls = [
-        "https://api.bybit-global.com/v5/market/instruments-info?category=linear",
-        "https://api.bybit.com/v5/market/instruments-info?category=linear"
-    ]
+def get_symbols():
+    try:
+        r = requests.get("https://public.bybit.com/spot/", timeout=20)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=20)
+        symbols = set()
 
-            try:
-                data = r.json()
-            except:
-                continue
+        for a in soup.find_all("a"):
+            symbol = a.text.strip("/")
 
-            if isinstance(data, dict) and data.get("retCode") == 0:
-                symbols = set()
+            if symbol.endswith("USDT"):
+                symbols.add(symbol)
 
-                for item in data["result"]["list"]:
-                    sym = item.get("symbol")
+        print("Загружено монет:", len(symbols))
 
-                    # 🔥 только USDT perpetual
-                    if sym and sym.endswith("USDT"):
-                        symbols.add(sym)
+        return symbols
 
-                return symbols
+    except Exception as e:
+        print("Ошибка Bybit:", e)
+        return set()
 
-        except:
-            continue
 
-    return set()
-def get_prices_mexc(symbols):
+def get_prices(symbols):
     prices = {}
 
     try:
@@ -77,7 +68,6 @@ def get_prices_mexc(symbols):
         data = r.json()
 
         if data["success"]:
-
             for item in data["data"]:
 
                 symbol = item["symbol"].replace("_", "")
@@ -97,75 +87,8 @@ def get_prices_mexc(symbols):
         print("Ошибка MEXC:", e)
 
     return prices
-def get_prices_okx(symbols):
-    prices = {}
 
-    try:
-        r = requests.get(
-            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
-            timeout=20
-        )
 
-        data = r.json()
-
-        if data["code"] == "0":
-
-            for item in data["data"]:
-
-                symbol = (
-                    item["instId"]
-                    .replace("-", "")
-                    .replace("SWAP", "")
-                )
-
-                if symbol in symbols:
-
-                    try:
-                        price = float(item["last"])
-
-                        if price > 0:
-                            prices[symbol] = price
-
-                    except:
-                        pass
-
-    except Exception as e:
-        print("Ошибка OKX:", e)
-
-    return prices
-
-def get_prices_bitget(symbols):
-    prices = {}
-
-    try:
-        r = requests.get(
-            "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES",
-            timeout=20
-        )
-
-        data = r.json()
-
-        if data["code"] == "00000":
-
-            for item in data["data"]:
-
-                symbol = item["symbol"].replace("_", "")
-
-                if symbol in symbols:
-
-                    try:
-                        price = float(item["lastPr"])
-
-                        if price > 0:
-                            prices[symbol] = price
-
-                    except:
-                        pass
-
-    except Exception as e:
-        print("Ошибка Bitget:", e)
-
-    return prices
 def calculate_rsi(prices, window=5):
     try:
         if len(prices) < window + 1:
@@ -190,44 +113,21 @@ async def monitor():
     symbols = get_symbols()
     last_symbols_update = time.time()
 
-    send_message(
-        f"✅ Бот запущен\n\n"
-        f"Монет: {len(symbols)}",
-        config.CHAT_ID
-    )
+    send_message("✅ Бот запущен", config.CHAT_ID)
 
     while True:
         try:
             now = time.time()
 
-            # обновляем список монет каждый час
+            # обновление списка монет каждый час
             if now - last_symbols_update >= 3600:
                 symbols = get_symbols()
                 last_symbols_update = now
                 print("Список монет обновлен")
 
-            # получаем цены с бирж
-            mexc_prices = get_prices_mexc(symbols)
-            okx_prices = get_prices_okx(symbols)
-            bitget_prices = get_prices_bitget(symbols)
+            prices = get_prices(symbols)
 
-            prices = {}
-
-            # MEXC — основной источник
-            for sym, price in mexc_prices.items():
-                prices[sym] = (price, "MEXC")
-
-            # OKX — резервный
-            for sym, price in okx_prices.items():
-                if sym not in prices:
-                    prices[sym] = (price, "OKX")
-
-            # Bitget — резервный
-            for sym, price in bitget_prices.items():
-                if sym not in prices:
-                    prices[sym] = (price, "Bitget")
-
-            for sym, (price, exchange) in prices.items():
+            for sym, price in prices.items():
 
                 if price <= 0:
                     continue
@@ -235,39 +135,37 @@ async def monitor():
                 if sym not in price_history:
                     price_history[sym] = []
 
-                # сохраняем цену
+                # добавляем цену
                 price_history[sym].append((now, price))
 
-                # храним историю 24 часа
+                # храним историю минимум сутки
+                history_time = max(current_window * 2, 86400)
+
                 price_history[sym] = [
                     x for x in price_history[sym]
-                    if now - x[0] <= 86400
+                    if now - x[0] <= history_time
                 ]
 
-                if len(price_history[sym]) < 2:
-                    continue
-
-                # цена current_window назад
-                old_prices = [
-                    p for t, p in price_history[sym]
-                    if now - t >= current_window
+                # окно для роста
+                recent_prices = [
+                    x for x in price_history[sym]
+                    if now - x[0] <= current_window
                 ]
 
-                if not old_prices:
+                if len(recent_prices) < 2:
                     continue
 
-                old_price = old_prices[0]
+                old_price = recent_prices[0][1]
 
                 if old_price <= 0:
                     continue
 
                 growth = ((price - old_price) / old_price) * 100
 
-                # RSI по последним 100 значениям
-                prices_list = [p for _, p in price_history[sym][-100:]]
+                # RSI по последним 100 ценам
+                prices_list = [x[1] for x in price_history[sym][-100:]]
                 rsi = calculate_rsi(prices_list, window=5)
 
-                # сигнал на рост и падение
                 if abs(growth) >= current_percent:
 
                     # антиспам
@@ -279,7 +177,6 @@ async def monitor():
                         text = (
                             f"🚀 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
-                            f"Биржа: {exchange}\n"
                             f"Цена: {price}\n"
                             f"Рост: +{growth:.2f}%\n"
                         )
@@ -287,15 +184,14 @@ async def monitor():
                         text = (
                             f"📉 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
-                            f"Биржа: {exchange}\n"
                             f"Цена: {price}\n"
                             f"Падение: {growth:.2f}%\n"
                         )
 
                     if rsi is not None:
-                        text += f"📊 RSI: {rsi:.2f}"
+                        text += f"\n📊 RSI: {rsi:.2f}"
                     else:
-                        text += "📊 RSI: ожидание данных"
+                        text += "\n📊 RSI: ожидание данных"
 
                     send_message(text, config.CHAT_ID)
 
@@ -306,6 +202,28 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(5)
+def send_keyboard(chat_id):
+    keyboard = {
+        "keyboard": [
+            ["📈 0.2%", "📈 5%", "📈 10%"],
+            ["📈 15%", "📈 20%"],
+            ["⏱ 5 мин", "⏱ 1 час"],
+            ["⏱ 4 часа", "⏱ 1 день"],
+            ["/status"]
+        ],
+        "resize_keyboard": True
+    }
+
+    requests.post(
+        f"{URL}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": "Выберите настройки:",
+            "reply_markup": keyboard
+        }
+    )
+
+
 def handle_message(msg):
     global current_percent, current_window
 
