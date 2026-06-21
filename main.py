@@ -10,9 +10,9 @@ TOKEN = config.BOT_TOKEN
 URL = f"https://api.telegram.org/bot{TOKEN}"
 
 offset = 0
+
 def normalize_symbol(sym: str) -> str:
     return sym.upper().replace("-", "").replace("_", "").replace("/", "")
-
 price_history = {}
 last_alert = {}
 
@@ -89,6 +89,7 @@ def get_symbols():
 
 def get_prices(symbols):
     prices = {}
+    sources = {}
 
     normalized_symbols = {normalize_symbol(s): s for s in symbols}
 
@@ -109,8 +110,10 @@ def get_prices(symbols):
                 sym = normalize_symbol(inst)
 
                 if price > 0 and sym in normalized_symbols:
-                    real = normalized_symbols[sym]
-                    prices[real] = price
+                    real_sym = normalized_symbols[sym]
+
+                    prices[real_sym] = price
+                    sources[real_sym] = "OKX"
 
     except Exception as e:
         print("Ошибка OKX:", e)
@@ -131,29 +134,17 @@ def get_prices(symbols):
                 price = float(item["lastPrice"])
 
                 if price > 0 and sym in normalized_symbols:
-                    real = normalized_symbols[sym]
+                    real_sym = normalized_symbols[sym]
 
-                    if real not in prices:
-                        prices[real] = price
+                    # не перезаписываем OKX
+                    if real_sym not in prices:
+                        prices[real_sym] = price
+                        sources[real_sym] = "MEXC"
 
     except Exception as e:
         print("Ошибка MEXC:", e)
 
-    # ---------------- KUCOIN (FALLBACK 2) ----------------
-    try:
-        k = get_kucoin_prices()
-
-        for sym, price in k.items():
-            if sym in normalized_symbols:
-                real = normalized_symbols[sym]
-
-                if real not in prices:
-                    prices[real] = price
-
-    except Exception as e:
-        print("Ошибка KUCOIN fallback:", e)
-
-    return prices
+    return prices, sources
 # ---------------- RSI ----------------
 
 def calculate_rsi(prices, window=5):
@@ -274,6 +265,7 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(5)
+
 # ---------------- TELEGRAM ----------------
 
 def handle_message(msg):
