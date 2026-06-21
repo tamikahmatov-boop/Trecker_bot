@@ -66,7 +66,7 @@ def send_keyboard(chat_id):
 
 def get_symbols():
     try:
-        r = requests.get("https://public.bybit.com", timeout=20)
+        r = requests.get("https://public.bybit.com/", timeout=20)
         soup = BeautifulSoup(r.text, "html.parser")
 
         symbols = set()
