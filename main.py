@@ -209,14 +209,20 @@ async def monitor():
     while True:
         try:
             now = time.time()
+            checks_count += 1
 
-            # обновление списка монет раз в час
-            if now - last_symbols_update >= 86400:
-                symbols = get_symbols()
+            # обновление списка монет каждые 30 минут
+            if now - last_symbols_update >= 1800:
+                new_symbols = get_symbols()
+
+                if len(new_symbols) > 0:
+                    symbols = new_symbols
+                    print("Список монет обновлен:", len(symbols))
+                else:
+                    print("Не удалось обновить список монет, используется старый")
+
                 last_symbols_update = now
-                print("Список монет обновлен")
 
-            # 👇 теперь получаем и цены, и источники
             prices, sources = get_prices(symbols)
 
             for sym, price in prices.items():
@@ -230,7 +236,7 @@ async def monitor():
                 # добавляем цену
                 price_history[sym].append((now, price))
 
-                # чистим историю
+                # очищаем старые данные
                 history_time = max(current_window * 2, 86400)
 
                 price_history[sym] = [
@@ -238,7 +244,7 @@ async def monitor():
                     if now - x[0] <= history_time
                 ]
 
-                # окно роста
+                # цены за выбранный период
                 recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
@@ -254,9 +260,8 @@ async def monitor():
 
                 growth = ((price - old_price) / old_price) * 100
 
-                # RSI
                 prices_list = [x[1] for x in price_history[sym][-100:]]
-                rsi = calculate_rsi(prices_list, window=5)
+                rsi = calculate_rsi(prices_list)
 
                 if abs(growth) >= current_percent:
 
@@ -289,6 +294,7 @@ async def monitor():
 
                     send_message(text, config.CHAT_ID)
 
+                    signals_count += 1
                     last_alert[sym] = now
 
             await asyncio.sleep(config.INTERVAL)
@@ -296,11 +302,10 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(5)
-
 # ---------------- TELEGRAM ----------------
 
 def handle_message(msg):
-    global current_percent, current_window
+    global current_percent, current_window, signals_count, checks_count
 
     text = msg.get("text", "")
     chat_id = msg["chat"]["id"]
@@ -320,6 +325,28 @@ def handle_message(msg):
             f"📈 Рост: {current_percent}%\n"
             f"⏱ Период: {current_window} сек\n"
             f"🔔 Кулдаун: {config.COOLDOWN // 60} мин",
+            chat_id
+        )
+
+    elif text == "📊 Статистика":
+
+        uptime = int(time.time() - start_time)
+
+        days = uptime // 86400
+        hours = (uptime % 86400) // 3600
+        minutes = (uptime % 3600) // 60
+
+        send_message(
+            f"📊 СТАТИСТИКА\n\n"
+            f"🟢 Время работы: {days}д {hours}ч {minutes}м\n"
+            f"🪙 Монет в истории: {len(price_history)}\n"
+            f"🔔 Сигналов отправлено: {signals_count}\n"
+            f"🔄 Циклов проверки: {checks_count}\n"
+            f"📈 Порог роста: {current_percent}%\n"
+            f"⏱ Период анализа: {current_window // 60} мин\n"
+            f"⚡ Интервал проверки: {config.INTERVAL} сек\n"
+            f"🕒 Кулдаун: {config.COOLDOWN // 60} мин\n"
+            f"📌 Активных алертов: {len(last_alert)}",
             chat_id
         )
 
@@ -361,7 +388,6 @@ def handle_message(msg):
 
     else:
         send_message("❓ Неизвестная команда", chat_id)
-
 # ---------------- UPDATES ----------------
 
 def get_updates():
