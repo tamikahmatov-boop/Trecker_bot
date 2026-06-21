@@ -36,46 +36,56 @@ def send_message(text, chat_id):
         print("Ошибка Telegram:", e)
 def get_symbols():
     try:
-        r = requests.get("https://public.bybit.com/spot/", timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
+        r = requests.get(
+            "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000",
+            timeout=20
+        )
 
+        data = r.json()
         symbols = set()
 
-        for a in soup.find_all("a"):
-            symbol = a.text.strip("/")
+        if data["retCode"] == 0:
 
-            if symbol.endswith("USDT"):
-                symbols.add(symbol)
+            for item in data["result"]["list"]:
 
-        print("Загружено монет:", len(symbols))
+                symbol = item["symbol"]
+
+                # только USDT perpetual
+                if symbol.endswith("USDT"):
+                    symbols.add(symbol)
+
+        print("Загружено Bybit Futures:", len(symbols))
 
         return symbols
 
     except Exception as e:
         print("Ошибка Bybit:", e)
         return set()
-
-
-def get_prices_mexc(symbols):
+def get_prices_okx(symbols):
     prices = {}
 
     try:
         r = requests.get(
-            "https://contract.mexc.com/api/v1/contract/ticker",
+            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
             timeout=20
         )
 
         data = r.json()
 
-        if data["success"]:
+        if data["code"] == "0":
+
             for item in data["data"]:
 
-                symbol = item["symbol"].replace("_", "")
+                symbol = (
+                    item["instId"]
+                    .replace("-", "")
+                    .replace("SWAP", "")
+                )
 
                 if symbol in symbols:
 
                     try:
-                        price = float(item["lastPrice"])
+                        price = float(item["last"])
 
                         if price > 0:
                             prices[symbol] = price
@@ -84,10 +94,9 @@ def get_prices_mexc(symbols):
                         pass
 
     except Exception as e:
-        print("Ошибка MEXC:", e)
+        print("Ошибка OKX:", e)
 
     return prices
-
 def get_prices_okx(symbols):
     prices = {}
 
@@ -125,7 +134,7 @@ def get_prices_bitget(symbols):
 
     try:
         r = requests.get(
-            "https://api.bitget.com/api/v2/spot/market/tickers",
+            "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES",
             timeout=20
         )
 
@@ -135,7 +144,7 @@ def get_prices_bitget(symbols):
 
             for item in data["data"]:
 
-                symbol = item["symbol"]
+                symbol = item["symbol"].replace("_", "")
 
                 if symbol in symbols:
 
@@ -176,7 +185,11 @@ async def monitor():
     symbols = get_symbols()
     last_symbols_update = time.time()
 
-    send_message("✅ Бот запущен", config.CHAT_ID)
+    send_message(
+        f"✅ Бот запущен\n\n"
+        f"Монет: {len(symbols)}",
+        config.CHAT_ID
+    )
 
     while True:
         try:
@@ -220,24 +233,25 @@ async def monitor():
                 # сохраняем цену
                 price_history[sym].append((now, price))
 
-                # храним историю минимум сутки
-                history_time = max(current_window * 2, 86400)
-
+                # храним историю 24 часа
                 price_history[sym] = [
                     x for x in price_history[sym]
-                    if now - x[0] <= history_time
+                    if now - x[0] <= 86400
                 ]
 
-                # цены за выбранный период
-                recent_prices = [
-                    x for x in price_history[sym]
-                    if now - x[0] <= current_window
-                ]
-
-                if len(recent_prices) < 2:
+                if len(price_history[sym]) < 2:
                     continue
 
-                old_price = recent_prices[0][1]
+                # цена current_window назад
+                old_prices = [
+                    p for t, p in price_history[sym]
+                    if now - t >= current_window
+                ]
+
+                if not old_prices:
+                    continue
+
+                old_price = old_prices[0]
 
                 if old_price <= 0:
                     continue
@@ -245,9 +259,10 @@ async def monitor():
                 growth = ((price - old_price) / old_price) * 100
 
                 # RSI по последним 100 значениям
-                prices_list = [x[1] for x in price_history[sym][-100:]]
+                prices_list = [p for _, p in price_history[sym][-100:]]
                 rsi = calculate_rsi(prices_list, window=5)
 
+                # сигнал на рост и падение
                 if abs(growth) >= current_percent:
 
                     # антиспам
@@ -273,11 +288,12 @@ async def monitor():
                         )
 
                     if rsi is not None:
-                        text += f"\n📊 RSI: {rsi:.2f}"
+                        text += f"📊 RSI: {rsi:.2f}"
                     else:
-                        text += "\n📊 RSI: ожидание данных"
+                        text += "📊 RSI: ожидание данных"
 
                     send_message(text, config.CHAT_ID)
+
                     last_alert[sym] = now
 
             await asyncio.sleep(config.INTERVAL)
@@ -285,28 +301,6 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(5)
-def send_keyboard(chat_id):
-    keyboard = {
-        "keyboard": [
-            ["📈 0.2%", "📈 5%", "📈 10%"],
-            ["📈 15%", "📈 20%"],
-            ["⏱ 5 мин", "⏱ 1 час"],
-            ["⏱ 4 часа", "⏱ 1 день"],
-            ["/status"]
-        ],
-        "resize_keyboard": True
-    }
-
-    requests.post(
-        f"{URL}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": "Выберите настройки:",
-            "reply_markup": keyboard
-        }
-    )
-
-
 def handle_message(msg):
     global current_percent, current_window
 
