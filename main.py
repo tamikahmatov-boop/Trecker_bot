@@ -15,6 +15,9 @@ def normalize_symbol(sym: str) -> str:
     return sym.upper().replace("-", "").replace("_", "").replace("/", "")
 price_history = {}
 last_alert = {}
+signals_count = 0
+checks_count = 0
+start_time = time.time()
 
 current_percent = config.PERCENT
 current_window = config.WINDOW
@@ -45,6 +48,7 @@ def send_keyboard(chat_id):
             ["📈 15%", "📈 20%"],
             ["⏱ 5 мин", "⏱ 1 час"],
             ["⏱ 4 часа", "⏱ 1 день"],
+            ["📊 Статистика"],
             ["/status"]
         ],
         "resize_keyboard": True
@@ -207,7 +211,7 @@ async def monitor():
             now = time.time()
 
             # обновление списка монет раз в час
-            if now - last_symbols_update >= 3600:
+            if now - last_symbols_update >= 86400:
                 symbols = get_symbols()
                 last_symbols_update = now
                 print("Список монет обновлен")
