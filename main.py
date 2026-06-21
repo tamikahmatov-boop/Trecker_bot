@@ -17,11 +17,11 @@ current_percent = config.PERCENT
 current_window = config.WINDOW
 
 
-# ----------------- TELEGRAM -----------------
+# ---------------- TELEGRAM ----------------
 
 def send_message(text, chat_id):
     try:
-        r = requests.post(
+        requests.post(
             f"{URL}/sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=20
@@ -30,15 +30,39 @@ def send_message(text, chat_id):
         print("Telegram error:", e)
 
 
-# ----------------- NORMALIZE -----------------
+# ---------------- NORMALIZE ----------------
 
 def normalize(symbol: str):
     return symbol.replace("-", "").replace("_", "").upper()
 
 
-# ----------------- OKX (MAIN SOURCE) -----------------
+# ---------------- BYBIT SYMBOLS ----------------
 
-def get_okx():
+def get_symbols():
+    try:
+        r = requests.get(
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "linear"},
+            timeout=20
+        )
+
+        data = r.json()
+        symbols = set()
+
+        if data.get("retCode") == 0:
+            for item in data["result"]["list"]:
+                symbols.add(normalize(item["symbol"]))
+
+        return symbols
+
+    except Exception as e:
+        print("Bybit error:", e)
+        return set()
+
+
+# ---------------- OKX PRICES (MAIN) ----------------
+
+def get_prices():
     try:
         r = requests.get(
             "https://www.okx.com/api/v5/market/tickers",
@@ -47,98 +71,21 @@ def get_okx():
         )
 
         data = r.json()
-
         prices = {}
-        symbols = set()
 
         if data.get("code") == "0":
             for item in data["data"]:
                 sym = normalize(item["instId"])
-                price = float(item["last"])
+                prices[sym] = float(item["last"])
 
-                prices[sym] = price
-                symbols.add(sym)
-
-        return symbols, prices
+        return prices
 
     except Exception as e:
         print("OKX error:", e)
-        return set(), {}
-
-
-# ----------------- OTHER EXCHANGES -----------------
-
-def get_mexc():
-    try:
-        r = requests.get("https://api.mexc.com/api/v3/ticker/price", timeout=20)
-        data = r.json()
-
-        return {
-            normalize(i["symbol"]): float(i["price"])
-            for i in data
-        }
-
-    except:
         return {}
 
 
-def get_bingx():
-    try:
-        r = requests.get(
-            "https://open-api.bingx.com/openApi/swap/v2/quote/price",
-            timeout=20
-        )
-
-        data = r.json()
-        prices = {}
-
-        for i in data.get("data", []):
-            prices[normalize(i["symbol"])] = float(i["price"])
-
-        return prices
-
-    except:
-        return {}
-
-
-def get_kucoin():
-    try:
-        r = requests.get(
-            "https://api-futures.kucoin.com/api/v1/ticker",
-            timeout=20
-        )
-
-        data = r.json()
-        prices = {}
-
-        for i in data.get("data", []):
-            prices[normalize(i["symbol"])] = float(i["price"])
-
-        return prices
-
-    except:
-        return {}
-
-
-# ----------------- MERGE (OKX PRIORITY) -----------------
-
-def merge_prices(okx, mexc, bingx, kucoin):
-    result = {}
-
-    # OKX priority
-    for k, v in okx.items():
-        result[k] = v
-
-    # fallback
-    for src in [mexc, bingx, kucoin]:
-        for k, v in src.items():
-            if k not in result:
-                result[k] = v
-
-    return result
-
-
-# ----------------- RSI -----------------
+# ---------------- RSI ----------------
 
 def calculate_rsi(prices, window=5):
     try:
@@ -157,10 +104,12 @@ def calculate_rsi(prices, window=5):
         return None
 
 
-# ----------------- MONITOR -----------------
+# ---------------- MONITOR ----------------
 
 async def monitor():
     global current_percent, current_window
+
+    symbols = get_symbols()
 
     send_message("✅ Бот запущен", config.CHAT_ID)
 
@@ -168,15 +117,12 @@ async def monitor():
         try:
             now = time.time()
 
-            okx_symbols, okx_prices = get_okx()
-
-            mexc = get_mexc()
-            bingx = get_bingx()
-            kucoin = get_kucoin()
-
-            prices = merge_prices(okx_prices, mexc, bingx, kucoin)
+            prices = get_prices()
 
             for sym, price in prices.items():
+
+                if sym not in symbols:
+                    continue
 
                 if price <= 0:
                     continue
@@ -217,7 +163,7 @@ async def monitor():
                         f"🚀 СИГНАЛ\n\n"
                         f"Монета: {sym}\n"
                         f"Цена: {price}\n"
-                        f"{'Рост' if growth>0 else 'Падение'}: {growth:.2f}%\n"
+                        f"{'Рост' if growth > 0 else 'Падение'}: {growth:.2f}%\n"
                         f"RSI: {rsi if rsi else '—'}"
                     )
 
@@ -232,7 +178,7 @@ async def monitor():
             await asyncio.sleep(3)
 
 
-# ----------------- TELEGRAM -----------------
+# ---------------- TELEGRAM ----------------
 
 def get_updates():
     global offset
@@ -263,6 +209,7 @@ async def telegram_loop():
 
         for u in updates:
             offset = u["update_id"] + 1
+
             if "message" in u:
                 handle_message(u["message"])
 
@@ -296,7 +243,7 @@ def handle_message(msg):
         send_message("OK 5 min", chat_id)
 
 
-# ----------------- MAIN -----------------
+# ---------------- MAIN ----------------
 
 async def main():
     await asyncio.gather(
