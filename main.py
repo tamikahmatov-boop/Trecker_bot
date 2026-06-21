@@ -35,27 +35,40 @@ def send_message(text, chat_id):
     except Exception as e:
         print("Ошибка Telegram:", e)
 def get_symbols():
-    try:
-        r = requests.get("https://public.bybit.com/spot/", timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
+    urls = [
+        "https://api.bybit-global.com/v5/market/instruments-info?category=linear",
+        "https://api.bybit.com/v5/market/instruments-info?category=linear"
+    ]
 
-        symbols = set()
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=20)
 
-        for a in soup.find_all("a"):
-            symbol = a.text.strip("/")
+            try:
+                data = r.json()
+            except:
+                print("Bybit response (not JSON):", r.text[:200])
+                continue
 
-            if symbol.endswith("USDT"):
-                symbols.add(symbol)
+            if not isinstance(data, dict):
+                continue
 
-        print("Загружено монет:", len(symbols))
+            if data.get("retCode") == 0:
+                symbols = set()
 
-        return symbols
+                for item in data["result"]["list"]:
+                    sym = item.get("symbol")
 
-    except Exception as e:
-        print("Ошибка Bybit:", e)
-        return set()
+                    if sym and sym.endswith("USDT"):
+                        symbols.add(sym)
 
+                print("Загружено Bybit USDT perpetual:", len(symbols))
+                return symbols
 
+        except Exception as e:
+            print("Ошибка Bybit:", e)
+
+    return set()
 def get_prices(symbols):
     prices = {}
 
