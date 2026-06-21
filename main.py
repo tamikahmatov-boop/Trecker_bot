@@ -62,25 +62,57 @@ def send_keyboard(chat_id):
 # ---------------- SYMBOLS ----------------
 
 def get_symbols():
+    symbols = set()
+
+    # Bybit Futures
     try:
-        r = requests.get("https://public.bybit.com/spot/trading/", timeout=20)
+        r = requests.get(
+            "https://public.bybit.com/trading/",
+            timeout=20
+        )
+
         soup = BeautifulSoup(r.text, "html.parser")
 
-        symbols = set()
+        count = 0
 
         for a in soup.find_all("a"):
-            symbol = a.text.strip("/")
+            sym = a.text.strip("/")
 
-            if symbol.endswith("USDT"):
-                symbols.add(symbol)
+            if sym.endswith(("USDT", "PERP")):
+                symbols.add(sym.replace("/", ""))
+                count += 1
 
-        print("Загружено монет:", len(symbols))
-        return symbols
+        print("Trading:", count)
 
     except Exception as e:
-        print("Ошибка Bybit:", e)
-        return set()
+        print("Ошибка trading:", e)
 
+    # Bybit Spot
+    try:
+        r = requests.get(
+            "https://public.bybit.com/spot/",
+            timeout=20
+        )
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        count = 0
+
+        for a in soup.find_all("a"):
+            sym = a.text.strip("/")
+
+            if sym.endswith("USDT"):
+                symbols.add(sym)
+                count += 1
+
+        print("Spot:", count)
+
+    except Exception as e:
+        print("Ошибка spot:", e)
+
+    print("Всего монет:", len(symbols))
+
+    return symbols
 # ---------------- OKX PRICES ----------------
 
 def get_prices(symbols):
