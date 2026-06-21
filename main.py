@@ -34,8 +34,6 @@ def send_message(text, chat_id):
 
     except Exception as e:
         print("Ошибка Telegram:", e)
-
-
 def get_symbols():
     try:
         r = requests.get("https://public.bybit.com/spot/", timeout=20)
@@ -113,11 +111,20 @@ async def monitor():
     global current_percent, current_window
 
     symbols = get_symbols()
+    last_symbols_update = time.time()
+
     send_message("✅ Бот запущен", config.CHAT_ID)
 
     while True:
         try:
             now = time.time()
+
+            # обновление списка монет каждый час
+            if now - last_symbols_update >= 3600:
+                symbols = get_symbols()
+                last_symbols_update = now
+                print("Список монет обновлен")
+
             prices = get_prices(symbols)
 
             for sym, price in prices.items():
@@ -131,10 +138,12 @@ async def monitor():
                 # добавляем цену
                 price_history[sym].append((now, price))
 
-                # чистим историю (2 окна)
+                # храним историю минимум сутки
+                history_time = max(current_window * 2, 86400)
+
                 price_history[sym] = [
                     x for x in price_history[sym]
-                    if now - x[0] <= current_window * 2
+                    if now - x[0] <= history_time
                 ]
 
                 # окно для роста
@@ -153,15 +162,16 @@ async def monitor():
 
                 growth = ((price - old_price) / old_price) * 100
 
-                # RSI (ограничиваем историю)
+                # RSI по последним 100 ценам
                 prices_list = [x[1] for x in price_history[sym][-100:]]
                 rsi = calculate_rsi(prices_list, window=5)
 
                 if abs(growth) >= current_percent:
 
                     # антиспам
-                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
-                        continue
+                    if sym in last_alert:
+                        if now - last_alert[sym] < config.COOLDOWN:
+                            continue
 
                     if growth > 0:
                         text = (
@@ -179,18 +189,19 @@ async def monitor():
                         )
 
                     if rsi is not None:
-                        text += f"📊 RSI: {rsi:.2f}"
+                        text += f"\n📊 RSI: {rsi:.2f}"
                     else:
-                        text += "📊 RSI: ожидание данных"
+                        text += "\n📊 RSI: ожидание данных"
 
                     send_message(text, config.CHAT_ID)
+
                     last_alert[sym] = now
 
             await asyncio.sleep(config.INTERVAL)
 
         except Exception as e:
             print("Ошибка monitor:", e)
-            await asyncio.sleep(config.INTERVAL)
+            await asyncio.sleep(5)
 def send_keyboard(chat_id):
     keyboard = {
         "keyboard": [
@@ -291,7 +302,8 @@ def get_updates():
             params={
                 "timeout": 30,
                 "offset": offset
-            }
+            },
+            timeout=35
         )
 
         data = response.json()
@@ -303,7 +315,6 @@ def get_updates():
         print("Ошибка get_updates:", e)
 
     return []
-
 async def telegram_loop():
     global offset
 
@@ -328,4 +339,9 @@ async def main():
     )
 
 
-asyncio.run(main())
+while True:
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print("Критическая ошибка:", e)
+        time.sleep(10)
