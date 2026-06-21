@@ -3,6 +3,7 @@ import requests
 import time
 import pandas as pd
 from ta.momentum import RSIIndicator
+from bs4 import BeautifulSoup
 import config
 
 TOKEN = config.BOT_TOKEN
@@ -30,29 +31,24 @@ def send_message(text, chat_id):
         print("Telegram error:", e)
 
 
-# ---------------- NORMALIZE ----------------
-
-def normalize(symbol: str):
-    return symbol.replace("-", "").replace("_", "").upper()
-
-
-# ---------------- BYBIT SYMBOLS ----------------
+# ---------------- BYBIT (PUBLIC SYMBOLS, NO API) ----------------
 
 def get_symbols():
     try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/tickers",
-            params={"category": "linear"},
-            timeout=20
-        )
+        url = "https://www.bybit.com/markets/trading"
+        r = requests.get(url, timeout=20, headers={
+            "User-Agent": "Mozilla/5.0"
+        })
 
-        data = r.json()
+        soup = BeautifulSoup(r.text, "html.parser")
+
         symbols = set()
 
-        if data.get("retCode") == 0:
-            for item in data["result"]["list"]:
-                symbols.add(normalize(item["symbol"]))
+        for text in soup.stripped_strings:
+            if text.endswith("USDT") and 5 <= len(text) <= 12:
+                symbols.add(text.upper())
 
+        print("Bybit symbols:", len(symbols))
         return symbols
 
     except Exception as e:
@@ -60,7 +56,11 @@ def get_symbols():
         return set()
 
 
-# ---------------- OKX PRICES (MAIN) ----------------
+# ---------------- OKX PRICES (MAIN SOURCE) ----------------
+
+def normalize(symbol: str):
+    return symbol.replace("-", "").replace("_", "").upper()
+
 
 def get_prices():
     try:
