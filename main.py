@@ -66,24 +66,30 @@ def send_keyboard(chat_id):
 
 def get_symbols():
     try:
-        r = requests.get("https://public.bybit.com/", timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
+        r = requests.get(
+            "https://api.bybit.com/v5/market/instruments-info",
+            params={
+                "category": "linear",
+                "limit": 1000
+            },
+            timeout=20
+        )
+
+        data = r.json()
 
         symbols = set()
 
-        for a in soup.find_all("a"):
-            symbol = a.text.strip("/")
+        if data["retCode"] == 0:
+            for item in data["result"]["list"]:
+                if item["quoteCoin"] == "USDT":
+                    symbols.add(item["symbol"])
 
-            if symbol.endswith("USDT"):
-                symbols.add(symbol)
-
-        print("Загружено монет:", len(symbols))
+        print("Bybit symbols:", len(symbols))
         return symbols
 
     except Exception as e:
-        print("Ошибка Bybit:", e)
+        print("Ошибка Bybit symbols:", e)
         return set()
-
 
 # ---------------- OKX PRICES ----------------
 
@@ -91,58 +97,31 @@ def get_prices(symbols):
     prices = {}
     sources = {}
 
-    normalized_symbols = {normalize_symbol(s): s for s in symbols}
-
-    # ---------------- OKX ----------------
     try:
         r = requests.get(
-            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "linear"},
             timeout=20
         )
 
         data = r.json()
 
-        if "data" in data:
-            for item in data["data"]:
-                inst = item["instId"]
-                price = float(item["last"])
+        if data["retCode"] == 0:
 
-                sym = normalize_symbol(inst)
+            for item in data["result"]["list"]:
 
-                if price > 0 and sym in normalized_symbols:
-                    real_sym = normalized_symbols[sym]
+                sym = item["symbol"]
 
-                    prices[real_sym] = price
-                    sources[real_sym] = "OKX"
+                if sym in symbols:
 
-    except Exception as e:
-        print("Ошибка OKX:", e)
+                    price = float(item["lastPrice"])
 
-    # ---------------- MEXC ----------------
-    try:
-        r = requests.get(
-            "https://contract.mexc.com/api/v1/contract/ticker",
-            timeout=20
-        )
-
-        data = r.json()
-
-        if data["success"]:
-            for item in data["data"]:
-
-                sym = normalize_symbol(item["symbol"])
-                price = float(item["lastPrice"])
-
-                if price > 0 and sym in normalized_symbols:
-                    real_sym = normalized_symbols[sym]
-
-                    # не перезаписываем OKX
-                    if real_sym not in prices:
-                        prices[real_sym] = price
-                        sources[real_sym] = "MEXC"
+                    if price > 0:
+                        prices[sym] = price
+                        sources[sym] = "BYBIT"
 
     except Exception as e:
-        print("Ошибка MEXC:", e)
+        print("Ошибка Bybit prices:", e)
 
     return prices, sources
 # ---------------- RSI ----------------
