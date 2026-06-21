@@ -19,7 +19,6 @@ last_alert = {}
 current_percent = config.PERCENT
 current_window = config.WINDOW
 
-
 # ---------------- TELEGRAM ----------------
 
 def send_message(text, chat_id):
@@ -38,7 +37,6 @@ def send_message(text, chat_id):
 
     except Exception as e:
         print("Ошибка Telegram:", e)
-
 
 def send_keyboard(chat_id):
     keyboard = {
@@ -61,59 +59,20 @@ def send_keyboard(chat_id):
         }
     )
 
-
 # ---------------- SYMBOLS ----------------
 
 def get_symbols():
     try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/instruments-info",
-            params={
-                "category": "linear",
-                "limit": 1000
-            },
-            timeout=20
-        )
-
-        data = r.json()
+        r = requests.get("https://public.bybit.com/spot/trading/", timeout=20)
+        soup = BeautifulSoup(r.text, "html.parser")
 
         symbols = set()
 
-        if data["retCode"] == 0:
-            for item in data["result"]["list"]:
-                if item["quoteCoin"] == "USDT":
-                    symbols.add(item["symbol"])
+        for a in soup.find_all("a"):
+            symbol = a.text.strip("/")
 
-        print("Bybit symbols:", len(symbols))
-        return symbols
-
-    except Exception as e:
-        print("Ошибка Bybit symbols:", e)
-        return set()
-
-# ---------------- OKX PRICES ----------------
-
-def get_symbols():
-    try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/instruments-info",
-            params={
-                "category": "linear",
-                "limit": 1000
-            },
-            timeout=20
-        )
-
-        print(r.text[:1000])   # посмотреть ответ сервера
-
-        data = r.json()
-
-        symbols = set()
-
-        if data["retCode"] == 0:
-            for item in data["result"]["list"]:
-                if item["quoteCoin"] == "USDT":
-                    symbols.add(item["symbol"])
+            if symbol.endswith("USDT"):
+                symbols.add(symbol)
 
         print("Загружено монет:", len(symbols))
         return symbols
@@ -121,6 +80,67 @@ def get_symbols():
     except Exception as e:
         print("Ошибка Bybit:", e)
         return set()
+
+# ---------------- OKX PRICES ----------------
+
+def get_prices(symbols):
+    prices = {}
+    sources = {}
+
+    normalized_symbols = {normalize_symbol(s): s for s in symbols}
+
+    # ---------------- OKX ----------------
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
+            timeout=20
+        )
+
+        data = r.json()
+
+        if "data" in data:
+            for item in data["data"]:
+                inst = item["instId"]
+                price = float(item["last"])
+
+                sym = normalize_symbol(inst)
+
+                if price > 0 and sym in normalized_symbols:
+                    real_sym = normalized_symbols[sym]
+
+                    prices[real_sym] = price
+                    sources[real_sym] = "OKX"
+
+    except Exception as e:
+        print("Ошибка OKX:", e)
+
+    # ---------------- MEXC ----------------
+    try:
+        r = requests.get(
+            "https://contract.mexc.com/api/v1/contract/ticker",
+            timeout=20
+        )
+
+        data = r.json()
+
+        if data["success"]:
+            for item in data["data"]:
+
+                sym = normalize_symbol(item["symbol"])
+                price = float(item["lastPrice"])
+
+                if price > 0 and sym in normalized_symbols:
+                    real_sym = normalized_symbols[sym]
+
+                    # не перезаписываем OKX
+                    if real_sym not in prices:
+                        prices[real_sym] = price
+                        sources[real_sym] = "MEXC"
+
+    except Exception as e:
+        print("Ошибка MEXC:", e)
+
+    return prices, sources
 # ---------------- RSI ----------------
 
 def calculate_rsi(prices, window=5):
@@ -139,7 +159,6 @@ def calculate_rsi(prices, window=5):
     except Exception as e:
         print("Ошибка RSI:", e)
         return None
-
 
 # ---------------- MONITOR ----------------
 
@@ -307,7 +326,6 @@ def handle_message(msg):
     else:
         send_message("❓ Неизвестная команда", chat_id)
 
-
 # ---------------- UPDATES ----------------
 
 def get_updates():
@@ -330,7 +348,6 @@ def get_updates():
 
     return []
 
-
 async def telegram_loop():
     global offset
 
@@ -345,7 +362,6 @@ async def telegram_loop():
 
         await asyncio.sleep(1)
 
-
 # ---------------- MAIN ----------------
 
 async def main():
@@ -353,7 +369,6 @@ async def main():
         monitor(),
         telegram_loop()
     )
-
 
 while True:
     try:
