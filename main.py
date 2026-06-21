@@ -227,8 +227,10 @@ async def monitor():
 
             for sym, price in prices.items():
 
+                await asyncio.sleep(0)  # передать управление Telegram-циклу
+
                 if price <= 0:
-                    continue
+                   continue
 
                 if sym not in price_history:
                     price_history[sym] = []
@@ -414,15 +416,19 @@ async def telegram_loop():
     global offset
 
     while True:
-        updates = get_updates()
+        try:
+            updates = get_updates()
 
-        for update in updates:
-            offset = update["update_id"] + 1
+            for update in updates:
+                offset = update["update_id"] + 1
 
-            if "message" in update:
-                handle_message(update["message"])
+                if "message" in update:
+                    handle_message(update["message"])
 
-        await asyncio.sleep(1)
+        except Exception as e:
+            print("Ошибка telegram_loop:", e)
+
+        await asyncio.sleep(0.2)
 
 # ---------------- MAIN ----------------
 
