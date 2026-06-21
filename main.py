@@ -121,27 +121,37 @@ def get_prices_okx(symbols):
 
     return prices
 def get_prices_bitget(symbols):
-prices = {}
+    prices = {}
 
-try:
-    r = requests.get(
-        "https://api.bitget.com/api/v2/spot/market/tickers",
-        timeout=20
-    )
-    data = r.json()
-    if data["code"] == "00000":
-        for item in data["data"]:
-            symbol = item["symbol"]
-            if symbol in symbols:
-                try:
-                    price = float(item["lastPr"])
-                    if price > 0:
-                        prices[symbol] = price
-                except:
-                    pass
-except Exception as e:
-    print("Ошибка Bitget:", e)
-return prices
+    try:
+        r = requests.get(
+            "https://api.bitget.com/api/v2/spot/market/tickers",
+            timeout=20
+        )
+
+        data = r.json()
+
+        if data["code"] == "00000":
+
+            for item in data["data"]:
+
+                symbol = item["symbol"]
+
+                if symbol in symbols:
+
+                    try:
+                        price = float(item["lastPr"])
+
+                        if price > 0:
+                            prices[symbol] = price
+
+                    except:
+                        pass
+
+    except Exception as e:
+        print("Ошибка Bitget:", e)
+
+    return prices
 def calculate_rsi(prices, window=5):
     try:
         if len(prices) < window + 1:
