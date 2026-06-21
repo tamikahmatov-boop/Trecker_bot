@@ -93,37 +93,34 @@ def get_symbols():
 
 # ---------------- OKX PRICES ----------------
 
-def get_prices(symbols):
-    prices = {}
-    sources = {}
-
+def get_symbols():
     try:
         r = requests.get(
-            "https://api.bybit.com/v5/market/tickers",
-            params={"category": "linear"},
+            "https://api.bybit.com/v5/market/instruments-info",
+            params={
+                "category": "linear",
+                "limit": 1000
+            },
             timeout=20
         )
 
+        print(r.text[:1000])   # посмотреть ответ сервера
+
         data = r.json()
 
+        symbols = set()
+
         if data["retCode"] == 0:
-
             for item in data["result"]["list"]:
+                if item["quoteCoin"] == "USDT":
+                    symbols.add(item["symbol"])
 
-                sym = item["symbol"]
-
-                if sym in symbols:
-
-                    price = float(item["lastPrice"])
-
-                    if price > 0:
-                        prices[sym] = price
-                        sources[sym] = "BYBIT"
+        print("Загружено монет:", len(symbols))
+        return symbols
 
     except Exception as e:
-        print("Ошибка Bybit prices:", e)
-
-    return prices, sources
+        print("Ошибка Bybit:", e)
+        return set()
 # ---------------- RSI ----------------
 
 def calculate_rsi(prices, window=5):
