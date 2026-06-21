@@ -35,34 +35,50 @@ def send_message(text, chat_id):
     except Exception as e:
         print("Ошибка Telegram:", e)
 def get_symbols():
-    try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000",
-            timeout=20
-        )
+    urls = [
+        "https://api.bybit-global.com/v5/market/instruments-info?category=linear&limit=1000",
+        "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
+    ]
 
+    for url in urls:
         try:
-            data = r.json()
-        except Exception:
-            print("Bybit response:")
-            print(r.text)
-            return set()
+            r = requests.get(url, timeout=20)
 
-        symbols = set()
+            # защита от HTML / Cloudflare / блокировок
+            try:
+                data = r.json()
+            except Exception:
+                print("Bybit response (не JSON):")
+                print(r.text[:500])  # ограничиваем вывод
+                continue
 
-        if data.get("retCode") == 0:
-            for item in data["result"]["list"]:
-                symbol = item["symbol"]
+            # проверка структуры ответа
+            if not isinstance(data, dict):
+                print("Bybit response (не dict):", type(data))
+                continue
 
-                if symbol.endswith("USDT"):
-                    symbols.add(symbol)
+            symbols = set()
 
-        print("Загружено Bybit Futures:", len(symbols))
-        return symbols
+            # нормальный ответ Bybit
+            if data.get("retCode") == 0 and "result" in data:
+                for item in data["result"].get("list", []):
+                    symbol = item.get("symbol")
 
-    except Exception as e:
-        print("Ошибка Bybit:", e)
-        return set()
+                    if symbol and symbol.endswith("USDT"):
+                        symbols.add(symbol)
+
+                print(f"Загружено Bybit Futures: {len(symbols)}")
+                return symbols
+
+            else:
+                print("Bybit API error:", data)
+
+        except Exception as e:
+            print("Ошибка Bybit URL:", url, e)
+
+    # если всё упало
+    print("Bybit недоступен — возвращаем пустой список")
+    return set()
 def get_prices_mexc(symbols):
     prices = {}
 
