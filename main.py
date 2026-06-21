@@ -20,7 +20,7 @@ current_window = config.WINDOW
 
 def send_message(text, chat_id):
     try:
-        requests.post(
+        response = requests.post(
             f"{URL}/sendMessage",
             json={
                 "chat_id": chat_id,
@@ -28,6 +28,10 @@ def send_message(text, chat_id):
             },
             timeout=20
         )
+
+        if not response.ok:
+            print("Ошибка Telegram:", response.text)
+
     except Exception as e:
         print("Ошибка Telegram:", e)
 
