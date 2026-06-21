@@ -41,26 +41,60 @@ def get_symbols():
             timeout=20
         )
 
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            print("Bybit response:")
+            print(r.text)
+            return set()
+
         symbols = set()
 
-        if data["retCode"] == 0:
-
+        if data.get("retCode") == 0:
             for item in data["result"]["list"]:
-
                 symbol = item["symbol"]
 
-                # только USDT perpetual
                 if symbol.endswith("USDT"):
                     symbols.add(symbol)
 
         print("Загружено Bybit Futures:", len(symbols))
-
         return symbols
 
     except Exception as e:
         print("Ошибка Bybit:", e)
         return set()
+def get_prices_mexc(symbols):
+    prices = {}
+
+    try:
+        r = requests.get(
+            "https://contract.mexc.com/api/v1/contract/ticker",
+            timeout=20
+        )
+
+        data = r.json()
+
+        if data["success"]:
+
+            for item in data["data"]:
+
+                symbol = item["symbol"].replace("_", "")
+
+                if symbol in symbols:
+
+                    try:
+                        price = float(item["lastPrice"])
+
+                        if price > 0:
+                            prices[symbol] = price
+
+                    except:
+                        pass
+
+    except Exception as e:
+        print("Ошибка MEXC:", e)
+
+    return prices
 def get_prices_okx(symbols):
     prices = {}
 
@@ -97,38 +131,7 @@ def get_prices_okx(symbols):
         print("Ошибка OKX:", e)
 
     return prices
-def get_prices_okx(symbols):
-    prices = {}
 
-    try:
-        r = requests.get(
-            "https://www.okx.com/api/v5/market/tickers?instType=SPOT",
-            timeout=20
-        )
-
-        data = r.json()
-
-        if data["code"] == "0":
-
-            for item in data["data"]:
-
-                symbol = item["instId"].replace("-", "")
-
-                if symbol in symbols:
-
-                    try:
-                        price = float(item["last"])
-
-                        if price > 0:
-                            prices[symbol] = price
-
-                    except:
-                        pass
-
-    except Exception as e:
-        print("Ошибка OKX:", e)
-
-    return prices
 def get_prices_bitget(symbols):
     prices = {}
 
