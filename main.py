@@ -3,6 +3,7 @@ import requests
 import time
 import pandas as pd
 from ta.momentum import RSIIndicator
+from bs4 import BeautifulSoup
 import config
 
 TOKEN = config.BOT_TOKEN
@@ -21,187 +22,141 @@ current_window = config.WINDOW
 
 def send_message(text, chat_id):
     try:
-        requests.post(
+        response = requests.post(
             f"{URL}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json={
+                "chat_id": chat_id,
+                "text": text
+            },
             timeout=20
         )
+
+        if not response.ok:
+            print("Ошибка Telegram:", response.text)
+
     except Exception as e:
-        print("Telegram error:", e)
+        print("Ошибка Telegram:", e)
 
 
-# ---------------- SYMBOLS (OKX as BASE LIST) ----------------
+def send_keyboard(chat_id):
+    keyboard = {
+        "keyboard": [
+            ["📈 0.2%", "📈 5%", "📈 10%"],
+            ["📈 15%", "📈 20%"],
+            ["⏱ 5 мин", "⏱ 1 час"],
+            ["⏱ 4 часа", "⏱ 1 день"],
+            ["/status"]
+        ],
+        "resize_keyboard": True
+    }
 
-def normalize(sym: str):
-    return sym.replace("-", "").replace("_", "").upper()
+    requests.post(
+        f"{URL}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": "Выберите настройки:",
+            "reply_markup": keyboard
+        }
+    )
 
+
+# ---------------- SYMBOLS ----------------
 
 def get_symbols():
-    """
-    Берём список символов с OKX (самый стабильный источник)
-    """
+    try:
+        r = requests.get("https://public.bybit.com/spot/", timeout=20)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        symbols = set()
+
+        for a in soup.find_all("a"):
+            symbol = a.text.strip("/")
+
+            if symbol.endswith("USDT"):
+                symbols.add(symbol)
+
+        print("Загружено монет:", len(symbols))
+        return symbols
+
+    except Exception as e:
+        print("Ошибка Bybit:", e)
+        return set()
+
+
+# ---------------- OKX PRICES ----------------
+
+def get_okx_prices():
+    prices = {}
+
     try:
         r = requests.get(
-            "https://www.okx.com/api/v5/market/tickers",
-            params={"instType": "SPOT"},
+            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
             timeout=20
         )
 
         data = r.json()
 
-        symbols = set()
+        if "data" in data:
+            for item in data["data"]:
+                inst = item["instId"]
+                price = float(item["last"])
 
-        if data.get("code") == "0":
-            for item in data.get("data", []):
-                sym = normalize(item.get("instId", ""))
-                if sym:
-                    symbols.add(sym)
-
-        print("Symbols loaded:", len(symbols))
-        return symbols
+                if price > 0:
+                    symbol = inst.replace("-SWAP", "").replace("-", "")
+                    prices[symbol] = price
 
     except Exception as e:
-        print("Symbols error:", e)
-        return set()
+        print("Ошибка OKX:", e)
+
+    return prices
 
 
-# ---------------- EXCHANGES ----------------
+# ---------------- MEXC FALLBACK ----------------
 
-def get_okx():
+def get_mexc_prices(symbols):
+    prices = {}
+
     try:
         r = requests.get(
-            "https://www.okx.com/api/v5/market/tickers",
-            params={"instType": "SPOT"},
+            "https://contract.mexc.com/api/v1/contract/ticker",
             timeout=20
         )
 
-        data = r.json().get("data", [])
-        prices = {}
+        data = r.json()
 
-        for item in data:
-            sym = normalize(item.get("instId", ""))
-            price = item.get("last")
+        if data["success"]:
+            for item in data["data"]:
 
-            if sym and price:
-                prices[sym] = float(price)
+                symbol = item["symbol"].replace("_", "")
+                price = float(item["lastPrice"])
 
-        return prices
-
-    except Exception as e:
-        print("OKX error:", e)
-        return {}
-
-
-def get_mexc():
-    try:
-        r = requests.get("https://api.mexc.com/api/v3/ticker/price", timeout=20)
-        return {item["symbol"]: float(item["price"]) for item in r.json()}
-    except:
-        return {}
-
-
-def get_bitget():
-    try:
-        r = requests.get(
-            "https://api.bitget.com/api/spot/v1/market/tickers",
-            timeout=20
-        )
-
-        data = r.json().get("data", [])
-        if not isinstance(data, list):
-            return {}
-
-        prices = {}
-
-        for item in data:
-            sym = item.get("symbol")
-            price = item.get("close")
-
-            if sym and price:
-                try:
-                    prices[sym] = float(price)
-                except:
-                    pass
-
-        return prices
+                if price > 0 and symbol in symbols:
+                    prices[symbol] = price
 
     except Exception as e:
-        print("Bitget error:", e)
-        return {}
+        print("Ошибка MEXC:", e)
+
+    return prices
 
 
-def get_kucoin():
-    try:
-        r = requests.get(
-            "https://api.kucoin.com/api/v1/market/allTickers",
-            timeout=20
-        )
-
-        data = r.json()["data"]["ticker"]
-        prices = {}
-
-        for item in data:
-            sym = item["symbol"].replace("-", "")
-            prices[sym] = float(item["last"])
-
-        return prices
-
-    except:
-        return {}
-
-
-def get_bingx():
-    try:
-        r = requests.get(
-            "https://open-api.bingx.com/openApi/spot/v1/ticker/price",
-            timeout=20
-        )
-
-        data = r.json().get("data", [])
-        prices = {}
-
-        for item in data:
-            sym = item.get("symbol")
-            price = item.get("price") or item.get("lastPrice") or item.get("last")
-
-            if sym and price:
-                try:
-                    prices[sym] = float(price)
-                except:
-                    pass
-
-        return prices
-
-    except Exception as e:
-        print("BingX error:", e)
-        return {}
-
-
-# ---------------- COMBINED PRICES ----------------
+# ---------------- PRICE ENGINE ----------------
 
 def get_prices(symbols):
-    all_prices = {}
+    prices = {}
 
-    sources = [
-        get_okx,
-        get_mexc,
-        get_bitget,
-        get_kucoin,
-        get_bingx
-    ]
+    # OKX (основной)
+    okx = get_okx_prices()
+    for sym in symbols:
+        if sym in okx:
+            prices[sym] = okx[sym]
 
-    for source in sources:
-        try:
-            data = source()
+    # fallback MEXC
+    mexc = get_mexc_prices(symbols)
+    for sym, price in mexc.items():
+        if sym not in prices:
+            prices[sym] = price
 
-            for sym, price in data.items():
-                if normalize(sym) in symbols:
-                    all_prices[normalize(sym)] = price
-
-        except Exception as e:
-            print("Source error:", e)
-
-    return all_prices
+    return prices
 
 
 # ---------------- RSI ----------------
@@ -219,7 +174,8 @@ def calculate_rsi(prices, window=5):
 
         return round(float(rsi), 2)
 
-    except:
+    except Exception as e:
+        print("Ошибка RSI:", e)
         return None
 
 
@@ -229,11 +185,18 @@ async def monitor():
     global current_percent, current_window
 
     symbols = get_symbols()
+    last_symbols_update = time.time()
+
     send_message("✅ Бот запущен", config.CHAT_ID)
 
     while True:
         try:
             now = time.time()
+
+            if now - last_symbols_update >= 3600:
+                symbols = get_symbols()
+                last_symbols_update = now
+                print("Список монет обновлен")
 
             prices = get_prices(symbols)
 
@@ -247,27 +210,30 @@ async def monitor():
 
                 price_history[sym].append((now, price))
 
-                # cleanup
                 history_time = max(current_window * 2, 86400)
+
                 price_history[sym] = [
                     x for x in price_history[sym]
                     if now - x[0] <= history_time
                 ]
 
-                recent = [
+                recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
                 ]
 
-                if len(recent) < 2:
+                if len(recent_prices) < 2:
                     continue
 
-                old_price = recent[0][1]
+                old_price = recent_prices[0][1]
+
+                if old_price <= 0:
+                    continue
 
                 growth = ((price - old_price) / old_price) * 100
 
                 prices_list = [x[1] for x in price_history[sym][-100:]]
-                rsi = calculate_rsi(prices_list)
+                rsi = calculate_rsi(prices_list, window=5)
 
                 if abs(growth) >= current_percent:
 
@@ -275,13 +241,25 @@ async def monitor():
                         if now - last_alert[sym] < config.COOLDOWN:
                             continue
 
-                    text = (
-                        f"🚀 СИГНАЛ\n\n"
-                        f"Монета: {sym}\n"
-                        f"Цена: {price}\n"
-                        f"{'Рост' if growth > 0 else 'Падение'}: {growth:.2f}%\n"
-                        f"RSI: {rsi if rsi else '—'}"
-                    )
+                    if growth > 0:
+                        text = (
+                            f"🚀 СИГНАЛ\n\n"
+                            f"Монета: {sym}\n"
+                            f"Цена: {price}\n"
+                            f"Рост: +{growth:.2f}%\n"
+                        )
+                    else:
+                        text = (
+                            f"📉 СИГНАЛ\n\n"
+                            f"Монета: {sym}\n"
+                            f"Цена: {price}\n"
+                            f"Падение: {growth:.2f}%\n"
+                        )
+
+                    if rsi is not None:
+                        text += f"\n📊 RSI: {rsi:.2f}"
+                    else:
+                        text += "\n📊 RSI: ожидание данных"
 
                     send_message(text, config.CHAT_ID)
                     last_alert[sym] = now
@@ -289,42 +267,11 @@ async def monitor():
             await asyncio.sleep(config.INTERVAL)
 
         except Exception as e:
-            print("monitor error:", e)
-            await asyncio.sleep(3)
+            print("Ошибка monitor:", e)
+            await asyncio.sleep(5)
 
 
 # ---------------- TELEGRAM ----------------
-
-def get_updates():
-    global offset
-
-    try:
-        r = requests.get(
-            f"{URL}/getUpdates",
-            params={"timeout": 30, "offset": offset},
-            timeout=35
-        )
-
-        data = r.json()
-        return data.get("result", [])
-
-    except:
-        return []
-
-
-async def telegram_loop():
-    global offset
-
-    while True:
-        updates = get_updates()
-
-        for u in updates:
-            offset = u["update_id"] + 1
-            if "message" in u:
-                handle_message(u["message"])
-
-        await asyncio.sleep(1)
-
 
 def handle_message(msg):
     global current_percent, current_window
@@ -334,23 +281,98 @@ def handle_message(msg):
 
     if text == "/start":
         send_message(
-            f"🚀 Бот\n📈 {current_percent}%\n⏱ {current_window}s",
+            f"🚀 Бот запущен\n\n"
+            f"📈 Рост: {current_percent}%\n"
+            f"⏱ Период: {current_window // 60} мин\n",
             chat_id
         )
+        send_keyboard(chat_id)
 
     elif text == "/status":
         send_message(
-            f"📊 {current_percent}%\n⏱ {current_window}s",
+            f"📊 Настройки\n\n"
+            f"📈 Рост: {current_percent}%\n"
+            f"⏱ Период: {current_window} сек\n"
+            f"🔔 Кулдаун: {config.COOLDOWN // 60} мин",
             chat_id
         )
 
+    elif text == "📈 0.2%":
+        current_percent = 0.2
+        send_message("✅ 0.2%", chat_id)
+
     elif text == "📈 5%":
         current_percent = 5
-        send_message("OK", chat_id)
+        send_message("✅ 5%", chat_id)
+
+    elif text == "📈 10%":
+        current_percent = 10
+        send_message("✅ 10%", chat_id)
+
+    elif text == "📈 15%":
+        current_percent = 15
+        send_message("✅ 15%", chat_id)
+
+    elif text == "📈 20%":
+        current_percent = 20
+        send_message("✅ 20%", chat_id)
 
     elif text == "⏱ 5 мин":
         current_window = 300
-        send_message("OK", chat_id)
+        send_message("✅ 5 мин", chat_id)
+
+    elif text == "⏱ 1 час":
+        current_window = 3600
+        send_message("✅ 1 час", chat_id)
+
+    elif text == "⏱ 4 часа":
+        current_window = 14400
+        send_message("✅ 4 часа", chat_id)
+
+    elif text == "⏱ 1 день":
+        current_window = 86400
+        send_message("✅ 1 день", chat_id)
+
+    else:
+        send_message("❓ Неизвестная команда", chat_id)
+
+
+# ---------------- UPDATES ----------------
+
+def get_updates():
+    global offset
+
+    try:
+        response = requests.get(
+            f"{URL}/getUpdates",
+            params={"timeout": 30, "offset": offset},
+            timeout=35
+        )
+
+        data = response.json()
+
+        if data["ok"]:
+            return data["result"]
+
+    except Exception as e:
+        print("Ошибка get_updates:", e)
+
+    return []
+
+
+async def telegram_loop():
+    global offset
+
+    while True:
+        updates = get_updates()
+
+        for update in updates:
+            offset = update["update_id"] + 1
+
+            if "message" in update:
+                handle_message(update["message"])
+
+        await asyncio.sleep(1)
 
 
 # ---------------- MAIN ----------------
@@ -366,5 +388,5 @@ while True:
     try:
         asyncio.run(main())
     except Exception as e:
-        print("CRITICAL:", e)
+        print("Критическая ошибка:", e)
         time.sleep(10)
