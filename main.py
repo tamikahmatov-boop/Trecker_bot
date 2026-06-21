@@ -56,7 +56,7 @@ def get_symbols():
         return set()
 
 
-def get_prices(symbols):
+def get_prices_mexc(symbols):
     prices = {}
 
     try:
@@ -88,7 +88,38 @@ def get_prices(symbols):
 
     return prices
 
+def get_prices_okx(symbols):
+    prices = {}
 
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/tickers?instType=SPOT",
+            timeout=20
+        )
+
+        data = r.json()
+
+        if data["code"] == "0":
+
+            for item in data["data"]:
+
+                symbol = item["instId"].replace("-", "")
+
+                if symbol in symbols:
+
+                    try:
+                        price = float(item["last"])
+
+                        if price > 0:
+                            prices[symbol] = price
+
+                    except:
+                        pass
+
+    except Exception as e:
+        print("Ошибка OKX:", e)
+
+    return prices
 def calculate_rsi(prices, window=5):
     try:
         if len(prices) < window + 1:
@@ -119,15 +150,28 @@ async def monitor():
         try:
             now = time.time()
 
-            # обновление списка монет каждый час
+            # обновление списка монет раз в час
             if now - last_symbols_update >= 3600:
                 symbols = get_symbols()
                 last_symbols_update = now
                 print("Список монет обновлен")
 
-            prices = get_prices(symbols)
+            # цены с MEXC и OKX
+            mexc_prices = get_prices_mexc(symbols)
+            okx_prices = get_prices_okx(symbols)
 
-            for sym, price in prices.items():
+            prices = {}
+
+            # сначала MEXC
+            for sym, price in mexc_prices.items():
+                prices[sym] = (price, "MEXC")
+
+            # если монеты нет на MEXC, берем с OKX
+            for sym, price in okx_prices.items():
+                if sym not in prices:
+                    prices[sym] = (price, "OKX")
+
+            for sym, (price, exchange) in prices.items():
 
                 if price <= 0:
                     continue
@@ -135,7 +179,7 @@ async def monitor():
                 if sym not in price_history:
                     price_history[sym] = []
 
-                # добавляем цену
+                # сохраняем цену
                 price_history[sym].append((now, price))
 
                 # храним историю минимум сутки
@@ -146,7 +190,7 @@ async def monitor():
                     if now - x[0] <= history_time
                 ]
 
-                # окно для роста
+                # цены за выбранный период
                 recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
@@ -162,7 +206,7 @@ async def monitor():
 
                 growth = ((price - old_price) / old_price) * 100
 
-                # RSI по последним 100 ценам
+                # RSI по последним 100 значениям
                 prices_list = [x[1] for x in price_history[sym][-100:]]
                 rsi = calculate_rsi(prices_list, window=5)
 
@@ -177,6 +221,7 @@ async def monitor():
                         text = (
                             f"🚀 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
+                            f"Биржа: {exchange}\n"
                             f"Цена: {price}\n"
                             f"Рост: +{growth:.2f}%\n"
                         )
@@ -184,17 +229,17 @@ async def monitor():
                         text = (
                             f"📉 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
+                            f"Биржа: {exchange}\n"
                             f"Цена: {price}\n"
                             f"Падение: {growth:.2f}%\n"
                         )
 
                     if rsi is not None:
-                        text += f"\n📊 RSI: {rsi:.2f}"
+                        text += f"📊 RSI: {rsi:.2f}"
                     else:
-                        text += "\n📊 RSI: ожидание данных"
+                        text += "📊 RSI: ожидание данных"
 
                     send_message(text, config.CHAT_ID)
-
                     last_alert[sym] = now
 
             await asyncio.sleep(config.INTERVAL)
