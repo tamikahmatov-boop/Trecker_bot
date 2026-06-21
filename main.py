@@ -33,20 +33,24 @@ def send_message(text, chat_id):
 
 # ---------------- BYBIT (PUBLIC SYMBOLS, NO API) ----------------
 
+import requests
+
 def get_symbols():
     try:
-        url = "https://www.bybit.com/markets/trading"
-        r = requests.get(url, timeout=20, headers={
-            "User-Agent": "Mozilla/5.0"
-        })
+        url = "https://api.bybit.com/v5/market/instruments-info"
 
-        soup = BeautifulSoup(r.text, "html.parser")
+        params = {
+            "category": "linear"   # USDT perpetual
+        }
+
+        r = requests.get(url, params=params, timeout=20)
+        data = r.json()
 
         symbols = set()
 
-        for text in soup.stripped_strings:
-            if text.endswith("USDT") and 5 <= len(text) <= 12:
-                symbols.add(text.upper())
+        if data.get("retCode") == 0:
+            for item in data["result"]["list"]:
+                symbols.add(item["symbol"])  # BTCUSDT
 
         print("Bybit symbols:", len(symbols))
         return symbols
