@@ -199,7 +199,7 @@ def calculate_rsi(prices, window=5):
 # ---------------- MONITOR ----------------
 
 async def monitor():
-    global current_percent, current_window
+    global current_percent, current_window, signals_count, checks_count
 
     symbols = get_symbols()
     last_symbols_update = time.time()
