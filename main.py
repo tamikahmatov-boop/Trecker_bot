@@ -72,26 +72,31 @@ def send_message(text, chat_id):
         print("Ошибка Telegram:", e)
 def get_symbols():
     try:
-        r = requests.get("https://public.bybit.com/spot/", timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
+        url = "https://api.bybit.com/v5/market/instruments-info"
+
+        params = {
+            "category": "linear"   # USDT perpetual
+        }
+
+        r = requests.get(url, params=params, timeout=20)
+        data = r.json()
 
         symbols = set()
 
-        for a in soup.find_all("a"):
-            symbol = a.text.strip("/")
+        if data.get("retCode") == 0:
+            for item in data["result"]["list"]:
+                symbol = item["symbol"]
 
-            if symbol.endswith("USDT"):
-                symbols.add(symbol)
+                # только USDT пары
+                if symbol.endswith("USDT"):
+                    symbols.add(symbol)
 
-        print("Загружено монет:", len(symbols))
-
+        print("Bybit perpetual загружено:", len(symbols))
         return symbols
 
     except Exception as e:
-        print("Ошибка Bybit:", e)
+        print("Ошибка Bybit symbols:", e)
         return set()
-
-
 def get_prices(symbols):
     prices = {}
 
