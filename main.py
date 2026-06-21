@@ -47,13 +47,11 @@ def get_symbols():
             try:
                 data = r.json()
             except:
-                print("Bybit response (not JSON):", r.text[:200])
+                print("Bybit not JSON:", r.text[:200])
                 continue
 
-            if not isinstance(data, dict):
-                continue
+            if isinstance(data, dict) and data.get("retCode") == 0:
 
-            if data.get("retCode") == 0:
                 symbols = set()
 
                 for item in data["result"]["list"]:
@@ -62,11 +60,11 @@ def get_symbols():
                     if sym and sym.endswith("USDT"):
                         symbols.add(sym)
 
-                print("Загружено Bybit USDT perpetual:", len(symbols))
+                print("Bybit USDT loaded:", len(symbols))
                 return symbols
 
         except Exception as e:
-            print("Ошибка Bybit:", e)
+            print("Bybit error:", e)
 
     return set()
 def get_prices(symbols):
