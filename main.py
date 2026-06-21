@@ -87,36 +87,9 @@ def get_symbols():
 
 # ---------------- OKX PRICES ----------------
 
-def get_okx_prices():
-    prices = {}
-
-    try:
-        r = requests.get(
-            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
-            timeout=20
-        )
-
-        data = r.json()
-
-        if "data" in data:
-            for item in data["data"]:
-                inst = item["instId"]
-                price = float(item["last"])
-
-                if price > 0:
-                    symbol = inst.replace("-SWAP", "").replace("-", "")
-                    prices[symbol] = price
-
-    except Exception as e:
-        print("Ошибка OKX:", e)
-
-    return prices
-
-
-# ---------------- MEXC FALLBACK ----------------
-
 def get_prices(symbols):
     prices = {}
+    sources = {}
 
     normalized_symbols = {normalize_symbol(s): s for s in symbols}
 
@@ -137,7 +110,10 @@ def get_prices(symbols):
                 sym = normalize_symbol(inst)
 
                 if price > 0 and sym in normalized_symbols:
-                    prices[normalized_symbols[sym]] = price
+                    real_sym = normalized_symbols[sym]
+
+                    prices[real_sym] = price
+                    sources[real_sym] = "OKX"
 
     except Exception as e:
         print("Ошибка OKX:", e)
@@ -158,17 +134,17 @@ def get_prices(symbols):
                 price = float(item["lastPrice"])
 
                 if price > 0 and sym in normalized_symbols:
+                    real_sym = normalized_symbols[sym]
 
-                    real_symbol = normalized_symbols[sym]
-
-                    if real_symbol not in prices:
-                        prices[real_symbol] = price
+                    # не перезаписываем OKX
+                    if real_sym not in prices:
+                        prices[real_sym] = price
+                        sources[real_sym] = "MEXC"
 
     except Exception as e:
         print("Ошибка MEXC:", e)
 
-    return prices
-
+    return prices, sources
 # ---------------- RSI ----------------
 
 def calculate_rsi(prices, window=5):
@@ -203,12 +179,14 @@ async def monitor():
         try:
             now = time.time()
 
+            # обновление списка монет раз в час
             if now - last_symbols_update >= 3600:
                 symbols = get_symbols()
                 last_symbols_update = now
                 print("Список монет обновлен")
 
-            prices = get_prices(symbols)
+            # 👇 теперь получаем и цены, и источники
+            prices, sources = get_prices(symbols)
 
             for sym, price in prices.items():
 
@@ -218,8 +196,10 @@ async def monitor():
                 if sym not in price_history:
                     price_history[sym] = []
 
+                # добавляем цену
                 price_history[sym].append((now, price))
 
+                # чистим историю
                 history_time = max(current_window * 2, 86400)
 
                 price_history[sym] = [
@@ -227,6 +207,7 @@ async def monitor():
                     if now - x[0] <= history_time
                 ]
 
+                # окно роста
                 recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
@@ -242,27 +223,31 @@ async def monitor():
 
                 growth = ((price - old_price) / old_price) * 100
 
+                # RSI
                 prices_list = [x[1] for x in price_history[sym][-100:]]
                 rsi = calculate_rsi(prices_list, window=5)
 
                 if abs(growth) >= current_percent:
 
+                    # антиспам
                     if sym in last_alert:
                         if now - last_alert[sym] < config.COOLDOWN:
                             continue
+
+                    source = sources.get(sym, "UNKNOWN")
 
                     if growth > 0:
                         text = (
                             f"🚀 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
-                            f"Цена: {price}\n"
+                            f"Цена: {price} ({source})\n"
                             f"Рост: +{growth:.2f}%\n"
                         )
                     else:
                         text = (
                             f"📉 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
-                            f"Цена: {price}\n"
+                            f"Цена: {price} ({source})\n"
                             f"Падение: {growth:.2f}%\n"
                         )
 
@@ -272,6 +257,7 @@ async def monitor():
                         text += "\n📊 RSI: ожидание данных"
 
                     send_message(text, config.CHAT_ID)
+
                     last_alert[sym] = now
 
             await asyncio.sleep(config.INTERVAL)
@@ -279,8 +265,6 @@ async def monitor():
         except Exception as e:
             print("Ошибка monitor:", e)
             await asyncio.sleep(5)
-
-
 # ---------------- TELEGRAM ----------------
 
 def handle_message(msg):
