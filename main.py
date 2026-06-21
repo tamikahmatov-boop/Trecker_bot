@@ -10,6 +10,8 @@ TOKEN = config.BOT_TOKEN
 URL = f"https://api.telegram.org/bot{TOKEN}"
 
 offset = 0
+def normalize_symbol(sym: str) -> str:
+    return sym.upper().replace("-", "").replace("_", "").replace("/", "")
 
 price_history = {}
 last_alert = {}
@@ -113,9 +115,34 @@ def get_okx_prices():
 
 # ---------------- MEXC FALLBACK ----------------
 
-def get_mexc_prices(symbols):
+def get_prices(symbols):
     prices = {}
 
+    normalized_symbols = {normalize_symbol(s): s for s in symbols}
+
+    # ---------------- OKX ----------------
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
+            timeout=20
+        )
+
+        data = r.json()
+
+        if "data" in data:
+            for item in data["data"]:
+                inst = item["instId"]
+                price = float(item["last"])
+
+                sym = normalize_symbol(inst)
+
+                if price > 0 and sym in normalized_symbols:
+                    prices[normalized_symbols[sym]] = price
+
+    except Exception as e:
+        print("Ошибка OKX:", e)
+
+    # ---------------- MEXC ----------------
     try:
         r = requests.get(
             "https://contract.mexc.com/api/v1/contract/ticker",
@@ -127,37 +154,20 @@ def get_mexc_prices(symbols):
         if data["success"]:
             for item in data["data"]:
 
-                symbol = item["symbol"].replace("_", "")
+                sym = normalize_symbol(item["symbol"])
                 price = float(item["lastPrice"])
 
-                if price > 0 and symbol in symbols:
-                    prices[symbol] = price
+                if price > 0 and sym in normalized_symbols:
+
+                    real_symbol = normalized_symbols[sym]
+
+                    if real_symbol not in prices:
+                        prices[real_symbol] = price
 
     except Exception as e:
         print("Ошибка MEXC:", e)
 
     return prices
-
-
-# ---------------- PRICE ENGINE ----------------
-
-def get_prices(symbols):
-    prices = {}
-
-    # OKX (основной)
-    okx = get_okx_prices()
-    for sym in symbols:
-        if sym in okx:
-            prices[sym] = okx[sym]
-
-    # fallback MEXC
-    mexc = get_mexc_prices(symbols)
-    for sym, price in mexc.items():
-        if sym not in prices:
-            prices[sym] = price
-
-    return prices
-
 
 # ---------------- RSI ----------------
 
