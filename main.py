@@ -37,28 +37,32 @@ import requests
 
 def get_symbols():
     try:
-        url = "https://api.bybit.com/v5/market/instruments-info"
+        url = "https://api.bybit.com/v5/market/instruments-info?category=linear"
+        response = requests.get(url, timeout=10)
 
-        params = {
-            "category": "linear"   # USDT perpetual
-        }
+        print("Bybit raw:", response.text[:200])  # DEBUG
 
-        r = requests.get(url, params=params, timeout=20)
-        data = r.json()
+        try:
+            data = response.json()
+        except Exception:
+            print("❌ Bybit returned non-JSON")
+            return []
 
-        symbols = set()
+        if "result" not in data:
+            print("❌ Invalid Bybit response:", data)
+            return []
 
-        if data.get("retCode") == 0:
-            for item in data["result"]["list"]:
-                symbols.add(item["symbol"])  # BTCUSDT
+        symbols = []
 
-        print("Bybit symbols:", len(symbols))
+        for item in data["result"]["list"]:
+            if item.get("symbol"):
+                symbols.append(item["symbol"])
+
         return symbols
 
     except Exception as e:
         print("Bybit error:", e)
-        return set()
-
+        return []
 
 # ---------------- OKX PRICES (MAIN SOURCE) ----------------
 
