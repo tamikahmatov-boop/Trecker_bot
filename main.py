@@ -120,6 +120,28 @@ def get_prices_okx(symbols):
         print("Ошибка OKX:", e)
 
     return prices
+def get_prices_bitget(symbols):
+prices = {}
+
+try:
+    r = requests.get(
+        "https://api.bitget.com/api/v2/spot/market/tickers",
+        timeout=20
+    )
+    data = r.json()
+    if data["code"] == "00000":
+        for item in data["data"]:
+            symbol = item["symbol"]
+            if symbol in symbols:
+                try:
+                    price = float(item["lastPr"])
+                    if price > 0:
+                        prices[symbol] = price
+                except:
+                    pass
+except Exception as e:
+    print("Ошибка Bitget:", e)
+return prices
 def calculate_rsi(prices, window=5):
     try:
         if len(prices) < window + 1:
@@ -150,26 +172,32 @@ async def monitor():
         try:
             now = time.time()
 
-            # обновление списка монет раз в час
+            # обновляем список монет каждый час
             if now - last_symbols_update >= 3600:
                 symbols = get_symbols()
                 last_symbols_update = now
                 print("Список монет обновлен")
 
-            # цены с MEXC и OKX
+            # получаем цены с бирж
             mexc_prices = get_prices_mexc(symbols)
             okx_prices = get_prices_okx(symbols)
+            bitget_prices = get_prices_bitget(symbols)
 
             prices = {}
 
-            # сначала MEXC
+            # MEXC — основной источник
             for sym, price in mexc_prices.items():
                 prices[sym] = (price, "MEXC")
 
-            # если монеты нет на MEXC, берем с OKX
+            # OKX — резервный
             for sym, price in okx_prices.items():
                 if sym not in prices:
                     prices[sym] = (price, "OKX")
+
+            # Bitget — резервный
+            for sym, price in bitget_prices.items():
+                if sym not in prices:
+                    prices[sym] = (price, "Bitget")
 
             for sym, (price, exchange) in prices.items():
 
@@ -235,9 +263,9 @@ async def monitor():
                         )
 
                     if rsi is not None:
-                        text += f"📊 RSI: {rsi:.2f}"
+                        text += f"\n📊 RSI: {rsi:.2f}"
                     else:
-                        text += "📊 RSI: ожидание данных"
+                        text += "\n📊 RSI: ожидание данных"
 
                     send_message(text, config.CHAT_ID)
                     last_alert[sym] = now
