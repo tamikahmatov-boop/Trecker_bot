@@ -22,75 +22,146 @@ current_window = config.WINDOW
 
 def send_message(text, chat_id):
     try:
-        requests.post(
+        response = requests.post(
             f"{URL}/sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=20
         )
+
+        if not response.ok:
+            print("Ошибка Telegram:", response.text)
+
     except Exception as e:
-        print("Telegram error:", e)
+        print("Ошибка Telegram:", e)
 
 
-# ---------------- BYBIT (PUBLIC SYMBOLS, NO API) ----------------
-
-import requests
+# ---------------- SYMBOLS ----------------
 
 def get_symbols():
     try:
-        url = "https://api.bybit.com/v5/market/instruments-info?category=linear"
-        response = requests.get(url, timeout=10)
+        r = requests.get("https://api.bybit.com/v5/market/instruments-info?category=spot", timeout=20)
+        data = r.json()
 
-        print("Bybit raw:", response.text[:200])  # DEBUG
+        symbols = set()
 
-        try:
-            data = response.json()
-        except Exception:
-            print("❌ Bybit returned non-JSON")
-            return []
+        for item in data.get("result", {}).get("list", []):
+            sym = item["symbol"]
+            if sym.endswith("USDT"):
+                symbols.add(sym)
 
-        if "result" not in data:
-            print("❌ Invalid Bybit response:", data)
-            return []
-
-        symbols = []
-
-        for item in data["result"]["list"]:
-            if item.get("symbol"):
-                symbols.append(item["symbol"])
-
+        print("Загружено монет:", len(symbols))
         return symbols
 
     except Exception as e:
-        print("Bybit error:", e)
-        return []
-
-# ---------------- OKX PRICES (MAIN SOURCE) ----------------
-
-def normalize(symbol: str):
-    return symbol.replace("-", "").replace("_", "").upper()
+        print("Ошибка symbols:", e)
+        return set()
 
 
-def get_prices():
+# ---------------- EXCHANGES ----------------
+
+def get_okx():
     try:
         r = requests.get(
-            "https://www.okx.com/api/v5/market/tickers",
-            params={"instType": "SWAP"},
+            "https://www.okx.com/api/v5/market/tickers?instType=SPOT",
             timeout=20
         )
+        data = r.json().get("data", [])
 
-        data = r.json()
-        prices = {}
-
-        if data.get("code") == "0":
-            for item in data["data"]:
-                sym = normalize(item["instId"])
-                prices[sym] = float(item["last"])
-
-        return prices
+        return {
+            item["instId"].replace("-", ""): float(item["last"])
+            for item in data
+        }
 
     except Exception as e:
         print("OKX error:", e)
         return {}
+
+
+def get_mexc():
+    try:
+        r = requests.get("https://api.mexc.com/api/v3/ticker/price", timeout=20)
+        return {item["symbol"]: float(item["price"]) for item in r.json()}
+    except Exception as e:
+        print("MEXC error:", e)
+        return {}
+
+
+def get_bitget():
+    try:
+        r = requests.get(
+            "https://api.bitget.com/api/spot/v1/market/tickers",
+            timeout=20
+        )
+        data = r.json().get("data", [])
+
+        return {
+            item["symbol"]: float(item["close"])
+            for item in data
+        }
+
+    except Exception as e:
+        print("Bitget error:", e)
+        return {}
+
+
+def get_kucoin():
+    try:
+        r = requests.get("https://api.kucoin.com/api/v1/market/allTickers", timeout=20)
+        data = r.json()["data"]["ticker"]
+
+        return {
+            item["symbol"].replace("-", ""): float(item["last"])
+            for item in data
+        }
+
+    except Exception as e:
+        print("KuCoin error:", e)
+        return {}
+
+
+def get_bingx():
+    try:
+        r = requests.get(
+            "https://open-api.bingx.com/openApi/spot/v1/ticker/price",
+            timeout=20
+        )
+        data = r.json().get("data", [])
+
+        return {
+            item["symbol"]: float(item["price"])
+            for item in data
+        }
+
+    except Exception as e:
+        print("BingX error:", e)
+        return {}
+
+
+# ---------------- COMBINED PRICES ----------------
+
+def get_prices(symbols):
+    all_prices = {}
+
+    sources = [
+        get_okx,
+        get_mexc,
+        get_bitget,
+        get_kucoin,
+        get_bingx
+    ]
+
+    for source in sources:
+        try:
+            data = source()
+
+            for sym, price in data.items():
+                if sym in symbols:
+                    all_prices[sym] = price
+
+        except Exception as e:
+            print("Source error:", e)
+
+    return all_prices
 
 
 # ---------------- RSI ----------------
@@ -108,7 +179,8 @@ def calculate_rsi(prices, window=5):
 
         return round(float(rsi), 2)
 
-    except:
+    except Exception as e:
+        print("RSI error:", e)
         return None
 
 
@@ -118,6 +190,7 @@ async def monitor():
     global current_percent, current_window
 
     symbols = get_symbols()
+    last_symbols_update = time.time()
 
     send_message("✅ Бот запущен", config.CHAT_ID)
 
@@ -125,12 +198,13 @@ async def monitor():
         try:
             now = time.time()
 
-            prices = get_prices()
+            if now - last_symbols_update >= 3600:
+                symbols = get_symbols()
+                last_symbols_update = now
+
+            prices = get_prices(symbols)
 
             for sym, price in prices.items():
-
-                if sym not in symbols:
-                    continue
 
                 if price <= 0:
                     continue
@@ -147,46 +221,117 @@ async def monitor():
                     if now - x[0] <= history_time
                 ]
 
-                recent = [
+                recent_prices = [
                     x for x in price_history[sym]
                     if now - x[0] <= current_window
                 ]
 
-                if len(recent) < 2:
+                if len(recent_prices) < 2:
                     continue
 
-                old_price = recent[0][1]
+                old_price = recent_prices[0][1]
+
+                if old_price <= 0:
+                    continue
 
                 growth = ((price - old_price) / old_price) * 100
 
                 prices_list = [x[1] for x in price_history[sym][-100:]]
-                rsi = calculate_rsi(prices_list)
+                rsi = calculate_rsi(prices_list, window=5)
 
                 if abs(growth) >= current_percent:
 
-                    if sym in last_alert and now - last_alert[sym] < config.COOLDOWN:
-                        continue
+                    if sym in last_alert:
+                        if now - last_alert[sym] < config.COOLDOWN:
+                            continue
 
-                    text = (
-                        f"🚀 СИГНАЛ\n\n"
-                        f"Монета: {sym}\n"
-                        f"Цена: {price}\n"
-                        f"{'Рост' if growth > 0 else 'Падение'}: {growth:.2f}%\n"
-                        f"RSI: {rsi if rsi else '—'}"
-                    )
+                    if growth > 0:
+                        text = (
+                            f"🚀 СИГНАЛ\n\n"
+                            f"Монета: {sym}\n"
+                            f"Цена: {price}\n"
+                            f"Рост: +{growth:.2f}%\n"
+                        )
+                    else:
+                        text = (
+                            f"📉 СИГНАЛ\n\n"
+                            f"Монета: {sym}\n"
+                            f"Цена: {price}\n"
+                            f"Падение: {growth:.2f}%\n"
+                        )
+
+                    if rsi is not None:
+                        text += f"\n📊 RSI: {rsi:.2f}"
+                    else:
+                        text += "\n📊 RSI: ожидание данных"
 
                     send_message(text, config.CHAT_ID)
-
                     last_alert[sym] = now
 
             await asyncio.sleep(config.INTERVAL)
 
         except Exception as e:
-            print("monitor error:", e)
-            await asyncio.sleep(3)
+            print("Monitor error:", e)
+            await asyncio.sleep(5)
 
 
-# ---------------- TELEGRAM ----------------
+# ---------------- TELEGRAM UI ----------------
+
+def send_keyboard(chat_id):
+    keyboard = {
+        "keyboard": [
+            ["📈 0.2%", "📈 5%", "📈 10%"],
+            ["📈 15%", "📈 20%"],
+            ["⏱ 5 мин", "⏱ 1 час"],
+            ["⏱ 4 часа", "⏱ 1 день"],
+            ["/status"]
+        ],
+        "resize_keyboard": True
+    }
+
+    requests.post(
+        f"{URL}/sendMessage",
+        json={"chat_id": chat_id, "text": "Выберите настройки:", "reply_markup": keyboard}
+    )
+
+
+# ---------------- HANDLER ----------------
+
+def handle_message(msg):
+    global current_percent, current_window
+
+    text = msg.get("text", "")
+    chat_id = msg["chat"]["id"]
+
+    if text == "/start":
+        send_message(
+            f"🚀 Бот запущен\n\n📈 Рост: {current_percent}%\n⏱ Период: {current_window // 60} мин",
+            chat_id
+        )
+        send_keyboard(chat_id)
+
+    elif text == "/status":
+        send_message(
+            f"📊 Настройки\n\n📈 Рост: {current_percent}%\n⏱ Период: {current_window} сек\n🔔 Кулдаун: {config.COOLDOWN // 60} мин",
+            chat_id
+        )
+
+    elif text == "📈 0.2%": current_percent = 0.2
+    elif text == "📈 5%": current_percent = 5
+    elif text == "📈 10%": current_percent = 10
+    elif text == "📈 15%": current_percent = 15
+    elif text == "📈 20%": current_percent = 20
+
+    elif text == "⏱ 5 мин": current_window = 300
+    elif text == "⏱ 1 час": current_window = 3600
+    elif text == "⏱ 4 часа": current_window = 14400
+    elif text == "⏱ 1 день": current_window = 86400
+
+    else:
+        send_message("❓ Неизвестная команда", chat_id)
+
+
+# ---------------- TELEGRAM LOOP ----------------
 
 def get_updates():
     global offset
@@ -199,12 +344,11 @@ def get_updates():
         )
 
         data = r.json()
-
-        if data.get("ok"):
+        if data["ok"]:
             return data["result"]
 
-    except:
-        pass
+    except Exception as e:
+        print("get_updates error:", e)
 
     return []
 
@@ -215,40 +359,12 @@ async def telegram_loop():
     while True:
         updates = get_updates()
 
-        for u in updates:
-            offset = u["update_id"] + 1
-
-            if "message" in u:
-                handle_message(u["message"])
+        for update in updates:
+            offset = update["update_id"] + 1
+            if "message" in update:
+                handle_message(update["message"])
 
         await asyncio.sleep(1)
-
-
-def handle_message(msg):
-    global current_percent, current_window
-
-    text = msg.get("text", "")
-    chat_id = msg["chat"]["id"]
-
-    if text == "/start":
-        send_message(
-            f"🚀 Бот запущен\n📈 {current_percent}%\n⏱ {current_window}s",
-            chat_id
-        )
-
-    elif text == "/status":
-        send_message(
-            f"📊 {current_percent}%\n⏱ {current_window}s",
-            chat_id
-        )
-
-    elif text == "📈 5%":
-        current_percent = 5
-        send_message("OK 5%", chat_id)
-
-    elif text == "⏱ 5 мин":
-        current_window = 300
-        send_message("OK 5 min", chat_id)
 
 
 # ---------------- MAIN ----------------
@@ -264,5 +380,5 @@ while True:
     try:
         asyncio.run(main())
     except Exception as e:
-        print("CRITICAL:", e)
+        print("CRITICAL ERROR:", e)
         time.sleep(10)
