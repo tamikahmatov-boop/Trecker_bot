@@ -15,6 +15,8 @@ def normalize_symbol(sym: str) -> str:
     return sym.upper().replace("-", "").replace("_", "").replace("/", "")
 price_history = {}
 last_alert = {}
+last_alert_growth = {}
+max_growth_seen = {}
 signals_count = 0
 checks_count = 0
 start_time = time.time()
@@ -267,9 +269,25 @@ async def monitor():
 
                 if abs(growth) >= current_percent:
 
-                    # антиспам
+                    # антиспам по времени
                     if sym in last_alert:
                         if now - last_alert[sym] < config.COOLDOWN:
+                            continue
+
+                    # сброс после отката
+                    if sym not in max_growth_seen:
+                        max_growth_seen[sym] = abs(growth)
+                    else:
+                        if abs(growth) > max_growth_seen[sym]:
+                            max_growth_seen[sym] = abs(growth)
+
+                        if abs(growth) < max_growth_seen[sym] * 0.5:
+                            last_alert_growth.pop(sym, None)
+                            max_growth_seen[sym] = abs(growth)
+
+                    # антиспам по проценту
+                    if sym in last_alert_growth:
+                        if abs(growth) < abs(last_alert_growth[sym]) + current_percent:
                             continue
 
                     source = sources.get(sym, "UNKNOWN")
@@ -298,6 +316,7 @@ async def monitor():
 
                     signals_count += 1
                     last_alert[sym] = now
+                    last_alert_growth[sym] = abs(growth)
 
             await asyncio.sleep(config.INTERVAL)
 
