@@ -24,14 +24,26 @@ current_window = config.WINDOW
 
 # ---------------- TELEGRAM ----------------
 
-def send_message(text, chat_id):
+def send_message(text, chat_id, button_link=None):
     try:
+        payload = {
+            "chat_id": chat_id,
+            "text": text
+        }
+
+        if button_link:
+            payload["reply_markup"] = {
+                "inline_keyboard": [[
+                    {
+                        "text": "📈 Открыть в Bybit",
+                        "url": button_link
+                    }
+                ]]
+            }
+
         response = requests.post(
             f"{URL}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text
-            },
+            json=payload,
             timeout=20
         )
 
@@ -273,6 +285,9 @@ async def monitor():
                             continue
 
                     source = sources.get(sym, "UNKNOWN")
+
+                    bybit_symbol = sym.replace("USDT", "")
+                    link = f"https://www.bybit.com/trade/usdt/{bybit_symbol}USDT"
                     bybit_symbol = sym.replace("USDT", "")
                     link = f"bybitapp://open?type=contract&symbol={bybit_symbol}USDT"      
                    
@@ -297,7 +312,7 @@ async def monitor():
                     else:
                         text += "\n📊 RSI: ожидание данных"
 
-                    send_message(text, config.CHAT_ID)
+                    send_message(text, config.CHAT_ID, link)
 
                     signals_count += 1
                     last_alert[sym] = now
