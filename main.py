@@ -285,11 +285,7 @@ async def monitor():
 
                     source = sources.get(sym, "UNKNOWN")
 
-                    bybit_symbol = sym.replace("USDT", "")
-                    link = f"https://www.bybit.com/trade/usdt/{bybit_symbol}USDT"
-                    bybit_symbol = sym.replace("USDT", "")
-                    link = f"bybitapp://open?type=contract&symbol={bybit_symbol}USDT"      
-                   
+                   link = f"https://crypto-tracker-bot-production-7317.up.railway.app/?symbol={bybit_symbol}USDT"
                     if growth > 0:
                         text = (
                             f"🚀 СИГНАЛ\n\n"
