@@ -52,7 +52,6 @@ def send_message(text, chat_id, button_link=None):
 
     except Exception as e:
         print("Ошибка Telegram:", e)
-
 def send_keyboard(chat_id):
     keyboard = {
         "keyboard": [
