@@ -24,26 +24,14 @@ current_window = config.WINDOW
 
 # ---------------- TELEGRAM ----------------
 
-def send_message(text, chat_id, button_link=None):
+def send_message(text, chat_id):
     try:
-        payload = {
-            "chat_id": chat_id,
-            "text": text
-        }
-
-        if button_link:
-            payload["reply_markup"] = {
-                "inline_keyboard": [[
-                    {
-                        "text": "📈 Открыть в Bybit",
-                        "url": button_link
-                    }
-                ]]
-            }
-
         response = requests.post(
             f"{URL}/sendMessage",
-            json=payload,
+            json={
+                "chat_id": chat_id,
+                "text": text
+            },
             timeout=20
         )
 
@@ -52,6 +40,7 @@ def send_message(text, chat_id, button_link=None):
 
     except Exception as e:
         print("Ошибка Telegram:", e)
+
 def send_keyboard(chat_id):
     keyboard = {
         "keyboard": [
@@ -285,30 +274,27 @@ async def monitor():
 
                     source = sources.get(sym, "UNKNOWN")
 
-                    bybit_symbol = sym.replace("USDT", "")
-                    link = f"https://crypto-tracker-bot-production-7317.up.railway.app/?symbol={bybit_symbol}USDT"
                     if growth > 0:
                         text = (
                             f"🚀 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
                             f"Цена: {price} ({source})\n"
-                            f"Рост: +{growth:.2f}%\n\n"
-                            f"🔗 Открыть в Bybit:\n{link}"
-    )
+                            f"Рост: +{growth:.2f}%\n"
+                        )
                     else:
                         text = (
                             f"📉 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
                             f"Цена: {price} ({source})\n"
-                            f"Падение: {growth:.2f}%\n\n"
-                            f"🔗 Открыть в Bybit:\n{link}"
-    )
+                            f"Падение: {growth:.2f}%\n"
+                        )
+
                     if rsi is not None:
                         text += f"\n📊 RSI: {rsi:.2f}"
                     else:
                         text += "\n📊 RSI: ожидание данных"
 
-                    send_message(text, config.CHAT_ID, link)
+                    send_message(text, config.CHAT_ID)
 
                     signals_count += 1
                     last_alert[sym] = now
