@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<script>
+const params = new URLSearchParams(window.location.search);
+const symbol = params.get("symbol");
+
+window.location.href = `bybitapp://open?type=contract&symbol=${symbol}`;
+
+setTimeout(() => {
+    window.location.href = `https://www.bybit.com/trade/usdt/${symbol}`;
+}, 1000);
+</script>
+</head>
+<body>
+Открытие Bybit...
+</body>
+</html>
