@@ -1,10 +1,10 @@
+import logging
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-import logging
 
 STATE_FILE = "state.json"
 
@@ -534,3 +534,29 @@ async def save_state_loop():
 # asyncio.create_task(save_state_loop())
 # asyncio.create_task(watchdog())
 
+
+
+# ===== RETRY WRAPPER =====
+
+async def safe_request(func, retries=5, delay=2):
+    for attempt in range(retries):
+        try:
+            return await func()
+        except Exception as e:
+            logging.warning(f"Retry {attempt + 1}/{retries}: {e}")
+            await asyncio.sleep(delay)
+    return None
+
+# ===== GLOBAL EXCEPTION HANDLER =====
+
+def handle_async_exception(loop, context):
+    logging.exception(context.get("exception") or context["message"])
+
+# Inside main():
+# loop = asyncio.get_running_loop()
+# loop.set_exception_handler(handle_async_exception)
+
+# Recommended:
+# asyncio.create_task(heartbeat())
+# asyncio.create_task(save_state_loop())
+# asyncio.create_task(watchdog())
