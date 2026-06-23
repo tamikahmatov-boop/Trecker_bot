@@ -1,3 +1,36 @@
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+import logging
+
+STATE_FILE = "state.json"
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({
+                "last_alert": last_alert,
+                "last_alert_growth": last_alert_growth
+            }, f)
+    except:
+        pass
+
+def load_state():
+    global last_alert, last_alert_growth
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+            last_alert = data.get("last_alert", {})
+            last_alert_growth = data.get("last_alert_growth", {})
+    except:
+        pass
+
+load_state()
+
+import json
 import asyncio
 import requests
 import time
@@ -15,8 +48,6 @@ def normalize_symbol(sym: str) -> str:
     return sym.upper().replace("-", "").replace("_", "").replace("/", "")
 price_history = {}
 last_alert = {}
-last_alert_growth = {}
-max_growth_seen = {}
 signals_count = 0
 checks_count = 0
 start_time = time.time()
@@ -269,25 +300,9 @@ async def monitor():
 
                 if abs(growth) >= current_percent:
 
-                    # антиспам по времени
+                    # антиспам
                     if sym in last_alert:
                         if now - last_alert[sym] < config.COOLDOWN:
-                            continue
-
-                    # сброс после отката
-                    if sym not in max_growth_seen:
-                        max_growth_seen[sym] = abs(growth)
-                    else:
-                        if abs(growth) > max_growth_seen[sym]:
-                            max_growth_seen[sym] = abs(growth)
-
-                        if abs(growth) < max_growth_seen[sym] * 0.5:
-                            last_alert_growth.pop(sym, None)
-                            max_growth_seen[sym] = abs(growth)
-
-                    # антиспам по проценту
-                    if sym in last_alert_growth:
-                        if abs(growth) < abs(last_alert_growth[sym]) + current_percent:
                             continue
 
                     source = sources.get(sym, "UNKNOWN")
@@ -316,7 +331,6 @@ async def monitor():
 
                     signals_count += 1
                     last_alert[sym] = now
-                    last_alert_growth[sym] = abs(growth)
 
             await asyncio.sleep(config.INTERVAL)
 
@@ -463,3 +477,60 @@ while True:
     except Exception as e:
         print("Критическая ошибка:", e)
         time.sleep(10)
+
+
+async def heartbeat():
+    while True:
+        logging.info("Bot alive")
+        await asyncio.sleep(300)
+
+
+async def save_state_loop():
+    while True:
+        save_state()
+        await asyncio.sleep(30)
+
+
+# Для запуска внутри main():
+# asyncio.create_task(heartbeat())
+# asyncio.create_task(save_state_loop())
+
+
+# ===== PROFESSIONAL WATCHDOG =====
+
+last_check_time = 0
+
+async def watchdog():
+    global last_check_time
+    while True:
+        try:
+            import time, logging
+            if last_check_time and time.time() - last_check_time > 60:
+                logging.warning("Monitor appears stalled")
+            await asyncio.sleep(30)
+        except Exception as e:
+            logging.exception(e)
+            await asyncio.sleep(30)
+
+# ===== HEARTBEAT =====
+
+async def heartbeat():
+    while True:
+        logging.info("Bot alive")
+        await asyncio.sleep(300)
+
+# ===== PERIODIC STATE SAVE =====
+
+async def save_state_loop():
+    while True:
+        try:
+            save_state()
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+# Add inside main():
+# asyncio.create_task(heartbeat())
+# asyncio.create_task(save_state_loop())
+# asyncio.create_task(watchdog())
+
