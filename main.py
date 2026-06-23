@@ -273,22 +273,25 @@ async def monitor():
                             continue
 
                     source = sources.get(sym, "UNKNOWN")
-
+                    bybit_symbol = sym.replace("USDT", "")
+                    link = f"https://www.bybit.com/trade/usdt/{bybit_symbol}USDT?openApp=true"      
+                   
                     if growth > 0:
                         text = (
                             f"🚀 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
                             f"Цена: {price} ({source})\n"
-                            f"Рост: +{growth:.2f}%\n"
-                        )
+                            f"Рост: +{growth:.2f}%\n\n"
+                            f"🔗 Открыть в Bybit:\n{link}"
+    )
                     else:
                         text = (
                             f"📉 СИГНАЛ\n\n"
                             f"Монета: {sym}\n"
                             f"Цена: {price} ({source})\n"
-                            f"Падение: {growth:.2f}%\n"
-                        )
-
+                            f"Падение: {growth:.2f}%\n\n"
+                            f"🔗 Открыть в Bybit:\n{link}"
+    )
                     if rsi is not None:
                         text += f"\n📊 RSI: {rsi:.2f}"
                     else:
