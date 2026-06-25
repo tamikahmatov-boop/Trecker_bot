@@ -28,9 +28,9 @@ def load_state():
     except:
         pass
 
-load_state()
-
 import json
+
+load_state()
 import asyncio
 import requests
 import time
