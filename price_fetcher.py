@@ -3,6 +3,8 @@ from typing import Dict, Set, Tuple
 import aiohttp
 from bs4 import BeautifulSoup
 
+logger = logging.getLogger(__name__)
+
 class PriceFetcher:
     def __init__(self):
         self.session: aiohttp.ClientSession = None
@@ -23,6 +25,7 @@ class PriceFetcher:
     async def get_symbols(self) -> Set[str]:
         import time
         symbols = set()
+        
         try:
             async with self.session.get("https://public.bybit.com/trading/") as resp:
                 if resp.status == 200:
@@ -32,7 +35,19 @@ class PriceFetcher:
                         if sym.endswith(("USDT", "PERP")):
                             symbols.add(sym.replace("/", ""))
         except Exception as e:
-            logging.error(f"Bybit error: {e}")
+            logger.error(f"Bybit error: {e}")
+        
+        try:
+            async with self.session.get("https://public.bybit.com/spot/") as resp:
+                if resp.status == 200:
+                    soup = BeautifulSoup(await resp.text(), "html.parser")
+                    for a in soup.find_all("a"):
+                        sym = a.text.strip("/")
+                        if sym.endswith("USDT"):
+                            symbols.add(sym)
+        except Exception as e:
+            logger.error(f"Bybit spot error: {e}")
+        
         return symbols
     
     async def get_prices(self, symbols: Set[str]) -> Tuple[Dict[str, float], Dict[str, str]]:
@@ -53,7 +68,7 @@ class PriceFetcher:
                             prices[real] = price
                             sources[real] = "OKX"
         except Exception as e:
-            logging.warning(f"OKX error: {e}")
+            logger.warning(f"OKX error: {e}")
         
         # MEXC
         try:
@@ -64,11 +79,12 @@ class PriceFetcher:
                         for item in data["data"]:
                             sym = self.normalize(item["symbol"])
                             price = float(item["lastPrice"])
-                            if price > 0 and sym in normalized and sym not in prices:
+                            if price > 0 and sym in normalized:
                                 real = normalized[sym]
-                                prices[real] = price
-                                sources[real] = "MEXC"
+                                if real not in prices:
+                                    prices[real] = price
+                                    sources[real] = "MEXC"
         except Exception as e:
-            logging.warning(f"MEXC error: {e}")
+            logger.warning(f"MEXC error: {e}")
         
         return prices, sources
