@@ -10,41 +10,33 @@ from telegram_client import TelegramClient
 from price_fetcher import PriceFetcher
 from analyzer import Analyzer
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Файл для блокировки (предотвращает запуск нескольких экземпляров)
 PID_FILE = "bot.pid"
 
 def check_single_instance():
-    """Проверка единственного экземпляра"""
     try:
         if os.path.exists(PID_FILE):
             with open(PID_FILE, 'r') as f:
                 old_pid = int(f.read().strip())
-            
             try:
                 os.kill(old_pid, 0)
                 logger.error(f"❌ Бот уже запущен с PID {old_pid}")
-                logger.error("Остановите старый процесс или удалите bot.pid")
                 sys.exit(1)
             except OSError:
                 logger.info(f"Старый PID {old_pid} не активен")
                 os.remove(PID_FILE)
-        
         with open(PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
         logger.info(f"✅ Запущен с PID {os.getpid()}")
-        
     except Exception as e:
         logger.warning(f"Не удалось создать PID файл: {e}")
 
 def cleanup_pid():
-    """Удаление PID файла при завершении"""
     try:
         if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
@@ -77,15 +69,12 @@ class CryptoBot:
     
     async def start(self):
         logger.info("🚀 Запуск бота...")
-        
-        # Проверяем, что только один экземпляр
         check_single_instance()
         
         self.telegram = TelegramClient(config.BOT_TOKEN, config.CHAT_ID)
         self.fetcher = PriceFetcher()
         
         async with self.telegram, self.fetcher:
-            # Отправляем стартовое сообщение
             await self.telegram.send_message(
                 f"✅ <b>Бот запущен!</b>\n\n"
                 f"📈 Порог: <b>{self.percent}%</b>\n"
@@ -93,14 +82,12 @@ class CryptoBot:
                 f"⚡ Интервал: <b>{self.interval} сек</b>"
             )
             
-            # Показываем меню через 2 секунды
             await asyncio.sleep(2)
             await self.telegram.send_main_menu(config.CHAT_ID)
             
             self.running = True
             self.state.state.start_time = time.time()
             
-            # Запуск задач
             tasks = [
                 self.monitor_loop(),
                 self.telegram_loop(),
@@ -122,13 +109,11 @@ class CryptoBot:
         logger.info("🛑 Бот остановлен")
     
     async def monitor_loop(self):
-        """Основной цикл мониторинга цен"""
         while self.running:
             try:
                 self.checks += 1
                 now = time.time()
                 
-                # Обновление списка символов раз в 30 минут
                 if not self.symbols or self.checks % 360 == 0:
                     self.symbols = await self.fetcher.get_symbols()
                     logger.info(f"📊 Символов: {len(self.symbols)}")
@@ -139,9 +124,7 @@ class CryptoBot:
                     await asyncio.sleep(self.interval)
                     continue
                 
-                # Анализ каждого символа
                 for symbol, price in prices.items():
-                    # Пропускаем игнорируемые монеты
                     if symbol in self.ignored_symbols:
                         continue
                     
@@ -166,7 +149,6 @@ class CryptoBot:
                 await asyncio.sleep(5)
     
     async def send_signal(self, signal):
-        """Отправка сигнала с инлайн кнопками"""
         symbol = signal["symbol"]
         growth = signal["growth"]
         emoji = "🚀" if growth > 0 else "📉"
@@ -183,7 +165,6 @@ class CryptoBot:
         
         text += "\n\n⬇️ Нажмите кнопку ниже:"
         
-        # Инлайн кнопки
         inline_keyboard = {
             "inline_keyboard": [
                 [
@@ -197,17 +178,13 @@ class CryptoBot:
         logger.info(f"📨 Сигнал: {symbol} {growth:+.2f}%")
     
     async def telegram_loop(self):
-        """Цикл обработки команд Telegram"""
         while self.running:
             try:
                 updates = await self.telegram.get_updates()
                 
                 for update in updates:
-                    # Обработка сообщений
                     if "message" in update:
                         await self.handle_message(update["message"])
-                    
-                    # Обработка callback запросов (инлайн кнопки)
                     elif "callback_query" in update:
                         callback = update["callback_query"]
                         logger.info(f"🔘 Получен callback: {callback.get('data')}")
@@ -229,7 +206,6 @@ class CryptoBot:
                 await asyncio.sleep(5)
     
     async def handle_callback(self, callback):
-        """Обработка инлайн кнопок"""
         callback_id = callback["id"]
         data = callback.get("data", "")
         message = callback.get("message", {})
@@ -238,48 +214,39 @@ class CryptoBot:
         
         logger.info(f"🔘 Обработка callback: data={data}, chat_id={chat_id}")
         
-        # Проверка авторизации
         if chat_id != config.CHAT_ID:
             await self.telegram.answer_callback(callback_id, "⛔ Доступ запрещен", True)
             return
         
-        # Обработка игнорирования монеты
         if data.startswith("ignore_"):
             symbol = data.replace("ignore_", "")
             self.ignored_symbols.add(symbol)
             
-            # ОТВЕЧАЕМ НА CALLBACK (ОБЯЗАТЕЛЬНО!)
             await self.telegram.answer_callback(
                 callback_id, 
                 f"🔕 {symbol} добавлен в игнор-лист",
                 False
             )
             
-            # Отправляем подтверждение
             await self.telegram.send_message(
-                f"🔕 <b>{symbol}</b> добавлен в игнор-лист\n"
-                f"Сигналы по этой монете больше не будут приходить",
+                f"🔕 <b>{symbol}</b> добавлен в игнор-лист\nСигналы по этой монете больше не будут приходить",
                 chat_id
             )
             
-            # Убираем кнопки из сообщения
             await self.telegram.edit_message_reply_markup(chat_id, message_id, None)
             
             logger.info(f"✅ Игнорируем: {symbol}")
             return
         
-        # Обработка информации о монете
         if data.startswith("info_"):
             symbol = data.replace("info_", "")
             
-            # ОТВЕЧАЕМ НА CALLBACK
             await self.telegram.answer_callback(
                 callback_id, 
                 f"ℹ️ Информация о {symbol}",
                 False
             )
             
-            # Показываем информацию
             if symbol in self.analyzer.price_history:
                 history = list(self.analyzer.price_history[symbol])
                 if history:
@@ -296,30 +263,15 @@ class CryptoBot:
                         f"В истории: <b>{len(history)}</b> записей",
                         chat_id
                     )
-                else:
-                    await self.telegram.send_message(
-                        f"ℹ️ Нет данных по {symbol}",
-                        chat_id
-                    )
             else:
-                await self.telegram.send_message(
-                    f"ℹ️ Нет данных по {symbol}",
-                    chat_id
-                )
+                await self.telegram.send_message(f"ℹ️ Нет данных по {symbol}", chat_id)
             return
         
-        # Если неизвестный callback
-        await self.telegram.answer_callback(
-            callback_id,
-            "❌ Неизвестная команда",
-            True
-        )
+        await self.telegram.answer_callback(callback_id, "❌ Неизвестная команда", True)
     
     async def handle_message(self, msg):
-        """Обработка текстовых сообщений"""
         chat_id = msg["chat"]["id"]
         
-        # Проверка авторизации
         if chat_id != config.CHAT_ID:
             logger.warning(f"⚠️ Неавторизованный доступ от {chat_id}")
             await self.telegram.send_message("⛔ Доступ запрещен", chat_id)
@@ -328,54 +280,32 @@ class CryptoBot:
         text = msg.get("text", "")
         logger.info(f"📩 Сообщение: {text}")
         
-        # Главное меню
         if text == "/start":
             await self.telegram.send_main_menu(chat_id)
-        
         elif text == "🏠 Главное меню" or text == "🔙 Назад":
             await self.telegram.send_main_menu(chat_id)
-        
-        # Настройки порога
         elif text == "📈 Настройки порога":
             await self.telegram.send_percent_menu(chat_id)
-        
-        # Настройки периода
         elif text == "⏱ Настройки периода":
             await self.telegram.send_window_menu(chat_id)
-        
-        # Установка порога
         elif text.startswith("📈 ") and text != "📈 Настройки порога":
             try:
                 percent_str = text.replace("📈 ", "").replace("%", "")
-                
                 if percent_str == "Пользовательский":
-                    await self.telegram.send_message(
-                        "Введите желаемый порог в процентах (например: 7.5):",
-                        chat_id
-                    )
+                    await self.telegram.send_message("Введите желаемый порог в процентах (например: 7.5):", chat_id)
                     return
-                
                 percent = float(percent_str)
                 self.percent = percent
-                
-                await self.telegram.send_message(
-                    f"✅ Установлен порог: <b>{percent}%</b>",
-                    chat_id
-                )
-                
+                await self.telegram.send_message(f"✅ Установлен порог: <b>{percent}%</b>", chat_id)
                 await asyncio.sleep(1)
                 await self.telegram.send_main_menu(chat_id)
                 logger.info(f"📈 Порог изменен на {percent}%")
-                
             except Exception as e:
                 await self.telegram.send_message(f"❌ Ошибка: {e}", chat_id)
-        
-        # Установка периода
         elif text.startswith("⏱ ") and text != "⏱ Настройки периода":
             try:
                 time_str = text.replace("⏱ ", "")
                 minutes = 0
-                
                 if "минута" in time_str or "минут" in time_str:
                     minutes = int(''.join(filter(str.isdigit, time_str)))
                 elif "час" in time_str:
@@ -387,80 +317,51 @@ class CryptoBot:
                 else:
                     await self.telegram.send_message("❌ Неверный формат", chat_id)
                     return
-                
                 self.window = minutes * 60
-                
-                await self.telegram.send_message(
-                    f"✅ Установлен период: <b>{minutes} мин</b>",
-                    chat_id
-                )
-                
+                await self.telegram.send_message(f"✅ Установлен период: <b>{minutes} мин</b>", chat_id)
                 await asyncio.sleep(1)
                 await self.telegram.send_main_menu(chat_id)
                 logger.info(f"⏱ Период изменен на {minutes} мин")
-                
             except Exception as e:
                 await self.telegram.send_message(f"❌ Ошибка: {e}", chat_id)
-        
-        # Статистика
         elif text == "📊 Статистика":
             uptime = int(time.time() - self.state.state.start_time)
             days = uptime // 86400
             hours = (uptime % 86400) // 3600
             minutes = (uptime % 3600) // 60
-            
             await self.telegram.send_message(
                 f"📊 <b>СТАТИСТИКА</b>\n\n"
                 f"🟢 Время работы: <b>{days}д {hours}ч {minutes}м</b>\n"
                 f"🪙 Монет в истории: <b>{len(self.analyzer.price_history)}</b>\n"
-                f"🔔 Сигналов отправлено: <b>{self.state.state.signals_count}</b>\n"
-                f"🔄 Циклов проверки: <b>{self.checks}</b>\n"
+                f"🔔 Сигналов: <b>{self.state.state.signals_count}</b>\n"
+                f"🔄 Проверок: <b>{self.checks}</b>\n"
                 f"📈 Текущий порог: <b>{self.percent}%</b>\n"
                 f"⏱ Текущий период: <b>{self.window // 60} мин</b>\n"
                 f"🔕 Игнорируется: <b>{len(self.ignored_symbols)}</b> монет\n"
                 f"📌 Активных алертов: <b>{len(self.state.state.last_alert)}</b>",
                 chat_id
             )
-        
-        # Список монет
         elif text == "📋 Список монет":
             if not self.symbols:
                 await self.telegram.send_message("🔄 Загрузка списка монет...", chat_id)
                 self.symbols = await self.fetcher.get_symbols()
-            
             symbols_list = sorted(list(self.symbols))[:50]
-            text_msg = f"📋 <b>Список монет ({len(self.symbols)} всего)</b>\n\n"
-            text_msg += "Первые 50 монет:\n"
-            
+            text_msg = f"📋 <b>Список монет ({len(self.symbols)} всего)</b>\n\nПервые 50 монет:\n"
             for i, sym in enumerate(symbols_list, 1):
                 ignored = "🔕" if sym in self.ignored_symbols else "✅"
                 text_msg += f"{i}. {ignored} {sym}\n"
-            
             if len(self.symbols) > 50:
                 text_msg += f"\n... и еще {len(self.symbols) - 50} монет"
-            
             await self.telegram.send_message(text_msg, chat_id)
-        
-        # Обновить список
         elif text == "🔄 Обновить список":
             await self.telegram.send_message("🔄 Обновление списка монет...", chat_id)
             self.symbols = await self.fetcher.get_symbols()
-            await self.telegram.send_message(
-                f"✅ Список обновлен! <b>{len(self.symbols)}</b> монет",
-                chat_id
-            )
-        
-        # Очистить историю
+            await self.telegram.send_message(f"✅ Список обновлен! <b>{len(self.symbols)}</b> монет", chat_id)
         elif text == "❌ Очистить историю":
             self.analyzer.price_history.clear()
             self.state.state.last_alert.clear()
-            await self.telegram.send_message(
-                "✅ История очищена! Все алерты сброшены.",
-                chat_id
-            )
+            await self.telegram.send_message("✅ История очищена! Все алерты сброшены.", chat_id)
             logger.info("🗑 История очищена")
-        
-        # Статус
         elif text == "/status":
             await self.telegram.send_message(
                 f"📊 <b>Текущие настройки</b>\n\n"
@@ -472,8 +373,6 @@ class CryptoBot:
                 f"🔕 Игнорируется: <b>{len(self.ignored_symbols)}</b> монет",
                 chat_id
             )
-        
-        # Помощь
         elif text == "/help":
             await self.telegram.send_message(
                 "🤖 <b>Помощь</b>\n\n"
@@ -483,36 +382,23 @@ class CryptoBot:
                 "📋 Список монет - показать отслеживаемые монеты\n"
                 "🔄 Обновить список - обновить список монет\n"
                 "❌ Очистить историю - очистить историю цен\n"
-                "🔕 Игнорировать - нажать под сигналом чтобы игнорировать монету\n\n"
-                "Сигналы приходят при достижении выбранного процента изменения цены"
+                "🔕 Игнорировать - нажать под сигналом чтобы игнорировать монету"
             )
-        
-        # Обработка пользовательского ввода (число для порога)
         else:
             try:
                 percent = float(text.replace("%", "").strip())
                 if 0 < percent <= 1000:
                     self.percent = percent
-                    await self.telegram.send_message(
-                        f"✅ Установлен порог: <b>{percent}%</b>",
-                        chat_id
-                    )
+                    await self.telegram.send_message(f"✅ Установлен порог: <b>{percent}%</b>", chat_id)
                     await asyncio.sleep(1)
                     await self.telegram.send_main_menu(chat_id)
                     logger.info(f"📈 Порог изменен на {percent}%")
                 else:
-                    await self.telegram.send_message(
-                        "❌ Пожалуйста, введите число от 0 до 1000",
-                        chat_id
-                    )
+                    await self.telegram.send_message("❌ Пожалуйста, введите число от 0 до 1000", chat_id)
             except ValueError:
-                await self.telegram.send_message(
-                    "❓ Неизвестная команда. Используйте кнопки меню.",
-                    chat_id
-                )
+                await self.telegram.send_message("❓ Неизвестная команда. Используйте кнопки меню.", chat_id)
     
     async def save_loop(self):
-        """Периодическое сохранение состояния"""
         while self.running:
             try:
                 self.state.save()
@@ -521,14 +407,11 @@ class CryptoBot:
             await asyncio.sleep(30)
     
     async def heartbeat_loop(self):
-        """Heartbeat для проверки работы"""
         while self.running:
             await asyncio.sleep(300)
             logger.info(f"❤️ Бот работает | Порог: {self.percent}% | Проверок: {self.checks}")
 
 async def main():
-    """Главная функция"""
-    # Обработка сигналов завершения
     def signal_handler(sig, frame):
         logger.info(f"Получен сигнал {sig}")
         cleanup_pid()
@@ -538,7 +421,6 @@ async def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     bot = CryptoBot()
-    
     try:
         await bot.start()
     except KeyboardInterrupt:
