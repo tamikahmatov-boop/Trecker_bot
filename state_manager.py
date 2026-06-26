@@ -30,6 +30,7 @@ class StateManager:
                 with open(self.state_file, "r") as f:
                     data = json.load(f)
                     self.state = BotState(**data)
+                    logging.info(f"Состояние загружено")
         except Exception as e:
             logging.warning(f"Не удалось загрузить состояние: {e}")
     
