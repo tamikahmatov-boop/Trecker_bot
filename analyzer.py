@@ -16,28 +16,64 @@ class Analyzer:
         try:
             if len(prices) < window + 1:
                 return None
-            rsi = RSIIndicator(close=pd.Series(prices), window=window).rsi().iloc[-1]
+            series = pd.Series(prices)
+            rsi = RSIIndicator(close=series, window=window).rsi().iloc[-1]
             return round(float(rsi), 2) if not pd.isna(rsi) else None
-        except:
+        except Exception as e:
+            logging.error(f"RSI error: {e}")
             return None
     
     def analyze_symbol(self, symbol: str, current_price: float, current_time: float,
                       window: int, percent: float, cooldown: int, last_alert: Dict) -> Optional[Dict]:
-        if current_price <= 0 or symbol not in self.price_history:
+        if current_price <= 0:
             return None
         
+        # Добавляем текущую цену
+        self.price_history[symbol].append((current_time, current_price))
+        
+        # Проверка антиспама
         if symbol in last_alert and current_time - last_alert[symbol] < cooldown:
             return None
         
-        recent = [p for t, p in self.price_history[symbol] if current_time - t <= window]
-        if len(recent) < 2:
+        # Получение цен за период - ИСПРАВЛЕНО
+        recent_prices = []
+        for t, p in self.price_history[symbol]:
+            if current_time - t <= window:
+                recent_prices.append(p)
+        
+        if len(recent_prices) < 2:
             return None
         
-        growth = ((current_price - recent[0]) / recent[0]) * 100
+        old_price = recent_prices[0]
+        if old_price <= 0:
+            return None
+        
+        growth = ((current_price - old_price) / old_price) * 100
         if abs(growth) < percent:
             return None
         
-        prices = [p for t, p in self.price_history[symbol][-100:]]
-        rsi = self.calculate_rsi(prices)
+        # RSI - ИСПРАВЛЕНО
+        prices_for_rsi = []
+        for t, p in list(self.price_history[symbol])[-100:]:
+            prices_for_rsi.append(p)
         
-        return {"symbol": symbol, "price": current_price, "growth": growth, "rsi": rsi}
+        rsi = self.calculate_rsi(prices_for_rsi)
+        
+        return {
+            "symbol": symbol,
+            "price": current_price,
+            "growth": growth,
+            "rsi": rsi,
+            "timestamp": current_time
+        }
+    
+    def cleanup_history(self, max_age: int = 86400):
+        """Очистка старой истории"""
+        current_time = time.time()
+        for symbol in list(self.price_history.keys()):
+            # Фильтруем старые записи
+            filtered = [(t, p) for t, p in self.price_history[symbol] if current_time - t <= max_age]
+            if filtered:
+                self.price_history[symbol] = deque(filtered, maxlen=self.price_history[symbol].maxlen)
+            else:
+                del self.price_history[symbol]
