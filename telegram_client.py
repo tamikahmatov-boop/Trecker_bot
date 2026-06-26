@@ -52,35 +52,6 @@ class TelegramClient:
             logger.error(f"❌ Ошибка: {e}")
             return False
     
-    async def send_main_menu(self, chat_id: int):
-        keyboard = {
-            "keyboard": [
-                ["📊 Статистика", "📋 Список монет"],
-                ["/status", "/help"]
-            ],
-            "resize_keyboard": True
-        }
-        await self.send_message("🏠 Меню:", chat_id, keyboard)
-    
-    async def send_test_buttons(self, chat_id: int):
-        """ТЕСТОВЫЕ КНОПКИ ДЛЯ ПРОВЕРКИ"""
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "🔴 Кнопка 1", "callback_data": "btn1"},
-                    {"text": "🟢 Кнопка 2", "callback_data": "btn2"}
-                ],
-                [
-                    {"text": "🔵 Кнопка 3", "callback_data": "btn3"}
-                ]
-            ]
-        }
-        await self.send_message(
-            "🧪 <b>ТЕСТ КНОПОК</b>\n\nНажми на любую кнопку:",
-            chat_id,
-            keyboard
-        )
-    
     async def get_updates(self) -> List[Dict[str, Any]]:
         try:
             async with self.session.get(
@@ -136,7 +107,7 @@ class TelegramClient:
             logger.error(f"❌ Ошибка: {e}")
             return False
     
-    async def edit_message(self, chat_id: int, message_id: int, text: str):
+    async def edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
         """Редактирование сообщения"""
         try:
             payload = {
@@ -151,7 +122,29 @@ class TelegramClient:
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
-                return response.status == 200
+                if response.status == 200:
+                    logger.info(f"✅ Сообщение обновлено")
+                    return True
+                else:
+                    error_text = await response.text()
+                    logger.error(f"❌ Ошибка edit: {response.status} - {error_text}")
+                    return False
         except Exception as e:
-            logger.error(f"Ошибка edit: {e}")
+            logger.error(f"❌ Ошибка edit: {e}")
+            return False
+    
+    async def delete_webhook(self) -> bool:
+        """Удаление вебхука (важно для long polling)"""
+        try:
+            async with self.session.get(
+                f"{self.base_url}/deleteWebhook",
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info(f"✅ Вебхук удален: {data}")
+                    return True
+                return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка delete_webhook: {e}")
             return False
