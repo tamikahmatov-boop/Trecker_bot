@@ -1,6 +1,7 @@
 import logging
 from typing import Optional, Dict, List, Any
 import aiohttp
+import json
 
 class TelegramClient:
     def __init__(self, token: str, chat_id: int):
@@ -18,13 +19,24 @@ class TelegramClient:
         if self.session:
             await self.session.close()
     
-    async def send_message(self, text: str, chat_id: Optional[int] = None) -> bool:
+    async def send_message(self, text: str, chat_id: Optional[int] = None, 
+                          reply_markup: Optional[Dict] = None) -> bool:
         if chat_id is None:
             chat_id = self.chat_id
+        
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        
         try:
             async with self.session.post(
                 f"{self.base_url}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                json=payload,
                 timeout=aiohttp.ClientTimeout(total=20)
             ) as response:
                 return response.status == 200
@@ -32,19 +44,79 @@ class TelegramClient:
             logging.error(f"Telegram send error: {e}")
             return False
     
-    async def send_keyboard(self, chat_id: int):
+    async def send_main_menu(self, chat_id: int):
+        """Главное меню с кнопками"""
+        keyboard = {
+            "keyboard": [
+                ["📈 Настройки порога", "⏱ Настройки периода"],
+                ["📊 Статистика", "📋 Список монет"],
+                ["🔄 Обновить список", "❌ Очистить историю"],
+                ["/status", "/help"]
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": False
+        }
+        await self.send_message(
+            "🏠 <b>Главное меню</b>\n\n"
+            "Выберите действие:",
+            chat_id,
+            keyboard
+        )
+    
+    async def send_percent_menu(self, chat_id: int):
+        """Меню выбора порога"""
         keyboard = {
             "keyboard": [
                 ["📈 0.2%", "📈 5%", "📈 10%"],
-                ["📈 15%", "📈 20%"],
-                ["⏱ 5 мин", "⏱ 1 час"],
-                ["⏱ 4 часа", "⏱ 1 день"],
-                ["📊 Статистика"],
-                ["/status"]
+                ["📈 15%", "📈 20%", "📈 30%"],
+                ["📈 50%", "📈 100%", "📈 Пользовательский"],
+                ["🔙 Назад"]
             ],
-            "resize_keyboard": True
+            "resize_keyboard": True,
+            "one_time_keyboard": False
         }
-        await self.send_message("Выберите настройки:", chat_id)
+        await self.send_message(
+            "📈 <b>Выберите порог изменения цены</b>\n\n"
+            "Сигнал будет отправлен при достижении выбранного процента:",
+            chat_id,
+            keyboard
+        )
+    
+    async def send_window_menu(self, chat_id: int):
+        """Меню выбора периода"""
+        keyboard = {
+            "keyboard": [
+                ["⏱ 1 минута", "⏱ 5 минут", "⏱ 15 минут"],
+                ["⏱ 30 минут", "⏱ 1 час", "⏱ 4 часа"],
+                ["⏱ 12 часов", "⏱ 1 день", "⏱ 3 дня"],
+                ["🔙 Назад"]
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": False
+        }
+        await self.send_message(
+            "⏱ <b>Выберите период анализа</b>\n\n"
+            "Бот будет анализировать изменение цены за выбранный период:",
+            chat_id,
+            keyboard
+        )
+    
+    async def send_inline_keyboard(self, chat_id: int, symbol: str, price: float, growth: float):
+        """Инлайн кнопки под сигналом"""
+        inline_keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 График", "url": f"https://www.tradingview.com/chart/?symbol={symbol}"},
+                    {"text": "ℹ️ Инфо", "callback_data": f"info_{symbol}"}
+                ],
+                [
+                    {"text": "🔕 Игнорировать", "callback_data": f"ignore_{symbol}"}
+                ]
+            ]
+        }
+        
+        # Упрощенная версия без инлайн кнопок (если не нужно)
+        return inline_keyboard
     
     async def get_updates(self) -> List[Dict[str, Any]]:
         try:
@@ -64,3 +136,19 @@ class TelegramClient:
         except Exception as e:
             logging.error(f"Telegram get_updates error: {e}")
             return []
+    
+    async def answer_callback(self, callback_id: str, text: str, show_alert: bool = False):
+        """Ответ на callback запрос"""
+        try:
+            async with self.session.post(
+                f"{self.base_url}/answerCallbackQuery",
+                json={
+                    "callback_query_id": callback_id,
+                    "text": text,
+                    "show_alert": show_alert
+                }
+            ) as response:
+                return response.status == 200
+        except Exception as e:
+            logging.error(f"Callback error: {e}")
+            return False
