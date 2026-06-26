@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import sys
 from config import config
 from state_manager import StateManager
 from telegram_client import TelegramClient
@@ -27,12 +28,13 @@ class CryptoBot:
         self.window = config.WINDOW
         self.interval = config.INTERVAL
         self.cooldown = config.COOLDOWN
+        self.ignored_symbols = set()
         
         try:
             config.validate()
         except ValueError as e:
             logger.error(f"Ошибка конфигурации: {e}")
-            exit(1)
+            sys.exit(1)
     
     async def start(self):
         logger.info("🚀 Запуск...")
@@ -41,16 +43,34 @@ class CryptoBot:
         self.fetcher = PriceFetcher()
         
         async with self.telegram, self.fetcher:
+            # 🔥 ВАЖНО: Удаляем вебхук
+            await self.telegram.delete_webhook()
+            await asyncio.sleep(1)
+            
+            # Отправляем стартовое сообщение
             await self.telegram.send_message(
-                f"✅ Бот запущен!\n\n"
-                f"📈 Порог: {self.percent}%\n"
-                f"⏱ Период: {self.window // 60} мин"
+                f"✅ <b>Бот запущен!</b>\n\n"
+                f"📈 Порог: <b>{self.percent}%</b>\n"
+                f"⏱ Период: <b>{self.window // 60} мин</b>"
             )
             
-            # 🔥 ОТПРАВЛЯЕМ ТЕСТОВЫЕ КНОПКИ
-            await self.telegram.send_test_buttons(config.CHAT_ID)
+            # ТЕСТОВЫЕ КНОПКИ
+            test_keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "🔴 Тест 1", "callback_data": "test1"},
+                        {"text": "🟢 Тест 2", "callback_data": "test2"}
+                    ],
+                    [
+                        {"text": "🔵 Тест 3", "callback_data": "test3"}
+                    ]
+                ]
+            }
             
-            await self.telegram.send_main_menu(config.CHAT_ID)
+            await self.telegram.send_message(
+                "🧪 <b>ТЕСТ КНОПОК</b>\n\nНажми на любую кнопку:",
+                reply_markup=test_keyboard
+            )
             
             self.running = True
             self.state.state.start_time = time.time()
@@ -89,6 +109,9 @@ class CryptoBot:
                     continue
                 
                 for symbol, price in prices.items():
+                    if symbol in self.ignored_symbols:
+                        continue
+                    
                     self.analyzer.add_price(symbol, price, now)
                     
                     result = self.analyzer.analyze_symbol(
@@ -110,7 +133,6 @@ class CryptoBot:
                 await asyncio.sleep(5)
     
     async def send_signal(self, signal):
-        """Отправка сигнала с кнопками"""
         symbol = signal["symbol"]
         growth = signal["growth"]
         emoji = "🚀" if growth > 0 else "📉"
@@ -133,7 +155,6 @@ class CryptoBot:
         logger.info(f"📨 Сигнал: {symbol} {growth:+.2f}%")
     
     async def telegram_loop(self):
-        """Обработка команд"""
         while self.running:
             try:
                 updates = await self.telegram.get_updates()
@@ -143,48 +164,48 @@ class CryptoBot:
                         await self.handle_message(update["message"])
                     elif "callback_query" in update:
                         callback = update["callback_query"]
-                        logger.info(f"🔘 Callback получен: {callback.get('data')}")
+                        logger.info(f"🔘 ПОЛУЧЕН CALLBACK: {callback.get('data')}")
                         await self.handle_callback(callback)
                 
                 await asyncio.sleep(0.5)
                 
             except Exception as e:
-                logger.error(f"❌ Ошибка: {e}")
+                logger.error(f"❌ Ошибка в telegram_loop: {e}")
                 await asyncio.sleep(1)
     
     async def handle_callback(self, callback):
-        """ОБРАБОТКА КНОПОК"""
         callback_id = callback["id"]
         data = callback.get("data", "")
         message = callback.get("message", {})
         chat_id = message.get("chat", {}).get("id")
         message_id = message.get("message_id")
         
-        logger.info(f"🔘 Обработка: {data}")
+        logger.info(f"🔘 ОБРАБОТКА: {data}")
         
         if chat_id != config.CHAT_ID:
             await self.telegram.answer_callback(callback_id, "⛔ Доступ запрещен", True)
             return
         
         # ТЕСТОВЫЕ КНОПКИ
-        if data == "btn1":
-            await self.telegram.answer_callback(callback_id, "✅ Нажата кнопка 1!", False)
-            await self.telegram.edit_message(chat_id, message_id, "✅ Вы нажали КНОПКУ 1!")
+        if data == "test1":
+            await self.telegram.answer_callback(callback_id, "✅ Тест 1!", False)
+            await self.telegram.edit_message(chat_id, message_id, "✅ Вы нажали <b>ТЕСТ 1</b>!")
             return
         
-        if data == "btn2":
-            await self.telegram.answer_callback(callback_id, "✅ Нажата кнопка 2!", False)
-            await self.telegram.edit_message(chat_id, message_id, "✅ Вы нажали КНОПКУ 2!")
+        if data == "test2":
+            await self.telegram.answer_callback(callback_id, "✅ Тест 2!", False)
+            await self.telegram.edit_message(chat_id, message_id, "✅ Вы нажали <b>ТЕСТ 2</b>!")
             return
         
-        if data == "btn3":
-            await self.telegram.answer_callback(callback_id, "✅ Нажата кнопка 3!", False)
-            await self.telegram.edit_message(chat_id, message_id, "✅ Вы нажали КНОПКУ 3!")
+        if data == "test3":
+            await self.telegram.answer_callback(callback_id, "✅ Тест 3!", False)
+            await self.telegram.edit_message(chat_id, message_id, "✅ Вы нажали <b>ТЕСТ 3</b>!")
             return
         
         # ИГНОРИРОВАНИЕ
         if data.startswith("ignore_"):
             symbol = data.replace("ignore_", "")
+            self.ignored_symbols.add(symbol)
             
             await self.telegram.answer_callback(
                 callback_id, 
@@ -212,28 +233,36 @@ class CryptoBot:
         logger.info(f"📩 Сообщение: {text}")
         
         if text == "/start":
-            await self.telegram.send_main_menu(chat_id)
-            await self.telegram.send_test_buttons(chat_id)
-        
-        elif text == "/test":
-            await self.telegram.send_test_buttons(chat_id)
-        
-        elif text == "📊 Статистика":
+            await self.telegram.send_message("🔄 Перезапуск...", chat_id)
+            # Отправляем тестовые кнопки снова
+            test_keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "🔴 Тест 1", "callback_data": "test1"},
+                        {"text": "🟢 Тест 2", "callback_data": "test2"}
+                    ],
+                    [
+                        {"text": "🔵 Тест 3", "callback_data": "test3"}
+                    ]
+                ]
+            }
             await self.telegram.send_message(
-                f"📊 Статистика\n\n"
-                f"Сигналов: {self.state.state.signals_count}\n"
-                f"Проверок: {self.checks}"
+                "🧪 <b>ТЕСТ КНОПОК</b>\n\nНажми на любую кнопку:",
+                chat_id,
+                test_keyboard
             )
         
         elif text == "/status":
             await self.telegram.send_message(
                 f"📊 Статус\n\n"
                 f"Порог: {self.percent}%\n"
-                f"Период: {self.window // 60} мин"
+                f"Период: {self.window // 60} мин\n"
+                f"Сигналов: {self.state.state.signals_count}\n"
+                f"Проверок: {self.checks}"
             )
         
         else:
-            await self.telegram.send_message("❓ Неизвестная команда")
+            await self.telegram.send_message("❓ Неизвестная команда. Напишите /start")
 
 async def main():
     bot = CryptoBot()
