@@ -1,69 +1,24 @@
-"""
-Telegram-бот для мониторинга бессрочных USDT-фьючерсов Bybit (Linear Perpetual).
-
-Источники данных:
-  • REST  GET /v5/market/instruments-info?category=linear  — список символов
-  • REST  GET /v5/market/tickers?category=linear           — снимок цен (fallback / init)
-  • WS    wss://stream.bybit.com/v5/public/linear          — real-time тикеры
-
-Зависимости:
-  pip install requests websocket-client pandas ta
-"""
+Код 9 
 
 import json
 import logging
 import asyncio
 import sqlite3
-import threading
-import time
-
-import pandas as pd
 import requests
-import websocket
+import time
+import pandas as pd
 from ta.momentum import RSIIndicator
-
+from bs4 import BeautifulSoup
 import config
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  LOGGING
-# ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s"
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  BYBIT ENDPOINTS
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Список эндпоинтов REST — перебираем по очереди при 403
-# api.bybit.com  — основной (заблокирован в РФ/США/Китае)
-# api.bytick.com — официальное зеркало Bybit (работает из большинства стран)
-BYBIT_REST_HOSTS = [
-    "https://api.bytick.com",   # зеркало — пробуем первым
-    "https://api.bybit.com",    # основной
-]
-BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
-BYBIT_WS_FALLBACK = "wss://stream.bytick.com/v5/public/linear"
-
-BYBIT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)",
-    "Accept": "application/json",
-}
-
-# Прокси из config (опционально). Пример в config.py:
-#   PROXY = "socks5://user:pass@host:port"   или   PROXY = ""
-_proxy_url: str = getattr(config, "PROXY", "")
-BYBIT_PROXIES: dict | None = (
-    {"http": _proxy_url, "https": _proxy_url} if _proxy_url else None
-)
-if BYBIT_PROXIES:
-    logging.info("Прокси активен: %s", _proxy_url)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  DATABASE
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
+#  DATABASE  (SQLite — алерты, кулдауны, история)
+# ================================================================
 
 DB_FILE = "alerts.db"
 
@@ -78,20 +33,21 @@ def db_init():
     with db_connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol  TEXT  NOT NULL,
-                price   REAL  NOT NULL,
-                growth  REAL  NOT NULL,
-                rsi     REAL,
-                ts      REAL  NOT NULL
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol    TEXT    NOT NULL,
+                price     REAL    NOT NULL,
+                growth    REAL    NOT NULL,
+                rsi       REAL,
+                source    TEXT,
+                ts        REAL    NOT NULL
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_a_sym ON alerts(symbol)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_a_ts  ON alerts(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ts     ON alerts(ts)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cooldowns (
-                symbol TEXT PRIMARY KEY,
-                ts     REAL NOT NULL
+                symbol    TEXT PRIMARY KEY,
+                ts        REAL NOT NULL
             )
         """)
 
@@ -99,18 +55,20 @@ def db_init():
 db_init()
 
 
-def db_save_alert(symbol: str, price: float, growth: float, rsi: float | None):
+def db_save_alert(symbol: str, price: float, growth: float,
+                  rsi: float | None, source: str):
     with db_connect() as conn:
         conn.execute(
-            "INSERT INTO alerts (symbol, price, growth, rsi, ts) VALUES (?,?,?,?,?)",
-            (symbol, price, growth, rsi, time.time()),
+            "INSERT INTO alerts (symbol, price, growth, rsi, source, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (symbol, price, growth, rsi, source, time.time())
         )
 
 
 def db_get_cooldown(symbol: str) -> float:
     with db_connect() as conn:
         row = conn.execute(
-            "SELECT ts FROM cooldowns WHERE symbol=?", (symbol,)
+            "SELECT ts FROM cooldowns WHERE symbol = ?", (symbol,)
         ).fetchone()
     return row["ts"] if row else 0.0
 
@@ -118,86 +76,92 @@ def db_get_cooldown(symbol: str) -> float:
 def db_set_cooldown(symbol: str):
     with db_connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO cooldowns (symbol, ts) VALUES (?,?)",
-            (symbol, time.time()),
+            "INSERT OR REPLACE INTO cooldowns (symbol, ts) VALUES (?, ?)",
+            (symbol, time.time())
         )
 
 
-def db_recent_alerts(limit: int = 10) -> list[dict]:
+def db_recent_alerts(limit: int = 10) -> list:
     with db_connect() as conn:
         rows = conn.execute(
-            "SELECT symbol, price, growth, rsi, ts FROM alerts ORDER BY ts DESC LIMIT ?",
-            (limit,),
+            "SELECT symbol, price, growth, rsi, source, ts "
+            "FROM alerts ORDER BY ts DESC LIMIT ?",
+            (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  STATE (лёгкие настройки между перезапусками)
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
+#  STATE  (json — лёгкие глобальные настройки)
+# ================================================================
 
 STATE_FILE = "state.json"
+last_alert_growth: dict = {}
 
 
 def save_state():
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(
-                {"percent": current_percent, "window": current_window}, f
-            )
+            json.dump({"last_alert_growth": last_alert_growth}, f)
     except Exception:
         pass
 
 
 def load_state():
-    global current_percent, current_window
+    global last_alert_growth
     try:
-        with open(STATE_FILE) as f:
-            d = json.load(f)
-            current_percent = d.get("percent", config.PERCENT)
-            current_window  = d.get("window",  config.WINDOW)
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+            last_alert_growth = data.get("last_alert_growth", {})
     except Exception:
         pass
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+load_state()
+
+# ================================================================
 #  GLOBALS
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 
 TOKEN = config.BOT_TOKEN
-TG_URL = f"https://api.telegram.org/bot{TOKEN}"
+URL   = f"https://api.telegram.org/bot{TOKEN}"
 
-tg_offset     = 0
-price_history: dict[str, list[tuple[float, float]]] = {}
-live_prices:   dict[str, float] = {}          # обновляется из WebSocket
+offset        = 0
+price_history: dict = {}
 signals_count = 0
 checks_count  = 0
 start_time    = time.time()
 last_check_time: float = 0.0
 
-current_percent: float = config.PERCENT
-current_window:  int   = config.WINDOW
+current_percent = config.PERCENT
+current_window  = config.WINDOW
 
+# Пауза мониторинга
 monitor_paused = False
+
+# Задача monitor — нужна watchdog'у для перезапуска
 monitor_task: asyncio.Task | None = None
 
-load_state()
 
-# ──────────────────────────────────────────────────────────────────────────────
+def normalize_symbol(sym: str) -> str:
+    return sym.upper().replace("-", "").replace("_", "").replace("/", "")
+
+
+# ================================================================
 #  TELEGRAM HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 
 def send_message(text: str, chat_id):
     try:
-        r = requests.post(
-            f"{TG_URL}/sendMessage",
+        resp = requests.post(
+            f"{URL}/sendMessage",
             json={"chat_id": chat_id, "text": text},
-            timeout=20,
+            timeout=20
         )
-        if not r.ok:
-            logging.warning("TG error: %s", r.text)
+        if not resp.ok:
+            logging.warning("Telegram error: %s", resp.text)
     except Exception as e:
-        logging.error("TG send: %s", e)
+        logging.error("Telegram send error: %s", e)
 
 
 def send_keyboard(chat_id):
@@ -214,287 +178,130 @@ def send_keyboard(chat_id):
         "resize_keyboard": True,
     }
     requests.post(
-        f"{TG_URL}/sendMessage",
+        f"{URL}/sendMessage",
         json={"chat_id": chat_id, "text": "Выберите настройки:", "reply_markup": keyboard},
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  BYBIT REST — утилита запроса
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
+#  SYMBOLS
+# ================================================================
 
-def bybit_get(path: str, params: dict | None = None, timeout: int = 20) -> dict | None:
-    """
-    Перебирает BYBIT_REST_HOSTS по очереди.
-    При 403/не-JSON переходит к следующему хосту.
-    Поддерживает прокси через BYBIT_PROXIES.
-    """
-    for host in BYBIT_REST_HOSTS:
-        url = f"{host}{path}"
+def get_symbols() -> set:
+    symbols: set = set()
+
+    for label, url, suffix in [
+        ("Trading", "https://public.bybit.com/trading/", ("USDT", "PERP")),
+        ("Spot",    "https://public.bybit.com/spot/",    ("USDT",)),
+    ]:
         try:
-            r = requests.get(
-                url,
-                params=params,
-                headers=BYBIT_HEADERS,
-                proxies=BYBIT_PROXIES,
-                timeout=timeout,
-            )
+            r = requests.get(url, timeout=20)
+            soup = BeautifulSoup(r.text, "html.parser")
+            count = 0
+            for a in soup.find_all("a"):
+                sym = a.text.strip("/")
+                if sym.endswith(suffix):
+                    symbols.add(sym.replace("/", ""))
+                    count += 1
+            logging.info("%s: %d", label, count)
+        except Exception as e:
+            logging.error("Ошибка %s: %s", label, e)
 
-            if r.status_code == 403:
-                logging.warning("bybit_get: 403 от %s — пробуем следующий хост", host)
-                continue
-
-            try:
-                data = r.json()
-            except Exception:
-                logging.error("bybit_get: не JSON от %s%s | статус=%s | тело=%s",
-                              host, path, r.status_code, r.text[:200])
-                continue
-
-            if data.get("retCode") != 0:
-                logging.error("bybit_get %s retCode=%s msg=%s",
-                              path, data.get("retCode"), data.get("retMsg"))
-                return None
-
-            return data
-
-        except requests.RequestException as e:
-            logging.error("bybit_get %s%s: %s", host, path, e)
-            continue
-
-    logging.error("bybit_get: все хосты недоступны для %s", path)
-    return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  BYBIT REST — список символов
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_bybit_symbols() -> set[str]:
-    """
-    Стратегия 1: instruments-info с пагинацией (надёжно, фильтруем LinearPerpetual+USDT).
-    Стратегия 2 (fallback): tickers — берём все символы заканчивающиеся на USDT.
-    """
-    symbols: set[str] = set()
-    cursor = ""
-    page   = 0
-
-    # ── Стратегия 1: instruments-info ─────────────────────────────────────────
-    while True:
-        page += 1
-        params: dict = {"category": "linear", "limit": 500}
-        if cursor:
-            params["cursor"] = cursor
-
-        data = bybit_get("/v5/market/instruments-info", params)
-        if data is None:
-            logging.warning("instruments-info недоступен, пробуем fallback через tickers")
-            break
-
-        result = data.get("result", {})
-        items  = result.get("list", [])
-        logging.debug("instruments-info стр.%d: %d записей", page, len(items))
-
-        for item in items:
-            if (
-                item.get("contractType") == "LinearPerpetual"
-                and item.get("quoteCoin") == "USDT"
-                and item.get("status") == "Trading"
-            ):
-                symbols.add(item["symbol"])
-
-        cursor = result.get("nextPageCursor", "")
-        if not cursor:
-            break
-
-    if symbols:
-        logging.info("Bybit LinearPerpetual USDT (instruments-info): %d символов", len(symbols))
-        return symbols
-
-    # ── Стратегия 2: fallback через tickers ───────────────────────────────────
-    logging.warning("Используем fallback: /v5/market/tickers?category=linear")
-    data = bybit_get("/v5/market/tickers", {"category": "linear"})
-    if data:
-        for item in data.get("result", {}).get("list", []):
-            sym = item.get("symbol", "")
-            if sym.endswith("USDT"):
-                symbols.add(sym)
-        logging.info("Bybit tickers fallback: %d символов", len(symbols))
-
+    logging.info("Всего монет: %d", len(symbols))
     return symbols
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  BYBIT REST — снимок цен (первый запуск / fallback для WS)
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
+#  PRICES
+# ================================================================
 
-def get_bybit_prices_rest(symbols: set[str]) -> dict[str, float]:
-    """
-    GET /v5/market/tickers?category=linear — все тикеры одним запросом.
-    Заодно возвращает символы если список пуст (двойное использование).
-    """
-    prices: dict[str, float] = {}
-    data = bybit_get("/v5/market/tickers", {"category": "linear"})
-    if not data:
-        return prices
+def get_prices(symbols: set) -> tuple[dict, dict]:
+    prices: dict  = {}
+    sources: dict = {}
+    norm = {normalize_symbol(s): s for s in symbols}
 
-    for item in data.get("result", {}).get("list", []):
-        sym = item.get("symbol", "")
-        if symbols and sym not in symbols:
-            continue
-        try:
-            price = float(item["lastPrice"])
-            if price > 0:
-                prices[sym] = price
-        except (ValueError, KeyError):
-            pass
-
-    return prices
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  BYBIT WEBSOCKET — real-time тикеры
-# ──────────────────────────────────────────────────────────────────────────────
-
-class BybitTickerWS:
-    """
-    Подписывается на tickers.<symbol> для всех символов через
-    wss://stream.bybit.com/v5/public/linear.
-
-    Bybit ограничивает одно соединение — не более ~21 000 символов в args.
-    На практике ~300+ символов — нужно разбить на батчи по 100.
-    """
-
-    BATCH = 100          # символов на одно соединение
-    PING_INTERVAL = 20   # секунд
-
-    def __init__(self, symbols: set[str]):
-        self._symbols  = list(symbols)
-        self._threads: list[threading.Thread] = []
-        self._stop     = threading.Event()
-        # WS URLs для перебора при ошибке
-        self._ws_urls  = [BYBIT_WS_URL, BYBIT_WS_FALLBACK]
-
-    def start(self):
-        batches = [
-            self._symbols[i: i + self.BATCH]
-            for i in range(0, len(self._symbols), self.BATCH)
-        ]
-        logging.info("WS: %d батчей × %d символов", len(batches), self.BATCH)
-
-        for idx, batch in enumerate(batches):
-            t = threading.Thread(
-                target=self._run_ws,
-                args=(batch, idx, 0),
-                daemon=True,
-                name=f"bybit-ws-{idx}",
-            )
-            t.start()
-            self._threads.append(t)
-
-    def stop(self):
-        self._stop.set()
-
-    def _run_ws(self, batch: list[str], idx: int, url_idx: int):
-        ws_url = self._ws_urls[url_idx % len(self._ws_urls)]
-        args   = [f"tickers.{s}" for s in batch]
-        connected = [False]
-
-        def on_open(ws):
-            connected[0] = True
-            ws.send(json.dumps({"op": "subscribe", "args": args}))
-            logging.info("WS[%d]: подключен к %s (%d символов)", idx, ws_url, len(batch))
-
-        def on_message(ws, raw):
-            try:
-                msg  = json.loads(raw)
-                data = msg.get("data", {})
-                sym  = data.get("symbol")
-                lp   = data.get("lastPrice")
-                if sym and lp:
-                    price = float(lp)
-                    if price > 0:
-                        live_prices[sym] = price
-            except Exception:
-                pass
-
-        def on_error(ws, err):
-            logging.warning("WS[%d] error: %s", idx, err)
-
-        def on_close(ws, code, msg):
-            if self._stop.is_set():
-                return
-            # если не успели подключиться — пробуем следующий URL
-            next_url_idx = (url_idx + 1) if not connected[0] else url_idx
-            logging.warning("WS[%d] закрыт (code=%s), переподключение к %s...",
-                            idx, code, self._ws_urls[next_url_idx % len(self._ws_urls)])
-            time.sleep(5)
-            self._run_ws(batch, idx, next_url_idx)
-
-        # прокси для websocket
-        proxy_opts = {}
-        if _proxy_url:
-            from urllib.parse import urlparse
-            p = urlparse(_proxy_url)
-            proxy_opts = {
-                "proxy_type": p.scheme,
-                "http_proxy_host": p.hostname,
-                "http_proxy_port": p.port,
-                "http_proxy_auth": (p.username, p.password) if p.username else None,
-            }
-
-        ws_app = websocket.WebSocketApp(
-            ws_url,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
+    # OKX
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
+            timeout=20
         )
-        ws_app.run_forever(
-            ping_interval=self.PING_INTERVAL,
-            ping_timeout=10,
-            **proxy_opts,
+        for item in r.json().get("data", []):
+            sym = normalize_symbol(item["instId"])
+            price = float(item["last"])
+            if price > 0 and sym in norm:
+                real = norm[sym]
+                prices[real]  = price
+                sources[real] = "OKX"
+    except Exception as e:
+        logging.error("Ошибка OKX: %s", e)
+
+    # MEXC
+    try:
+        r = requests.get(
+            "https://contract.mexc.com/api/v1/contract/ticker",
+            timeout=20
         )
+        data = r.json()
+        if data.get("success"):
+            for item in data["data"]:
+                sym = normalize_symbol(item["symbol"])
+                price = float(item["lastPrice"])
+                if price > 0 and sym in norm:
+                    real = norm[sym]
+                    if real not in prices:
+                        prices[real]  = price
+                        sources[real] = "MEXC"
+    except Exception as e:
+        logging.error("Ошибка MEXC: %s", e)
+
+    return prices, sources
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 #  RSI
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 
-def calculate_rsi(prices: list[float], window: int = 5) -> float | None:
+def calculate_rsi(prices: list, window: int = 5) -> float | None:
     try:
         if len(prices) < window + 1:
             return None
-        rsi = RSIIndicator(close=pd.Series(prices), window=window).rsi().iloc[-1]
+        series = pd.Series(prices)
+        rsi = RSIIndicator(close=series, window=window).rsi().iloc[-1]
         return None if pd.isna(rsi) else round(float(rsi), 2)
     except Exception as e:
-        logging.error("RSI: %s", e)
+        logging.error("Ошибка RSI: %s", e)
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
+#  RETRY WRAPPER
+# ================================================================
+
+async def safe_request(func, retries: int = 5, delay: float = 2):
+    for attempt in range(retries):
+        try:
+            return await func()
+        except Exception as e:
+            logging.warning("Retry %d/%d: %s", attempt + 1, retries, e)
+            await asyncio.sleep(delay)
+    return None
+
+
+# ================================================================
 #  MONITOR
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 
-async def monitor(symbols: set[str], ws_client: BybitTickerWS):
-    global signals_count, checks_count, last_check_time
+async def monitor():
+    global current_percent, current_window, signals_count, checks_count, last_check_time
 
-    # Первичное заполнение через REST, пока WS ещё не прислал данные
-    logging.info("Monitor: первичный REST-снимок...")
-    rest_snap = get_bybit_prices_rest(symbols)
-    live_prices.update(rest_snap)
-    logging.info("Monitor: загружено %d цен из REST", len(rest_snap))
-
-    send_message(
-        f"✅ Бот запущен\n"
-        f"📡 Bybit Linear Perpetual USDT\n"
-        f"🪙 Символов: {len(symbols)}",
-        config.CHAT_ID,
-    )
-
+    symbols = get_symbols()
     last_symbols_update = time.time()
 
+    send_message("✅ Бот запущен", config.CHAT_ID)
+
     while True:
+        # ── пауза ──────────────────────────────────────────────
         if monitor_paused:
             await asyncio.sleep(2)
             continue
@@ -504,27 +311,28 @@ async def monitor(symbols: set[str], ws_client: BybitTickerWS):
             checks_count   += 1
             last_check_time = now
 
-            # ── обновление списка монет каждые 30 мин ─────────
+            # обновление списка монет каждые 30 мин
             if now - last_symbols_update >= 1800:
-                new_syms = get_bybit_symbols()
-                if new_syms:
-                    symbols = new_syms
-                    logging.info("Символы обновлены: %d", len(symbols))
+                new_symbols = get_symbols()
+                if new_symbols:
+                    symbols = new_symbols
+                    logging.info("Монеты обновлены: %d", len(symbols))
+                else:
+                    logging.warning("Список монет не обновлён, используется старый")
                 last_symbols_update = now
 
-            # ── обход текущих цен из WebSocket ────────────────
-            snapshot = dict(live_prices)   # атомарная копия
+            prices, sources = get_prices(symbols)
 
-            for sym, price in snapshot.items():
-                if sym not in symbols:
+            for sym, price in prices.items():
+                await asyncio.sleep(0)   # передать управление event loop
+
+                if price <= 0:
                     continue
-
-                await asyncio.sleep(0)   # yield event loop
 
                 hist = price_history.setdefault(sym, [])
                 hist.append((now, price))
 
-                # чистим старое
+                # чистим старую историю
                 cutoff = max(current_window * 2, 86400)
                 price_history[sym] = [x for x in hist if now - x[0] <= cutoff]
 
@@ -541,38 +349,47 @@ async def monitor(symbols: set[str], ws_client: BybitTickerWS):
                 if abs(growth) < current_percent:
                     continue
 
-                # антиспам
-                if now - db_get_cooldown(sym) < config.COOLDOWN:
+                # ── антиспам через SQLite ──────────────────────
+                last_ts = db_get_cooldown(sym)
+                if now - last_ts < config.COOLDOWN:
                     continue
 
-                rsi = calculate_rsi([x[1] for x in price_history[sym][-100:]])
+                rsi    = calculate_rsi([x[1] for x in price_history[sym][-100:]])
+                source = sources.get(sym, "UNKNOWN")
 
-                arrow = "🚀" if growth > 0 else "📉"
-                sign  = "+" if growth > 0 else ""
-                text  = (
-                    f"{arrow} СИГНАЛ\n\n"
-                    f"Монета:  {sym}\n"
-                    f"Цена:    {price}\n"
-                    f"Изменение: {sign}{growth:.2f}%\n"
-                    f"Период:  {current_window // 60} мин\n"
-                )
-                text += f"📊 RSI: {rsi:.2f}" if rsi is not None else "📊 RSI: ожидание данных"
+                if growth > 0:
+                    text = (
+                        f"🚀 СИГНАЛ\n\n"
+                        f"Монета: {sym}\n"
+                        f"Цена: {price} ({source})\n"
+                        f"Рост: +{growth:.2f}%\n"
+                    )
+                else:
+                    text = (
+                        f"📉 СИГНАЛ\n\n"
+                        f"Монета: {sym}\n"
+                        f"Цена: {price} ({source})\n"
+                        f"Падение: {growth:.2f}%\n"
+                    )
+
+                text += f"\n📊 RSI: {rsi:.2f}" if rsi is not None else "\n📊 RSI: ожидание данных"
 
                 send_message(text, config.CHAT_ID)
-                db_save_alert(sym, price, growth, rsi)
+
+                db_save_alert(sym, price, growth, rsi, source)
                 db_set_cooldown(sym)
                 signals_count += 1
 
             await asyncio.sleep(config.INTERVAL)
 
         except Exception as e:
-            logging.exception("monitor: %s", e)
+            logging.exception("Ошибка monitor: %s", e)
             await asyncio.sleep(5)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  TELEGRAM HANDLER
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
+#  TELEGRAM MESSAGE HANDLER
+# ================================================================
 
 def handle_message(msg: dict):
     global current_percent, current_window, monitor_paused
@@ -580,23 +397,21 @@ def handle_message(msg: dict):
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
 
+    # ── /start ─────────────────────────────────────────────────
     if text == "/start":
         send_message(
-            f"🚀 Бот запущен\n"
-            f"📡 Источник: Bybit Linear Perpetual USDT\n"
+            f"🚀 Бот запущен\n\n"
             f"📈 Порог: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n"
-            f"{'⏸ Пауза' if monitor_paused else '▶️ Мониторинг активен'}",
+            f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг идёт'}",
             chat_id,
         )
         send_keyboard(chat_id)
 
+    # ── /status ────────────────────────────────────────────────
     elif text == "/status":
-        ws_syms = len(live_prices)
         send_message(
-            f"📊 Статус\n\n"
-            f"📡 Bybit LinearPerpetual USDT\n"
-            f"🟢 WS цен: {ws_syms}\n"
+            f"📊 Настройки\n\n"
             f"📈 Порог: {current_percent}%\n"
             f"⏱ Период: {current_window} сек\n"
             f"🔔 Кулдаун: {config.COOLDOWN // 60} мин\n"
@@ -604,23 +419,27 @@ def handle_message(msg: dict):
             chat_id,
         )
 
+    # ── Статистика ─────────────────────────────────────────────
     elif text == "📊 Статистика":
         uptime  = int(time.time() - start_time)
-        d = uptime // 86400; h = (uptime % 86400) // 3600; m = (uptime % 3600) // 60
+        days    = uptime // 86400
+        hours   = (uptime % 86400) // 3600
+        minutes = (uptime % 3600) // 60
         send_message(
             f"📊 СТАТИСТИКА\n\n"
-            f"🟢 Время работы: {d}д {h}ч {m}м\n"
+            f"🟢 Время работы: {days}д {hours}ч {minutes}м\n"
             f"🪙 Монет в истории: {len(price_history)}\n"
-            f"📡 WS live-цен: {len(live_prices)}\n"
-            f"🔔 Сигналов: {signals_count}\n"
-            f"🔄 Циклов: {checks_count}\n"
-            f"📈 Порог: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n"
-            f"⚡ Интервал: {config.INTERVAL} сек\n"
-            f"🕒 Кулдаун: {config.COOLDOWN // 60} мин",
+            f"🔔 Сигналов отправлено: {signals_count}\n"
+            f"🔄 Циклов проверки: {checks_count}\n"
+            f"📈 Порог роста: {current_percent}%\n"
+            f"⏱ Период анализа: {current_window // 60} мин\n"
+            f"⚡ Интервал проверки: {config.INTERVAL} сек\n"
+            f"🕒 Кулдаун: {config.COOLDOWN // 60} мин\n"
+            f"{'⏸ Мониторинг на паузе' if monitor_paused else '▶️ Мониторинг активен'}",
             chat_id,
         )
 
+    # ── История алертов (из SQLite) ────────────────────────────
     elif text in ("📋 История", "/history"):
         rows = db_recent_alerts(10)
         if not rows:
@@ -628,137 +447,174 @@ def handle_message(msg: dict):
         else:
             lines = ["📋 Последние 10 сигналов:\n"]
             for r in rows:
-                ts   = time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))
+                ts  = time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))
                 sign = "🚀" if r["growth"] > 0 else "📉"
-                rsi_s = f"RSI {r['rsi']:.1f}" if r["rsi"] is not None else "RSI —"
-                lines.append(f"{sign} {r['symbol']} {r['growth']:+.2f}% | {rsi_s} | {ts}")
+                rsi_str = f"RSI {r['rsi']:.1f}" if r["rsi"] is not None else "RSI —"
+                lines.append(
+                    f"{sign} {r['symbol']} {r['growth']:+.2f}% | {rsi_str} | {ts}"
+                )
             send_message("\n".join(lines), chat_id)
 
+    # ── Пауза / Продолжить ─────────────────────────────────────
     elif text in ("⏸ Пауза", "/pause"):
         if monitor_paused:
-            send_message("⏸ Уже на паузе", chat_id)
+            send_message("⏸ Мониторинг уже на паузе", chat_id)
         else:
             monitor_paused = True
+            logging.info("Monitor paused by user")
             send_message("⏸ Мониторинг приостановлен", chat_id)
 
     elif text in ("▶️ Продолжить", "/resume"):
         if not monitor_paused:
-            send_message("▶️ Уже активен", chat_id)
+            send_message("▶️ Мониторинг уже активен", chat_id)
         else:
             monitor_paused = False
+            logging.info("Monitor resumed by user")
             send_message("▶️ Мониторинг возобновлён", chat_id)
 
-    elif text == "📈 0.2%":  current_percent = 0.2;  save_state(); send_message("✅ Порог: 0.2%", chat_id)
-    elif text == "📈 5%":    current_percent = 5;    save_state(); send_message("✅ Порог: 5%", chat_id)
-    elif text == "📈 10%":   current_percent = 10;   save_state(); send_message("✅ Порог: 10%", chat_id)
-    elif text == "📈 15%":   current_percent = 15;   save_state(); send_message("✅ Порог: 15%", chat_id)
-    elif text == "📈 20%":   current_percent = 20;   save_state(); send_message("✅ Порог: 20%", chat_id)
-    elif text == "⏱ 5 мин":  current_window = 300;   save_state(); send_message("✅ Период: 5 мин", chat_id)
-    elif text == "⏱ 1 час":  current_window = 3600;  save_state(); send_message("✅ Период: 1 час", chat_id)
-    elif text == "⏱ 4 часа": current_window = 14400; save_state(); send_message("✅ Период: 4 часа", chat_id)
-    elif text == "⏱ 1 день": current_window = 86400; save_state(); send_message("✅ Период: 1 день", chat_id)
+    # ── Пороги роста ───────────────────────────────────────────
+    elif text == "📈 0.2%":
+        current_percent = 0.2;  send_message("✅ Порог: 0.2%", chat_id)
+    elif text == "📈 5%":
+        current_percent = 5;    send_message("✅ Порог: 5%", chat_id)
+    elif text == "📈 10%":
+        current_percent = 10;   send_message("✅ Порог: 10%", chat_id)
+    elif text == "📈 15%":
+        current_percent = 15;   send_message("✅ Порог: 15%", chat_id)
+    elif text == "📈 20%":
+        current_percent = 20;   send_message("✅ Порог: 20%", chat_id)
+
+    # ── Периоды ────────────────────────────────────────────────
+    elif text == "⏱ 5 мин":
+        current_window = 300;   send_message("✅ Период: 5 мин", chat_id)
+    elif text == "⏱ 1 час":
+        current_window = 3600;  send_message("✅ Период: 1 час", chat_id)
+    elif text == "⏱ 4 часа":
+        current_window = 14400; send_message("✅ Период: 4 часа", chat_id)
+    elif text == "⏱ 1 день":
+        current_window = 86400; send_message("✅ Период: 1 день", chat_id)
+
     else:
         send_message("❓ Неизвестная команда", chat_id)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 #  TELEGRAM LOOP
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 
 def get_updates() -> list:
-    global tg_offset
+    global offset
     try:
-        r = requests.get(
-            f"{TG_URL}/getUpdates",
-            params={"timeout": 30, "offset": tg_offset},
+        resp = requests.get(
+            f"{URL}/getUpdates",
+            params={"timeout": 30, "offset": offset},
             timeout=35,
         )
-        data = r.json()
+        data = resp.json()
         if data.get("ok"):
             return data["result"]
     except Exception as e:
-        logging.error("get_updates: %s", e)
+        logging.error("Ошибка get_updates: %s", e)
     return []
 
 
 async def telegram_loop():
-    global tg_offset
+    global offset
     while True:
         try:
-            for upd in get_updates():
-                tg_offset = upd["update_id"] + 1
-                if "message" in upd:
-                    handle_message(upd["message"])
+            for update in get_updates():
+                offset = update["update_id"] + 1
+                if "message" in update:
+                    handle_message(update["message"])
         except Exception as e:
-            logging.exception("telegram_loop: %s", e)
+            logging.exception("Ошибка telegram_loop: %s", e)
         await asyncio.sleep(0.2)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 #  BACKGROUND TASKS
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 
 async def heartbeat():
     while True:
-        logging.info(
-            "alive | ws_prices=%d | signals=%d | paused=%s",
-            len(live_prices), signals_count, monitor_paused,
-        )
+        status = "PAUSED" if monitor_paused else "running"
+        logging.info("Bot alive | status=%s | signals=%d", status, signals_count)
         await asyncio.sleep(300)
 
 
 async def save_state_loop():
     while True:
-        save_state()
+        try:
+            save_state()
+        except Exception:
+            pass
         await asyncio.sleep(30)
 
 
-WATCHDOG_TIMEOUT = 90   # сек без активности monitor → перезапуск
+# ================================================================
+#  WATCHDOG  — авто-перезапуск monitor при зависании
+# ================================================================
 
+WATCHDOG_TIMEOUT = 90   # секунд без активности monitor → перезапуск
 
-async def watchdog(symbols: set[str], ws_client: BybitTickerWS):
+async def watchdog():
     global monitor_task, last_check_time
+
+    # небольшая задержка при старте, чтобы monitor успел инициализироваться
     await asyncio.sleep(60)
 
     while True:
         try:
-            if not monitor_paused and last_check_time:
-                stall = time.time() - last_check_time
-                if stall > WATCHDOG_TIMEOUT:
-                    logging.warning("Watchdog: monitor завис (%.0f сек)", stall)
-                    send_message(
-                        f"⚠️ Watchdog: monitor завис ({stall:.0f} с). Перезапуск...",
-                        config.CHAT_ID,
-                    )
-                    if monitor_task and not monitor_task.done():
-                        monitor_task.cancel()
-                        try:
-                            await monitor_task
-                        except asyncio.CancelledError:
-                            pass
-                    monitor_task = asyncio.create_task(monitor(symbols, ws_client))
-                    last_check_time = time.time()
-                    send_message("✅ Monitor перезапущен", config.CHAT_ID)
+            if monitor_paused:
+                await asyncio.sleep(30)
+                continue
+
+            stall = time.time() - last_check_time if last_check_time else 0
+
+            if stall > WATCHDOG_TIMEOUT:
+                logging.warning(
+                    "Watchdog: monitor завис (%.0f сек без активности) — перезапуск", stall
+                )
+                send_message(
+                    f"⚠️ Watchdog: monitor завис ({stall:.0f} сек). Перезапуск...",
+                    config.CHAT_ID,
+                )
+
+                # отменяем старую задачу
+                if monitor_task and not monitor_task.done():
+                    monitor_task.cancel()
+                    try:
+                        await monitor_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # запускаем новую
+                monitor_task = asyncio.create_task(monitor())
+                last_check_time = time.time()   # сбрасываем таймер
+                logging.info("Watchdog: monitor перезапущен")
+                send_message("✅ Monitor перезапущен", config.CHAT_ID)
+
         except Exception as e:
-            logging.exception("watchdog: %s", e)
+            logging.exception("Ошибка watchdog: %s", e)
+
         await asyncio.sleep(30)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 #  GLOBAL EXCEPTION HANDLER
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 
 def handle_async_exception(loop, context):
     exc = context.get("exception")
     if exc:
-        logging.exception("Unhandled async exc", exc_info=exc)
+        logging.exception("Unhandled async exception", exc_info=exc)
     else:
         logging.error("Async error: %s", context["message"])
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 #  MAIN
-# ──────────────────────────────────────────────────────────────────────────────
+# ================================================================
 
 async def main():
     global monitor_task
@@ -766,45 +622,14 @@ async def main():
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_async_exception)
 
-    # 1. Загружаем символы — несколько попыток
-    symbols: set[str] = set()
-    for attempt in range(1, 6):
-        logging.info("Загрузка символов, попытка %d...", attempt)
-        symbols = get_bybit_symbols()
-        if symbols:
-            break
-        logging.warning("Символы не получены, ждём 10 сек...")
-        await asyncio.sleep(10)
-
-    if not symbols:
-        # Последний шанс — просто взять символы из REST-снимка цен
-        logging.warning("instruments-info недоступен — берём символы из tickers")
-        snap = get_bybit_prices_rest(set())   # пустой фильтр = все символы
-        symbols = set(snap.keys())
-
-    if not symbols:
-        logging.critical("Не удалось загрузить символы ни одним способом. Выход.")
-        return
-
-    logging.info("Запуск с %d символами", len(symbols))
-
-    # 2. Запускаем WebSocket-клиент в фоновых потоках
-    ws_client = BybitTickerWS(symbols)
-    ws_client.start()
-    logging.info("WebSocket-клиент запущен")
-
-    # 3. Пауза — даём WS прислать первые данные
-    await asyncio.sleep(5)
-
-    # 4. Запускаем monitor как отдельную task (watchdog может перезапустить)
-    monitor_task = asyncio.create_task(monitor(symbols, ws_client))
+    monitor_task = asyncio.create_task(monitor())
 
     await asyncio.gather(
-        asyncio.shield(monitor_task),
+        asyncio.shield(monitor_task),   # watchdog управляет задачей сам
         telegram_loop(),
         heartbeat(),
         save_state_loop(),
-        watchdog(symbols, ws_client),
+        watchdog(),
     )
 
 
