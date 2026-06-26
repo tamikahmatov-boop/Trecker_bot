@@ -1,4 +1,3 @@
-Код 9 
 
 import json
 import logging
