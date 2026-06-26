@@ -37,14 +37,29 @@ logging.basicConfig(
 #  BYBIT ENDPOINTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-BYBIT_REST   = "https://api.bybit.com"
+# Список эндпоинтов REST — перебираем по очереди при 403
+# api.bybit.com  — основной (заблокирован в РФ/США/Китае)
+# api.bytick.com — официальное зеркало Bybit (работает из большинства стран)
+BYBIT_REST_HOSTS = [
+    "https://api.bytick.com",   # зеркало — пробуем первым
+    "https://api.bybit.com",    # основной
+]
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
+BYBIT_WS_FALLBACK = "wss://stream.bytick.com/v5/public/linear"
 
-# Заголовки — без них Bybit может вернуть HTML вместо JSON
 BYBIT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)",
     "Accept": "application/json",
 }
+
+# Прокси из config (опционально). Пример в config.py:
+#   PROXY = "socks5://user:pass@host:port"   или   PROXY = ""
+_proxy_url: str = getattr(config, "PROXY", "")
+BYBIT_PROXIES: dict | None = (
+    {"http": _proxy_url, "https": _proxy_url} if _proxy_url else None
+)
+if BYBIT_PROXIES:
+    logging.info("Прокси активен: %s", _proxy_url)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  DATABASE
@@ -210,32 +225,45 @@ def send_keyboard(chat_id):
 
 def bybit_get(path: str, params: dict | None = None, timeout: int = 20) -> dict | None:
     """
-    Делает GET-запрос к Bybit REST API.
-    Логирует сырой ответ при ошибке парсинга JSON.
-    Возвращает dict или None при ошибке.
+    Перебирает BYBIT_REST_HOSTS по очереди.
+    При 403/не-JSON переходит к следующему хосту.
+    Поддерживает прокси через BYBIT_PROXIES.
     """
-    url = f"{BYBIT_REST}{path}"
-    try:
-        r = requests.get(url, params=params, headers=BYBIT_HEADERS, timeout=timeout)
-        raw = r.text
-
+    for host in BYBIT_REST_HOSTS:
+        url = f"{host}{path}"
         try:
-            data = r.json()
-        except Exception:
-            logging.error("bybit_get: не JSON от %s | статус=%s | тело=%s",
-                          path, r.status_code, raw[:300])
-            return None
+            r = requests.get(
+                url,
+                params=params,
+                headers=BYBIT_HEADERS,
+                proxies=BYBIT_PROXIES,
+                timeout=timeout,
+            )
 
-        if data.get("retCode") != 0:
-            logging.error("bybit_get %s retCode=%s msg=%s",
-                          path, data.get("retCode"), data.get("retMsg"))
-            return None
+            if r.status_code == 403:
+                logging.warning("bybit_get: 403 от %s — пробуем следующий хост", host)
+                continue
 
-        return data
+            try:
+                data = r.json()
+            except Exception:
+                logging.error("bybit_get: не JSON от %s%s | статус=%s | тело=%s",
+                              host, path, r.status_code, r.text[:200])
+                continue
 
-    except requests.RequestException as e:
-        logging.error("bybit_get %s: %s", path, e)
-        return None
+            if data.get("retCode") != 0:
+                logging.error("bybit_get %s retCode=%s msg=%s",
+                              path, data.get("retCode"), data.get("retMsg"))
+                return None
+
+            return data
+
+        except requests.RequestException as e:
+            logging.error("bybit_get %s%s: %s", host, path, e)
+            continue
+
+    logging.error("bybit_get: все хосты недоступны для %s", path)
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -344,6 +372,8 @@ class BybitTickerWS:
         self._symbols  = list(symbols)
         self._threads: list[threading.Thread] = []
         self._stop     = threading.Event()
+        # WS URLs для перебора при ошибке
+        self._ws_urls  = [BYBIT_WS_URL, BYBIT_WS_FALLBACK]
 
     def start(self):
         batches = [
@@ -355,7 +385,7 @@ class BybitTickerWS:
         for idx, batch in enumerate(batches):
             t = threading.Thread(
                 target=self._run_ws,
-                args=(batch, idx),
+                args=(batch, idx, 0),
                 daemon=True,
                 name=f"bybit-ws-{idx}",
             )
@@ -365,16 +395,19 @@ class BybitTickerWS:
     def stop(self):
         self._stop.set()
 
-    def _run_ws(self, batch: list[str], idx: int):
-        args = [f"tickers.{s}" for s in batch]
+    def _run_ws(self, batch: list[str], idx: int, url_idx: int):
+        ws_url = self._ws_urls[url_idx % len(self._ws_urls)]
+        args   = [f"tickers.{s}" for s in batch]
+        connected = [False]
 
         def on_open(ws):
+            connected[0] = True
             ws.send(json.dumps({"op": "subscribe", "args": args}))
-            logging.info("WS[%d]: подписан на %d символов", idx, len(batch))
+            logging.info("WS[%d]: подключен к %s (%d символов)", idx, ws_url, len(batch))
 
         def on_message(ws, raw):
             try:
-                msg = json.loads(raw)
+                msg  = json.loads(raw)
                 data = msg.get("data", {})
                 sym  = data.get("symbol")
                 lp   = data.get("lastPrice")
@@ -389,19 +422,39 @@ class BybitTickerWS:
             logging.warning("WS[%d] error: %s", idx, err)
 
         def on_close(ws, code, msg):
-            if not self._stop.is_set():
-                logging.warning("WS[%d] закрыт (%s %s), переподключение...", idx, code, msg)
-                time.sleep(5)
-                self._run_ws(batch, idx)   # рекурсивный перезапуск
+            if self._stop.is_set():
+                return
+            # если не успели подключиться — пробуем следующий URL
+            next_url_idx = (url_idx + 1) if not connected[0] else url_idx
+            logging.warning("WS[%d] закрыт (code=%s), переподключение к %s...",
+                            idx, code, self._ws_urls[next_url_idx % len(self._ws_urls)])
+            time.sleep(5)
+            self._run_ws(batch, idx, next_url_idx)
+
+        # прокси для websocket
+        proxy_opts = {}
+        if _proxy_url:
+            from urllib.parse import urlparse
+            p = urlparse(_proxy_url)
+            proxy_opts = {
+                "proxy_type": p.scheme,
+                "http_proxy_host": p.hostname,
+                "http_proxy_port": p.port,
+                "http_proxy_auth": (p.username, p.password) if p.username else None,
+            }
 
         ws_app = websocket.WebSocketApp(
-            BYBIT_WS_URL,
+            ws_url,
             on_open=on_open,
             on_message=on_message,
             on_error=on_error,
             on_close=on_close,
         )
-        ws_app.run_forever(ping_interval=self.PING_INTERVAL, ping_timeout=10)
+        ws_app.run_forever(
+            ping_interval=self.PING_INTERVAL,
+            ping_timeout=10,
+            **proxy_opts,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
