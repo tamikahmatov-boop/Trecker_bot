@@ -2,6 +2,7 @@ import logging
 import asyncio
 from typing import Optional, Dict, List, Any
 import aiohttp
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -53,17 +54,18 @@ class TelegramClient:
                 timeout=aiohttp.ClientTimeout(total=20)
             ) as response:
                 if response.status == 200:
-                    logger.debug(f"Сообщение отправлено в {chat_id}")
+                    logger.info(f"✅ Сообщение отправлено в {chat_id}")
                     return True
                 else:
                     error_text = await response.text()
-                    logger.error(f"Ошибка sendMessage: {response.status} - {error_text}")
+                    logger.error(f"❌ Ошибка sendMessage: {response.status} - {error_text}")
                     return False
         except Exception as e:
-            logger.error(f"Ошибка send_message: {e}")
+            logger.error(f"❌ Ошибка send_message: {e}")
             return False
     
     async def send_main_menu(self, chat_id: int):
+        """Главное меню"""
         keyboard = {
             "keyboard": [
                 ["📈 Настройки порога", "⏱ Настройки периода"],
@@ -81,6 +83,7 @@ class TelegramClient:
         )
     
     async def send_percent_menu(self, chat_id: int):
+        """Меню выбора порога"""
         keyboard = {
             "keyboard": [
                 ["📈 0.2%", "📈 5%", "📈 10%"],
@@ -98,6 +101,7 @@ class TelegramClient:
         )
     
     async def send_window_menu(self, chat_id: int):
+        """Меню выбора периода"""
         keyboard = {
             "keyboard": [
                 ["⏱ 1 минута", "⏱ 5 минут", "⏱ 15 минут"],
@@ -114,7 +118,37 @@ class TelegramClient:
             keyboard
         )
     
+    async def send_signal_with_buttons(self, chat_id: int, symbol: str, price: float, 
+                                       growth: float, source: str, rsi: Optional[float] = None):
+        """Отправка сигнала с инлайн кнопками"""
+        emoji = "🚀" if growth > 0 else "📉"
+        action = "Рост" if growth > 0 else "Падение"
+        
+        text = (
+            f"{emoji} <b>СИГНАЛ</b>\n\n"
+            f"Монета: <b>{symbol}</b>\n"
+            f"Цена: <b>{price:.4f}</b> ({source})\n"
+            f"{action}: <b>{growth:+.2f}%</b>"
+        )
+        if rsi is not None:
+            text += f"\n📊 RSI: <b>{rsi:.2f}</b>"
+        
+        text += "\n\n⬇️ Нажмите кнопку ниже:"
+        
+        # Инлайн кнопки
+        inline_keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔕 Игнорировать", "callback_data": f"ignore_{symbol}"},
+                    {"text": "ℹ️ Инфо", "callback_data": f"info_{symbol}"}
+                ]
+            ]
+        }
+        
+        await self.send_message(text, chat_id, inline_keyboard)
+    
     async def get_updates(self) -> List[Dict[str, Any]]:
+        """Получение обновлений от Telegram"""
         await self._rate_limit()
         
         try:
@@ -133,26 +167,31 @@ class TelegramClient:
                         updates = data.get("result", [])
                         if updates:
                             self.offset = updates[-1]["update_id"] + 1
+                            # Логируем callback запросы
+                            for update in updates:
+                                if "callback_query" in update:
+                                    logger.info(f"🔘 Получен callback: {update['callback_query'].get('data')}")
                             logger.info(f"📥 Получено {len(updates)} обновлений")
                         return updates
                     else:
-                        logger.error(f"Telegram API error: {data}")
+                        logger.error(f"❌ Telegram API error: {data}")
                         return []
                 elif response.status == 409:
-                    logger.warning("Conflict 409 - возможно дублирующийся бот")
+                    logger.warning("⚠️ Conflict 409 - возможно дублирующийся бот")
                     await asyncio.sleep(5)
                     return []
                 else:
-                    logger.error(f"HTTP error: {response.status}")
+                    logger.error(f"❌ HTTP error: {response.status}")
                     return []
         except asyncio.TimeoutError:
-            logger.warning("Timeout в get_updates")
+            logger.warning("⏰ Timeout в get_updates")
             return []
         except Exception as e:
-            logger.error(f"Ошибка get_updates: {e}")
+            logger.error(f"❌ Ошибка get_updates: {e}")
             return []
     
     async def answer_callback(self, callback_id: str, text: str, show_alert: bool = False) -> bool:
+        """ОТВЕТ НА CALLBACK - ЭТО ОБЯЗАТЕЛЬНО ДЛЯ РАБОТЫ КНОПОК!"""
         await self._rate_limit()
         
         try:
@@ -180,6 +219,7 @@ class TelegramClient:
     
     async def edit_message_reply_markup(self, chat_id: int, message_id: int, 
                                        reply_markup: Optional[Dict] = None) -> bool:
+        """Редактирование кнопок в сообщении"""
         await self._rate_limit()
         
         try:
@@ -197,12 +237,12 @@ class TelegramClient:
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status == 200:
-                    logger.debug(f"Кнопки обновлены в сообщении {message_id}")
+                    logger.debug(f"✅ Кнопки обновлены в сообщении {message_id}")
                     return True
                 else:
                     error_text = await response.text()
-                    logger.error(f"Ошибка editMessageReplyMarkup: {response.status} - {error_text}")
+                    logger.error(f"❌ Ошибка editMessageReplyMarkup: {response.status} - {error_text}")
                     return False
         except Exception as e:
-            logger.error(f"Ошибка edit_message_reply_markup: {e}")
+            logger.error(f"❌ Ошибка edit_message_reply_markup: {e}")
             return False
