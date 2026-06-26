@@ -40,6 +40,12 @@ logging.basicConfig(
 BYBIT_REST   = "https://api.bybit.com"
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
+# Заголовки — без них Bybit может вернуть HTML вместо JSON
+BYBIT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)",
+    "Accept": "application/json",
+}
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  DATABASE
 # ──────────────────────────────────────────────────────────────────────────────
@@ -199,92 +205,121 @@ def send_keyboard(chat_id):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  BYBIT REST — утилита запроса
+# ──────────────────────────────────────────────────────────────────────────────
+
+def bybit_get(path: str, params: dict | None = None, timeout: int = 20) -> dict | None:
+    """
+    Делает GET-запрос к Bybit REST API.
+    Логирует сырой ответ при ошибке парсинга JSON.
+    Возвращает dict или None при ошибке.
+    """
+    url = f"{BYBIT_REST}{path}"
+    try:
+        r = requests.get(url, params=params, headers=BYBIT_HEADERS, timeout=timeout)
+        raw = r.text
+
+        try:
+            data = r.json()
+        except Exception:
+            logging.error("bybit_get: не JSON от %s | статус=%s | тело=%s",
+                          path, r.status_code, raw[:300])
+            return None
+
+        if data.get("retCode") != 0:
+            logging.error("bybit_get %s retCode=%s msg=%s",
+                          path, data.get("retCode"), data.get("retMsg"))
+            return None
+
+        return data
+
+    except requests.RequestException as e:
+        logging.error("bybit_get %s: %s", path, e)
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  BYBIT REST — список символов
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_bybit_symbols() -> set[str]:
     """
-    Возвращает все активные USDT-бессрочные (LinearPerpetual) с Bybit.
-    Использует пагинацию через cursor.
+    Стратегия 1: instruments-info с пагинацией (надёжно, фильтруем LinearPerpetual+USDT).
+    Стратегия 2 (fallback): tickers — берём все символы заканчивающиеся на USDT.
     """
     symbols: set[str] = set()
     cursor = ""
+    page   = 0
 
+    # ── Стратегия 1: instruments-info ─────────────────────────────────────────
     while True:
-        try:
-            params: dict = {"category": "linear", "limit": 1000, "status": "Trading"}
-            if cursor:
-                params["cursor"] = cursor
+        page += 1
+        params: dict = {"category": "linear", "limit": 500}
+        if cursor:
+            params["cursor"] = cursor
 
-            r = requests.get(
-                f"{BYBIT_REST}/v5/market/instruments-info",
-                params=params,
-                timeout=20,
-            )
-            data = r.json()
-
-            if data.get("retCode") != 0:
-                logging.error("instruments-info error: %s", data.get("retMsg"))
-                break
-
-            result = data["result"]
-
-            for item in result.get("list", []):
-                # только бессрочные котируемые в USDT
-                if (
-                    item.get("contractType") == "LinearPerpetual"
-                    and item.get("quoteCoin") == "USDT"
-                    and item.get("status") == "Trading"
-                ):
-                    symbols.add(item["symbol"])
-
-            cursor = result.get("nextPageCursor", "")
-            if not cursor:
-                break
-
-        except Exception as e:
-            logging.error("get_bybit_symbols: %s", e)
+        data = bybit_get("/v5/market/instruments-info", params)
+        if data is None:
+            logging.warning("instruments-info недоступен, пробуем fallback через tickers")
             break
 
-    logging.info("Bybit LinearPerpetual USDT: %d символов", len(symbols))
+        result = data.get("result", {})
+        items  = result.get("list", [])
+        logging.debug("instruments-info стр.%d: %d записей", page, len(items))
+
+        for item in items:
+            if (
+                item.get("contractType") == "LinearPerpetual"
+                and item.get("quoteCoin") == "USDT"
+                and item.get("status") == "Trading"
+            ):
+                symbols.add(item["symbol"])
+
+        cursor = result.get("nextPageCursor", "")
+        if not cursor:
+            break
+
+    if symbols:
+        logging.info("Bybit LinearPerpetual USDT (instruments-info): %d символов", len(symbols))
+        return symbols
+
+    # ── Стратегия 2: fallback через tickers ───────────────────────────────────
+    logging.warning("Используем fallback: /v5/market/tickers?category=linear")
+    data = bybit_get("/v5/market/tickers", {"category": "linear"})
+    if data:
+        for item in data.get("result", {}).get("list", []):
+            sym = item.get("symbol", "")
+            if sym.endswith("USDT"):
+                symbols.add(sym)
+        logging.info("Bybit tickers fallback: %d символов", len(symbols))
+
     return symbols
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  BYBIT REST — снимок цен (fallback / первый запуск)
+#  BYBIT REST — снимок цен (первый запуск / fallback для WS)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_bybit_prices_rest(symbols: set[str]) -> dict[str, float]:
     """
-    GET /v5/market/tickers?category=linear — возвращает все тикеры одним запросом.
-    Фильтрует только нужные символы.
+    GET /v5/market/tickers?category=linear — все тикеры одним запросом.
+    Заодно возвращает символы если список пуст (двойное использование).
     """
     prices: dict[str, float] = {}
-    try:
-        r = requests.get(
-            f"{BYBIT_REST}/v5/market/tickers",
-            params={"category": "linear"},
-            timeout=20,
-        )
-        data = r.json()
+    data = bybit_get("/v5/market/tickers", {"category": "linear"})
+    if not data:
+        return prices
 
-        if data.get("retCode") != 0:
-            logging.error("tickers REST error: %s", data.get("retMsg"))
-            return prices
-
-        for item in data["result"]["list"]:
-            sym = item["symbol"]
-            if sym not in symbols:
-                continue
-            try:
-                price = float(item["lastPrice"])
-                if price > 0:
-                    prices[sym] = price
-            except (ValueError, KeyError):
-                pass
-
-    except Exception as e:
-        logging.error("get_bybit_prices_rest: %s", e)
+    for item in data.get("result", {}).get("list", []):
+        sym = item.get("symbol", "")
+        if symbols and sym not in symbols:
+            continue
+        try:
+            price = float(item["lastPrice"])
+            if price > 0:
+                prices[sym] = price
+        except (ValueError, KeyError):
+            pass
 
     return prices
 
@@ -678,20 +713,35 @@ async def main():
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_async_exception)
 
-    # 1. Получаем список символов
-    logging.info("Загружаем список символов с Bybit...")
-    symbols = get_bybit_symbols()
+    # 1. Загружаем символы — несколько попыток
+    symbols: set[str] = set()
+    for attempt in range(1, 6):
+        logging.info("Загрузка символов, попытка %d...", attempt)
+        symbols = get_bybit_symbols()
+        if symbols:
+            break
+        logging.warning("Символы не получены, ждём 10 сек...")
+        await asyncio.sleep(10)
+
     if not symbols:
-        logging.critical("Не удалось загрузить символы. Выход.")
+        # Последний шанс — просто взять символы из REST-снимка цен
+        logging.warning("instruments-info недоступен — берём символы из tickers")
+        snap = get_bybit_prices_rest(set())   # пустой фильтр = все символы
+        symbols = set(snap.keys())
+
+    if not symbols:
+        logging.critical("Не удалось загрузить символы ни одним способом. Выход.")
         return
+
+    logging.info("Запуск с %d символами", len(symbols))
 
     # 2. Запускаем WebSocket-клиент в фоновых потоках
     ws_client = BybitTickerWS(symbols)
     ws_client.start()
     logging.info("WebSocket-клиент запущен")
 
-    # 3. Небольшая пауза — даём WS прислать первые данные
-    await asyncio.sleep(3)
+    # 3. Пауза — даём WS прислать первые данные
+    await asyncio.sleep(5)
 
     # 4. Запускаем monitor как отдельную task (watchdog может перезапустить)
     monitor_task = asyncio.create_task(monitor(symbols, ws_client))
