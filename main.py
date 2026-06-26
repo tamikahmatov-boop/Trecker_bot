@@ -149,35 +149,19 @@ class CryptoBot:
                 await asyncio.sleep(5)
     
     async def send_signal(self, signal):
-        symbol = signal["symbol"]
-        growth = signal["growth"]
-        emoji = "🚀" if growth > 0 else "📉"
-        action = "Рост" if growth > 0 else "Падение"
-        
-        text = (
-            f"{emoji} <b>СИГНАЛ</b>\n\n"
-            f"Монета: <b>{symbol}</b>\n"
-            f"Цена: <b>{signal['price']:.4f}</b> ({signal['source']})\n"
-            f"{action}: <b>{growth:+.2f}%</b>"
+        """Отправка сигнала с инлайн кнопками"""
+        await self.telegram.send_signal_with_buttons(
+            chat_id=config.CHAT_ID,
+            symbol=signal["symbol"],
+            price=signal["price"],
+            growth=signal["growth"],
+            source=signal["source"],
+            rsi=signal.get("rsi")
         )
-        if signal.get("rsi") is not None:
-            text += f"\n📊 RSI: <b>{signal['rsi']:.2f}</b>"
-        
-        text += "\n\n⬇️ Нажмите кнопку ниже:"
-        
-        inline_keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "🔕 Игнорировать", "callback_data": f"ignore_{symbol}"},
-                    {"text": "ℹ️ Инфо", "callback_data": f"info_{symbol}"}
-                ]
-            ]
-        }
-        
-        await self.telegram.send_message(text, reply_markup=inline_keyboard)
-        logger.info(f"📨 Сигнал: {symbol} {growth:+.2f}%")
+        logger.info(f"📨 Сигнал: {signal['symbol']} {signal['growth']:+.2f}%")
     
     async def telegram_loop(self):
+        """Цикл обработки команд Telegram"""
         while self.running:
             try:
                 updates = await self.telegram.get_updates()
@@ -187,7 +171,7 @@ class CryptoBot:
                         await self.handle_message(update["message"])
                     elif "callback_query" in update:
                         callback = update["callback_query"]
-                        logger.info(f"🔘 Получен callback: {callback.get('data')}")
+                        logger.info(f"🔘 Обработка callback: {callback.get('data')}")
                         await self.handle_callback(callback)
                 
                 await asyncio.sleep(0.5)
@@ -206,6 +190,7 @@ class CryptoBot:
                 await asyncio.sleep(5)
     
     async def handle_callback(self, callback):
+        """Обработка инлайн кнопок"""
         callback_id = callback["id"]
         data = callback.get("data", "")
         message = callback.get("message", {})
@@ -214,39 +199,48 @@ class CryptoBot:
         
         logger.info(f"🔘 Обработка callback: data={data}, chat_id={chat_id}")
         
+        # Проверка авторизации
         if chat_id != config.CHAT_ID:
             await self.telegram.answer_callback(callback_id, "⛔ Доступ запрещен", True)
             return
         
+        # Обработка игнорирования монеты
         if data.startswith("ignore_"):
             symbol = data.replace("ignore_", "")
             self.ignored_symbols.add(symbol)
             
+            # ✅ ОТВЕЧАЕМ НА CALLBACK (ОБЯЗАТЕЛЬНО!)
             await self.telegram.answer_callback(
                 callback_id, 
                 f"🔕 {symbol} добавлен в игнор-лист",
                 False
             )
             
+            # Отправляем подтверждение
             await self.telegram.send_message(
-                f"🔕 <b>{symbol}</b> добавлен в игнор-лист\nСигналы по этой монете больше не будут приходить",
+                f"🔕 <b>{symbol}</b> добавлен в игнор-лист\n"
+                f"Сигналы по этой монете больше не будут приходить",
                 chat_id
             )
             
+            # ✅ Убираем кнопки из сообщения
             await self.telegram.edit_message_reply_markup(chat_id, message_id, None)
             
             logger.info(f"✅ Игнорируем: {symbol}")
             return
         
+        # Обработка информации о монете
         if data.startswith("info_"):
             symbol = data.replace("info_", "")
             
+            # ✅ ОТВЕЧАЕМ НА CALLBACK
             await self.telegram.answer_callback(
                 callback_id, 
                 f"ℹ️ Информация о {symbol}",
                 False
             )
             
+            # Показываем информацию
             if symbol in self.analyzer.price_history:
                 history = list(self.analyzer.price_history[symbol])
                 if history:
@@ -263,13 +257,27 @@ class CryptoBot:
                         f"В истории: <b>{len(history)}</b> записей",
                         chat_id
                     )
+                else:
+                    await self.telegram.send_message(
+                        f"ℹ️ Нет данных по {symbol}",
+                        chat_id
+                    )
             else:
-                await self.telegram.send_message(f"ℹ️ Нет данных по {symbol}", chat_id)
+                await self.telegram.send_message(
+                    f"ℹ️ Нет данных по {symbol}",
+                    chat_id
+                )
             return
         
-        await self.telegram.answer_callback(callback_id, "❌ Неизвестная команда", True)
+        # Если неизвестный callback
+        await self.telegram.answer_callback(
+            callback_id,
+            "❌ Неизвестная команда",
+            True
+        )
     
     async def handle_message(self, msg):
+        """Обработка текстовых сообщений"""
         chat_id = msg["chat"]["id"]
         
         if chat_id != config.CHAT_ID:
