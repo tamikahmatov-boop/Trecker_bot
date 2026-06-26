@@ -9,7 +9,7 @@ from price_fetcher import PriceFetcher
 from analyzer import Analyzer
 
 logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL),
+    level=logging.DEBUG,  # Включаем DEBUG для отладки
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -26,7 +26,9 @@ class CryptoBot:
         self.running = False
         self.checks = 0
         self.symbols = set()
-        self.ignored_symbols = set()  # Для игнорируемых монет
+        self.ignored_symbols = set()
+        self.telegram = None
+        self.fetcher = None
         
         try:
             config.validate()
@@ -43,9 +45,8 @@ class CryptoBot:
         async with self.telegram, self.fetcher:
             await self.telegram.send_main_menu(config.CHAT_ID)
             
-            # Отправка сообщения о запуске
             await self.telegram.send_message(
-                f"✅ <b>Бот запущен на Railway!</b>\n\n"
+                f"✅ <b>Бот запущен!</b>\n\n"
                 f"📈 Порог: <b>{self.percent}%</b>\n"
                 f"⏱ Период: <b>{self.window // 60} мин</b>\n"
                 f"⚡ Интервал: <b>{self.interval} сек</b>\n\n"
@@ -55,7 +56,6 @@ class CryptoBot:
             self.running = True
             self.state.state.start_time = time.time()
             
-            # Запуск задач
             tasks = [
                 self.monitor_loop(),
                 self.telegram_loop(),
@@ -81,7 +81,6 @@ class CryptoBot:
                 self.checks += 1
                 now = time.time()
                 
-                # Обновление списка символов раз в 30 минут
                 if not self.symbols or self.checks % 360 == 0:
                     self.symbols = await self.fetcher.get_symbols()
                     logger.info(f"Символов: {len(self.symbols)}")
@@ -92,9 +91,7 @@ class CryptoBot:
                     await asyncio.sleep(self.interval)
                     continue
                 
-                # Анализ каждого символа
                 for symbol, price in prices.items():
-                    # Пропускаем игнорируемые монеты
                     if symbol in self.ignored_symbols:
                         continue
                     
@@ -134,11 +131,13 @@ class CryptoBot:
         else:
             text += "\n📊 RSI: ожидание данных"
         
-        # Добавляем инлайн кнопки под сообщением
+        text += "\n\n🔄 Нажмите кнопку ниже чтобы игнорировать монету"
+        
         inline_keyboard = {
             "inline_keyboard": [
                 [
-                    {"text": "🔕 Игнорировать", "callback_data": f"ignore_{symbol}"}
+                    {"text": "🔕 Игнорировать", "callback_data": f"ignore_{symbol}"},
+                    {"text": "ℹ️ Инфо", "callback_data": f"info_{symbol}"}
                 ]
             ]
         }
@@ -154,6 +153,7 @@ class CryptoBot:
                     if "message" in update:
                         await self.handle_message(update["message"])
                     elif "callback_query" in update:
+                        logger.info(f"Получен callback: {update['callback_query'].get('data')}")
                         await self.handle_callback(update["callback_query"])
                 await asyncio.sleep(0.2)
             except Exception as e:
@@ -161,27 +161,54 @@ class CryptoBot:
                 await asyncio.sleep(1)
     
     async def handle_callback(self, callback):
-        """Обработка инлайн кнопок"""
         callback_id = callback["id"]
-        data = callback["data"]
-        chat_id = callback["message"]["chat"]["id"]
-        message_id = callback["message"]["message_id"]
+        data = callback.get("data", "")
+        message = callback.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        message_id = message.get("message_id")
+        
+        logger.info(f"Callback: {data} от {chat_id}")
         
         if chat_id != config.CHAT_ID:
+            await self.telegram.answer_callback(callback_id, "⛔ Доступ запрещен", True)
             return
         
         if data.startswith("ignore_"):
             symbol = data.replace("ignore_", "")
             self.ignored_symbols.add(symbol)
-            await self.telegram.answer_callback(callback_id, f"🔕 {symbol} игнорируется")
             
-            # Редактируем сообщение
+            await self.telegram.answer_callback(
+                callback_id, 
+                f"🔕 {symbol} добавлен в игнор-лист",
+                False
+            )
+            
             await self.telegram.send_message(
                 f"🔕 <b>{symbol}</b> добавлен в игнор-лист\n"
                 f"Сигналы по этой монете больше не будут приходить",
                 chat_id
             )
+            
+            # Удаляем кнопки
+            await self.telegram.edit_message_reply_markup(chat_id, message_id, None)
             logger.info(f"Игнорируем: {symbol}")
+        
+        elif data.startswith("info_"):
+            symbol = data.replace("info_", "")
+            await self.telegram.answer_callback(callback_id, f"ℹ️ Информация о {symbol}", False)
+            
+            if symbol in self.analyzer.price_history:
+                prices = [p for _, p in self.analyzer.price_history[symbol][-10:]]
+                if prices:
+                    avg_price = sum(prices) / len(prices)
+                    last_price = prices[-1]
+                    await self.telegram.send_message(
+                        f"ℹ️ <b>Информация о {symbol}</b>\n\n"
+                        f"Последняя цена: {last_price:.4f}\n"
+                        f"Средняя (10): {avg_price:.4f}\n"
+                        f"Изменение: {((last_price - avg_price) / avg_price * 100):+.2f}%",
+                        chat_id
+                    )
     
     async def handle_message(self, msg):
         chat_id = msg["chat"]["id"]
@@ -192,23 +219,20 @@ class CryptoBot:
             return
         
         text = msg.get("text", "")
+        logger.info(f"Получено сообщение: {text}")
         
-        # Главное меню
         if text == "/start":
             await self.telegram.send_main_menu(chat_id)
         
         elif text == "🏠 Главное меню" or text == "🔙 Назад":
             await self.telegram.send_main_menu(chat_id)
         
-        # Меню порога
         elif text == "📈 Настройки порога":
             await self.telegram.send_percent_menu(chat_id)
         
-        # Меню периода
         elif text == "⏱ Настройки периода":
             await self.telegram.send_window_menu(chat_id)
         
-        # Настройка порога
         elif text.startswith("📈 ") and text != "📈 Настройки порога":
             try:
                 percent_str = text.replace("📈 ", "").replace("%", "")
@@ -232,7 +256,6 @@ class CryptoBot:
             except Exception as e:
                 await self.telegram.send_message(f"❌ Ошибка: {e}", chat_id)
         
-        # Настройка периода
         elif text.startswith("⏱ ") and text != "⏱ Настройки периода":
             try:
                 time_str = text.replace("⏱ ", "")
@@ -262,7 +285,6 @@ class CryptoBot:
             except Exception as e:
                 await self.telegram.send_message(f"❌ Ошибка: {e}", chat_id)
         
-        # Статистика
         elif text == "📊 Статистика":
             uptime = int(time.time() - self.state.state.start_time)
             days = uptime // 86400
@@ -282,26 +304,23 @@ class CryptoBot:
                 chat_id
             )
         
-        # Список монет
         elif text == "📋 Список монет":
             if not self.symbols:
                 await self.telegram.send_message("🔄 Загрузка списка монет...", chat_id)
                 self.symbols = await self.fetcher.get_symbols()
             
-            # Показываем первые 50 монет
             symbols_list = sorted(list(self.symbols))[:50]
-            text = f"📋 <b>Список монет ({len(self.symbols)} всего)</b>\n\n"
-            text += "Первые 50 монет:\n"
+            text_msg = f"📋 <b>Список монет ({len(self.symbols)} всего)</b>\n\n"
+            text_msg += "Первые 50 монет:\n"
             for i, sym in enumerate(symbols_list, 1):
                 ignored = "🔕" if sym in self.ignored_symbols else "✅"
-                text += f"{i}. {ignored} {sym}\n"
+                text_msg += f"{i}. {ignored} {sym}\n"
             
             if len(self.symbols) > 50:
-                text += f"\n... и еще {len(self.symbols) - 50} монет"
+                text_msg += f"\n... и еще {len(self.symbols) - 50} монет"
             
-            await self.telegram.send_message(text, chat_id)
+            await self.telegram.send_message(text_msg, chat_id)
         
-        # Обновить список
         elif text == "🔄 Обновить список":
             await self.telegram.send_message("🔄 Обновление списка монет...", chat_id)
             self.symbols = await self.fetcher.get_symbols()
@@ -310,7 +329,6 @@ class CryptoBot:
                 chat_id
             )
         
-        # Очистить историю
         elif text == "❌ Очистить историю":
             self.analyzer.price_history.clear()
             self.state.state.last_alert.clear()
@@ -320,7 +338,6 @@ class CryptoBot:
             )
             logger.info("История очищена")
         
-        # Статус
         elif text == "/status":
             await self.telegram.send_message(
                 f"📊 <b>Текущие настройки</b>\n\n"
@@ -345,10 +362,8 @@ class CryptoBot:
                 "Сигналы приходят при достижении выбранного процента изменения цены"
             )
         
-        # Обработка пользовательского порога
         else:
             try:
-                # Проверяем, не ввел ли пользователь число
                 percent = float(text.replace("%", "").strip())
                 if 0 < percent <= 1000:
                     self.percent = percent
