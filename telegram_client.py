@@ -1,8 +1,8 @@
 import logging
+import asyncio
 from typing import Optional, Dict, List, Any
 import aiohttp
 import json
-import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +14,7 @@ class TelegramClient:
         self.offset = 0
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_request_time = 0
-        self.min_interval = 0.5  # Минимальный интервал между запросами
+        self.min_interval = 0.3
     
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -25,7 +25,6 @@ class TelegramClient:
             await self.session.close()
     
     async def _rate_limit(self):
-        """Ограничение частоты запросов"""
         now = asyncio.get_event_loop().time()
         elapsed = now - self.last_request_time
         if elapsed < self.min_interval:
@@ -34,7 +33,6 @@ class TelegramClient:
     
     async def send_message(self, text: str, chat_id: Optional[int] = None, 
                           reply_markup: Optional[Dict] = None) -> bool:
-        """Отправка сообщения с поддержкой клавиатур"""
         if chat_id is None:
             chat_id = self.chat_id
         
@@ -58,9 +56,6 @@ class TelegramClient:
                 if response.status == 200:
                     logger.debug(f"Сообщение отправлено в {chat_id}")
                     return True
-                elif response.status == 409:
-                    logger.warning("Conflict 409 - возможно, запущен другой экземпляр бота")
-                    return False
                 else:
                     error_text = await response.text()
                     logger.error(f"Ошибка sendMessage: {response.status} - {error_text}")
@@ -82,8 +77,7 @@ class TelegramClient:
             "one_time_keyboard": False
         }
         await self.send_message(
-            "🏠 <b>Главное меню</b>\n\n"
-            "Выберите действие:",
+            "🏠 <b>Главное меню</b>\n\nВыберите действие:",
             chat_id,
             keyboard
         )
@@ -101,8 +95,7 @@ class TelegramClient:
             "one_time_keyboard": False
         }
         await self.send_message(
-            "📈 <b>Выберите порог изменения цены</b>\n\n"
-            "Сигнал будет отправлен при достижении выбранного процента:",
+            "📈 <b>Выберите порог изменения цены</b>\n\nСигнал будет отправлен при достижении выбранного процента:",
             chat_id,
             keyboard
         )
@@ -120,11 +113,39 @@ class TelegramClient:
             "one_time_keyboard": False
         }
         await self.send_message(
-            "⏱ <b>Выберите период анализа</b>\n\n"
-            "Бот будет анализировать изменение цены за выбранный период:",
+            "⏱ <b>Выберите период анализа</b>\n\nБот будет анализировать изменение цены за выбранный период:",
             chat_id,
             keyboard
         )
+    
+    async def send_signal_with_buttons(self, chat_id: int, symbol: str, price: float, 
+                                       growth: float, source: str, rsi: Optional[float] = None):
+        """Отправка сигнала с инлайн кнопками"""
+        emoji = "🚀" if growth > 0 else "📉"
+        action = "Рост" if growth > 0 else "Падение"
+        
+        text = (
+            f"{emoji} <b>СИГНАЛ</b>\n\n"
+            f"Монета: <b>{symbol}</b>\n"
+            f"Цена: <b>{price:.4f}</b> ({source})\n"
+            f"{action}: <b>{growth:+.2f}%</b>"
+        )
+        if rsi is not None:
+            text += f"\n📊 RSI: <b>{rsi:.2f}</b>"
+        
+        text += "\n\n⬇️ Нажмите кнопку ниже:"
+        
+        # Инлайн кнопки (не обычные)
+        inline_keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔕 Игнорировать", "callback_data": f"ignore_{symbol}"},
+                    {"text": "ℹ️ Инфо", "callback_data": f"info_{symbol}"}
+                ]
+            ]
+        }
+        
+        await self.send_message(text, chat_id, inline_keyboard)
     
     async def get_updates(self) -> List[Dict[str, Any]]:
         """Получение обновлений от Telegram"""
@@ -146,13 +167,17 @@ class TelegramClient:
                         updates = data.get("result", [])
                         if updates:
                             self.offset = updates[-1]["update_id"] + 1
-                            logger.debug(f"Получено {len(updates)} обновлений")
+                            logger.info(f"📥 Получено {len(updates)} обновлений")
+                            # Логируем типы обновлений
+                            for update in updates:
+                                if "callback_query" in update:
+                                    logger.info(f"🔘 Callback: {update['callback_query'].get('data')}")
                         return updates
                     else:
                         logger.error(f"Telegram API error: {data}")
                         return []
                 elif response.status == 409:
-                    logger.warning("Conflict 409 в get_updates - возможно, дублирующийся бот")
+                    logger.warning("Conflict 409 - возможно дублирующийся бот")
                     await asyncio.sleep(5)
                     return []
                 else:
@@ -166,7 +191,7 @@ class TelegramClient:
             return []
     
     async def answer_callback(self, callback_id: str, text: str, show_alert: bool = False) -> bool:
-        """Ответ на callback запрос"""
+        """Ответ на callback запрос - ОБЯЗАТЕЛЬНО для инлайн кнопок!"""
         await self._rate_limit()
         
         try:
@@ -182,17 +207,14 @@ class TelegramClient:
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status == 200:
-                    logger.debug(f"Callback ответ отправлен: {text}")
+                    logger.info(f"✅ Callback ответ отправлен: {text}")
                     return True
-                elif response.status == 409:
-                    logger.warning("Conflict 409 в answer_callback")
-                    return False
                 else:
                     error_text = await response.text()
-                    logger.error(f"Ошибка answerCallbackQuery: {response.status} - {error_text}")
+                    logger.error(f"❌ Ошибка answerCallbackQuery: {response.status} - {error_text}")
                     return False
         except Exception as e:
-            logger.error(f"Ошибка answer_callback: {e}")
+            logger.error(f"❌ Ошибка answer_callback: {e}")
             return False
     
     async def edit_message_reply_markup(self, chat_id: int, message_id: int, 
@@ -217,9 +239,6 @@ class TelegramClient:
                 if response.status == 200:
                     logger.debug(f"Кнопки обновлены в сообщении {message_id}")
                     return True
-                elif response.status == 409:
-                    logger.warning("Conflict 409 в edit_message_reply_markup")
-                    return False
                 else:
                     error_text = await response.text()
                     logger.error(f"Ошибка editMessageReplyMarkup: {response.status} - {error_text}")
