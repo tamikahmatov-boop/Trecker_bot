@@ -2,6 +2,7 @@ import logging
 from typing import Optional, Dict, List, Any
 import aiohttp
 import json
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,8 @@ class TelegramClient:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.offset = 0
         self.session: Optional[aiohttp.ClientSession] = None
+        self.last_request_time = 0
+        self.min_interval = 0.5  # Минимальный интервал между запросами
     
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -21,11 +24,21 @@ class TelegramClient:
         if self.session:
             await self.session.close()
     
+    async def _rate_limit(self):
+        """Ограничение частоты запросов"""
+        now = asyncio.get_event_loop().time()
+        elapsed = now - self.last_request_time
+        if elapsed < self.min_interval:
+            await asyncio.sleep(self.min_interval - elapsed)
+        self.last_request_time = asyncio.get_event_loop().time()
+    
     async def send_message(self, text: str, chat_id: Optional[int] = None, 
                           reply_markup: Optional[Dict] = None) -> bool:
         """Отправка сообщения с поддержкой клавиатур"""
         if chat_id is None:
             chat_id = self.chat_id
+        
+        await self._rate_limit()
         
         payload = {
             "chat_id": chat_id,
@@ -45,6 +58,9 @@ class TelegramClient:
                 if response.status == 200:
                     logger.debug(f"Сообщение отправлено в {chat_id}")
                     return True
+                elif response.status == 409:
+                    logger.warning("Conflict 409 - возможно, запущен другой экземпляр бота")
+                    return False
                 else:
                     error_text = await response.text()
                     logger.error(f"Ошибка sendMessage: {response.status} - {error_text}")
@@ -112,6 +128,8 @@ class TelegramClient:
     
     async def get_updates(self) -> List[Dict[str, Any]]:
         """Получение обновлений от Telegram"""
+        await self._rate_limit()
+        
         try:
             async with self.session.get(
                 f"{self.base_url}/getUpdates",
@@ -133,6 +151,10 @@ class TelegramClient:
                     else:
                         logger.error(f"Telegram API error: {data}")
                         return []
+                elif response.status == 409:
+                    logger.warning("Conflict 409 в get_updates - возможно, дублирующийся бот")
+                    await asyncio.sleep(5)
+                    return []
                 else:
                     logger.error(f"HTTP error: {response.status}")
                     return []
@@ -144,7 +166,9 @@ class TelegramClient:
             return []
     
     async def answer_callback(self, callback_id: str, text: str, show_alert: bool = False) -> bool:
-        """Ответ на callback запрос (обязательно для инлайн кнопок)"""
+        """Ответ на callback запрос"""
+        await self._rate_limit()
+        
         try:
             payload = {
                 "callback_query_id": callback_id,
@@ -160,6 +184,9 @@ class TelegramClient:
                 if response.status == 200:
                     logger.debug(f"Callback ответ отправлен: {text}")
                     return True
+                elif response.status == 409:
+                    logger.warning("Conflict 409 в answer_callback")
+                    return False
                 else:
                     error_text = await response.text()
                     logger.error(f"Ошибка answerCallbackQuery: {response.status} - {error_text}")
@@ -171,6 +198,8 @@ class TelegramClient:
     async def edit_message_reply_markup(self, chat_id: int, message_id: int, 
                                        reply_markup: Optional[Dict] = None) -> bool:
         """Редактирование кнопок в сообщении"""
+        await self._rate_limit()
+        
         try:
             payload = {
                 "chat_id": chat_id,
@@ -188,52 +217,13 @@ class TelegramClient:
                 if response.status == 200:
                     logger.debug(f"Кнопки обновлены в сообщении {message_id}")
                     return True
+                elif response.status == 409:
+                    logger.warning("Conflict 409 в edit_message_reply_markup")
+                    return False
                 else:
                     error_text = await response.text()
                     logger.error(f"Ошибка editMessageReplyMarkup: {response.status} - {error_text}")
                     return False
         except Exception as e:
             logger.error(f"Ошибка edit_message_reply_markup: {e}")
-            return False
-    
-    async def delete_message(self, chat_id: int, message_id: int) -> bool:
-        """Удаление сообщения"""
-        try:
-            payload = {
-                "chat_id": chat_id,
-                "message_id": message_id
-            }
-            
-            async with self.session.post(
-                f"{self.base_url}/deleteMessage",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
-                if response.status == 200:
-                    logger.debug(f"Сообщение {message_id} удалено")
-                    return True
-                else:
-                    error_text = await response.text()
-                    logger.error(f"Ошибка deleteMessage: {response.status} - {error_text}")
-                    return False
-        except Exception as e:
-            logger.error(f"Ошибка delete_message: {e}")
-            return False
-    
-    async def send_chat_action(self, chat_id: int, action: str = "typing") -> bool:
-        """Отправка статуса 'печатает' и т.д."""
-        try:
-            payload = {
-                "chat_id": chat_id,
-                "action": action
-            }
-            
-            async with self.session.post(
-                f"{self.base_url}/sendChatAction",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as response:
-                return response.status == 200
-        except Exception as e:
-            logger.error(f"Ошибка send_chat_action: {e}")
             return False
