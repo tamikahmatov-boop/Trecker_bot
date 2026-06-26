@@ -49,7 +49,9 @@ class Analyzer:
         if abs(growth) < percent:
             return None
         
-        prices = [p for t, p in self.price_history[symbol][-100:]]
+        # 🔥 ИСПРАВЛЕНО: конвертируем deque в список для среза
+        history_list = list(self.price_history[symbol])
+        prices = [p for t, p in history_list[-100:]]
         rsi = self.calculate_rsi(prices)
         
         return {
