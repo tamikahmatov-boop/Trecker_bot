@@ -371,13 +371,21 @@ _session: aiohttp.ClientSession | None = None
 
 _alert_cooldown:    dict[str, float] = {}
 _reversal_cooldown: dict[str, float] = {}
-ALERT_COOLDOWN_SEC:    int = getattr(config, "ALERT_COOLDOWN_SEC", 60)
-REVERSAL_COOLDOWN_SEC: int = getattr(config, "REVERSAL_COOLDOWN_SEC", 300)  # 5 мин
+ALERT_COOLDOWN_SEC:    int   = getattr(config, "ALERT_COOLDOWN_SEC",    60)
+REVERSAL_COOLDOWN_SEC: int   = getattr(config, "REVERSAL_COOLDOWN_SEC", 300)
 
 _levels_cache: dict[str, dict] = {}
 
-# Минимальный скоринг для отправки разворотного сигнала (из 8 возможных факторов)
-REVERSAL_MIN_SCORE: int = getattr(config, "REVERSAL_MIN_SCORE", 3)
+# ── Настройки детектора разворота (изменяются через Telegram) ────────────
+REVERSAL_MIN_SCORE:   int   = getattr(config, "REVERSAL_MIN_SCORE",   3)
+REVERSAL_RSI_OB:      float = getattr(config, "REVERSAL_RSI_OB",      70.0)
+REVERSAL_STOCH_OB:    float = getattr(config, "REVERSAL_STOCH_OB",    0.80)
+REVERSAL_STOCH_EXT:   float = getattr(config, "REVERSAL_STOCH_EXT",   0.85)
+REVERSAL_BB_OB:       float = getattr(config, "REVERSAL_BB_OB",       1.0)
+REVERSAL_MACD_SLOPE:  float = getattr(config, "REVERSAL_MACD_SLOPE",  -0.000005)
+REVERSAL_ACCEL:       float = getattr(config, "REVERSAL_ACCEL",       0.5)
+REVERSAL_HIGH_MARGIN: float = getattr(config, "REVERSAL_HIGH_MARGIN", 0.998)
+REVERSAL_MOMENTUM:    float = getattr(config, "REVERSAL_MOMENTUM",    -0.5)
 
 
 def _cache_load_levels():
@@ -741,26 +749,26 @@ def detect_short_reversal(
 
     # ── 1. RSI перекупленность ────────────────────────────────────────────────
     stoch_rsi_val = None
-    if rsi is not None and rsi > 70:
+    if rsi is not None and rsi > REVERSAL_RSI_OB:
         score += 1
-        factors.append(f"RSI перекуплен ({rsi:.1f} > 70)")
+        factors.append(f"RSI перекуплен ({rsi:.1f} > {REVERSAL_RSI_OB})")
 
         # ── 2. Стохастик RSI ──────────────────────────────────────────────────
         stoch_rsi_val = calculate_stoch_rsi(prices)
-        if stoch_rsi_val is not None and stoch_rsi_val > 0.80:
+        if stoch_rsi_val is not None and stoch_rsi_val > REVERSAL_STOCH_OB:
             score += 1
-            factors.append(f"StochRSI в перекупленности ({stoch_rsi_val:.2f} > 0.80)")
+            factors.append(f"StochRSI в перекупленности ({stoch_rsi_val:.2f} > {REVERSAL_STOCH_OB})")
     elif rsi is not None:
         # Стохастик RSI считаем в любом случае
         stoch_rsi_val = calculate_stoch_rsi(prices)
-        if stoch_rsi_val is not None and stoch_rsi_val > 0.85:
+        if stoch_rsi_val is not None and stoch_rsi_val > REVERSAL_STOCH_EXT:
             # Экстремальная зона стохастика даже без RSI > 70
             score += 1
-            factors.append(f"StochRSI экстремум ({stoch_rsi_val:.2f} > 0.85)")
+            factors.append(f"StochRSI экстремум ({stoch_rsi_val:.2f} > {REVERSAL_STOCH_EXT})")
 
     # ── 3. Боллинджер %B > 1.0 (цена выше верхней полосы) ───────────────────
     bb_pct = calculate_bollinger_pct(prices)
-    if bb_pct is not None and bb_pct > 1.0:
+    if bb_pct is not None and bb_pct > REVERSAL_BB_OB:
         score += 1
         factors.append(f"Цена выше BB ({bb_pct:.2f}x верхней полосы)")
     elif bb_pct is not None and bb_pct > 0.95:
@@ -776,7 +784,7 @@ def detect_short_reversal(
     elif (macd_data["histogram"] is not None
           and macd_data["slope"] is not None
           and macd_data["histogram"] > 0
-          and macd_data["slope"] < -0.000005):
+          and macd_data["slope"] < REVERSAL_MACD_SLOPE):
         score += 1
         factors.append(f"MACD гистограмма убывает (slope={macd_data['slope']:+.6f})")
 
@@ -789,9 +797,9 @@ def detect_short_reversal(
 
     # ── 6. Замедление роста (accel) ───────────────────────────────────────────
     accel = calculate_acceleration(recent)
-    if accel is not None and growth >= current_percent and accel < 0.5:
+    if accel is not None and growth >= current_percent and accel < REVERSAL_ACCEL:
         score += 1
-        factors.append(f"Замедление импульса (accel={accel:.2f}x)")
+        factors.append(f"Замедление импульса (accel={accel:.2f}x < {REVERSAL_ACCEL})")
 
     # ── 7. Отбой от 24h High ─────────────────────────────────────────────────
     hist      = price_history.get(sym, [])
@@ -799,7 +807,7 @@ def detect_short_reversal(
     day_prices = [p for t, p in hist if now_ts - t <= 86400]
     if len(day_prices) >= 20:
         high24 = max(day_prices)
-        near_high = price >= high24 * 0.998  # в пределах 0.2% от хая
+        near_high = price >= high24 * REVERSAL_HIGH_MARGIN
         if near_high and len(recent) >= 4:
             last_ticks = [p for _, p in recent[-4:]]
             turning_down = all(last_ticks[i] >= last_ticks[i + 1] for i in range(len(last_ticks) - 1))
@@ -810,9 +818,9 @@ def detect_short_reversal(
 
     # ── 8. Моментум иссякает ─────────────────────────────────────────────────
     momentum = calculate_price_momentum(prices)
-    if momentum is not None and momentum < -0.5:
+    if momentum is not None and momentum < REVERSAL_MOMENTUM:
         score += 1
-        factors.append(f"Моментум иссякает (fast-slow={momentum:+.2f}%)")
+        factors.append(f"Моментум иссякает (fast-slow={momentum:+.2f}% < {REVERSAL_MOMENTUM})")
 
     # ── Дополнительный контекст иссякания объёма (не влияет на скор) ─────────
     vol_signal = calculate_volume_signal(sym)
@@ -874,12 +882,13 @@ async def broadcast(text: str, reply_markup=None):
 def reply_keyboard():
     return {
         "keyboard": [
-            ["📈 0.2%",    "📈 5%",       "📈 10%"          ],
-            ["📈 15%",     "📈 20%"                          ],
-            ["⏱ 5 мин",   "⏱ 1 час",    "⏱ 4 ч", "⏱ 1 д" ],
-            ["📊 Статус",  "📋 История",  "🏆 Топ-5"         ],
-            ["⏸ Пауза",   "▶️ Продолжить"                   ],
-            ["📤 Экспорт", "🗑 Кулдауны", "🔄 Развороты"     ],
+            ["📈 0.2%",    "📈 5%",       "📈 10%"            ],
+            ["📈 15%",     "📈 20%"                            ],
+            ["⏱ 5 мин",   "⏱ 1 час",    "⏱ 4 ч",  "⏱ 1 д" ],
+            ["📊 Статус",  "📋 История",  "🏆 Топ-5"           ],
+            ["⏸ Пауза",   "▶️ Продолжить"                     ],
+            ["🔄 Развороты", "⚙️ Разворот", "🗑 Кулдауны"     ],
+            ["📤 Экспорт"                                      ],
         ],
         "resize_keyboard": True,
         "persistent":       True,
@@ -1366,7 +1375,10 @@ async def monitor():
 # ================================================================
 
 async def handle_message(msg: dict):
-    global current_percent, current_window, monitor_paused, REVERSAL_MIN_SCORE
+    global current_percent, current_window, monitor_paused
+    global REVERSAL_MIN_SCORE, REVERSAL_RSI_OB, REVERSAL_STOCH_OB, REVERSAL_STOCH_EXT
+    global REVERSAL_BB_OB, REVERSAL_MACD_SLOPE, REVERSAL_ACCEL, REVERSAL_HIGH_MARGIN
+    global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -1479,6 +1491,99 @@ async def handle_message(msg: dict):
         return
 
     # ── Настройка порога разворота: /set_reversal_score 3 ────────────────────
+    # ── Меню настроек разворота ─────────────────────────────────────────────
+    if text in ("⚙️ Разворот", "/reversal_settings"):
+        await _cmd_reversal_settings(chat_id)
+        return
+
+    # ── /rev_score 3  — минимум факторов ─────────────────────────────────────
+    if text.startswith("/rev_score"):
+        try:
+            val = int(text.split()[1])
+            assert 1 <= val <= 8
+            REVERSAL_MIN_SCORE = val
+            await send_message(f"✅ Порог разворота: <b>{val}/8 факторов</b>", chat_id)
+        except Exception:
+            await send_message("❌ /rev_score 3  (1–8)", chat_id)
+        return
+
+    # ── /rev_rsi 70  — порог RSI перекупленности ─────────────────────────────
+    if text.startswith("/rev_rsi"):
+        try:
+            val = float(text.split()[1])
+            assert 50 <= val <= 90
+            REVERSAL_RSI_OB = val
+            await send_message(f"✅ RSI перекупленность: <b>> {val}</b>", chat_id)
+        except Exception:
+            await send_message("❌ /rev_rsi 70  (50–90)", chat_id)
+        return
+
+    # ── /rev_stoch 0.80  — порог StochRSI ───────────────────────────────────
+    if text.startswith("/rev_stoch"):
+        try:
+            val = float(text.split()[1])
+            assert 0.5 <= val <= 1.0
+            REVERSAL_STOCH_OB = val
+            await send_message(f"✅ StochRSI порог: <b>> {val}</b>", chat_id)
+        except Exception:
+            await send_message("❌ /rev_stoch 0.80  (0.5–1.0)", chat_id)
+        return
+
+    # ── /rev_bb 1.0  — порог Боллинджер %B ──────────────────────────────────
+    if text.startswith("/rev_bb"):
+        try:
+            val = float(text.split()[1])
+            assert 0.8 <= val <= 1.5
+            REVERSAL_BB_OB = val
+            await send_message(f"✅ Боллинджер %B порог: <b>> {val}</b>", chat_id)
+        except Exception:
+            await send_message("❌ /rev_bb 1.0  (0.8–1.5)", chat_id)
+        return
+
+    # ── /rev_accel 0.5  — порог замедления ──────────────────────────────────
+    if text.startswith("/rev_accel"):
+        try:
+            val = float(text.split()[1])
+            assert 0.1 <= val <= 1.0
+            REVERSAL_ACCEL = val
+            await send_message(f"✅ Порог замедления accel: <b>< {val}</b>", chat_id)
+        except Exception:
+            await send_message("❌ /rev_accel 0.5  (0.1–1.0)", chat_id)
+        return
+
+    # ── /rev_momentum -0.5  — порог моментума ────────────────────────────────
+    if text.startswith("/rev_momentum"):
+        try:
+            val = float(text.split()[1])
+            assert -5.0 <= val <= 0
+            REVERSAL_MOMENTUM = val
+            await send_message(f"✅ Порог моментума: <b>< {val}%</b>", chat_id)
+        except Exception:
+            await send_message("❌ /rev_momentum -0.5  (от -5.0 до 0)", chat_id)
+        return
+
+    # ── /rev_cooldown 5  — кулдаун разворота в минутах ───────────────────────
+    if text.startswith("/rev_cooldown"):
+        try:
+            val = int(text.split()[1])
+            assert 1 <= val <= 1440
+            REVERSAL_COOLDOWN_SEC = val * 60
+            await send_message(f"✅ Кулдаун разворота: <b>{val} мин</b>", chat_id)
+        except Exception:
+            await send_message("❌ /rev_cooldown 5  (1–1440 мин)", chat_id)
+        return
+
+    # ── /rev_high 0.2  — отступ от 24h High в % ──────────────────────────────
+    if text.startswith("/rev_high"):
+        try:
+            val = float(text.split()[1])
+            assert 0.0 <= val <= 5.0
+            REVERSAL_HIGH_MARGIN = 1.0 - val / 100
+            await send_message(f"✅ Зона отбоя от 24h High: <b>{val}%</b>", chat_id)
+        except Exception:
+            await send_message("❌ /rev_high 0.2  (отступ от хая в %, 0–5)", chat_id)
+        return
+
     if text.startswith("/set_reversal_score"):
         try:
             val = int(text.split()[1])
@@ -1572,6 +1677,35 @@ async def _cmd_top5(chat_id):
         sign = "🚀" if r["growth"] > 0 else "📉"
         lines.append(f"{i}. {sign} <b>{r['symbol']}</b> {r['growth']:+.2f}% [{r['source']}] {ts}")
     await send_message("\n".join(lines), chat_id)
+
+
+async def _cmd_reversal_settings(chat_id):
+    """Показывает текущие настройки детектора разворота и справку по командам."""
+    high_pct = round((1.0 - REVERSAL_HIGH_MARGIN) * 100, 2)
+    await send_message(
+        f"⚙️ <b>Настройки детектора разворота на шорт</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>Скоринг:</b>\n"
+        f"  Минимум факторов:  <code>{REVERSAL_MIN_SCORE}/8</code>  → /rev_score 3\n\n"
+        f"<b>Пороги факторов:</b>\n"
+        f"  RSI перекупл.:    <code>> {REVERSAL_RSI_OB}</code>       → /rev_rsi 70\n"
+        f"  StochRSI:         <code>> {REVERSAL_STOCH_OB}</code>     → /rev_stoch 0.80\n"
+        f"  Боллинджер %%B:   <code>> {REVERSAL_BB_OB}</code>       → /rev_bb 1.0\n"
+        f"  Замедление accel: <code>< {REVERSAL_ACCEL}</code>       → /rev_accel 0.5\n"
+        f"  Моментум:         <code>< {REVERSAL_MOMENTUM}%%</code>  → /rev_momentum -0.5\n"
+        f"  Зона хая 24h:     <code>{high_pct}%%</code>             → /rev_high 0.2\n\n"
+        f"<b>Кулдаун:</b>\n"
+        f"  Между сигналами:  <code>{REVERSAL_COOLDOWN_SEC // 60} мин</code>  → /rev_cooldown 5\n\n"
+        f"<b>Пример — агрессивный режим (больше сигналов):</b>\n"
+        f"  /rev_score 2\n"
+        f"  /rev_rsi 65\n"
+        f"  /rev_cooldown 2\n\n"
+        f"<b>Пример — строгий режим (только чёткие сигналы):</b>\n"
+        f"  /rev_score 5\n"
+        f"  /rev_rsi 75\n"
+        f"  /rev_cooldown 15",
+        chat_id,
+    )
 
 
 async def _cmd_reversals(chat_id):
