@@ -5,3 +5,8 @@ ta>=0.10.0
 requests>=2.31.0
 lxml>=4.9.0
 websocket-client
+aiohttp
+ta
+pandas
+beautifulsoup4
+prometheus_client
