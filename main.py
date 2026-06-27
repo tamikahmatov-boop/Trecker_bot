@@ -279,6 +279,10 @@ def normalize_symbol(sym: str) -> str:
 #  INDICATORS
 # ================================================================
 
+# Минимум точек данных чтобы сигнал считался надёжным
+MIN_SAMPLES = 10
+
+
 def calculate_rsi(prices: list[float], window: int = 5) -> Optional[float]:
     try:
         if len(prices) < window + 1:
@@ -291,8 +295,27 @@ def calculate_rsi(prices: list[float], window: int = 5) -> Optional[float]:
         return None
 
 
+def calculate_rsi_trend(prices: list[float], window: int = 5) -> Optional[str]:
+    """Направление RSI: растёт ▲ / падает ▼ / боковик —"""
+    try:
+        if len(prices) < window + 3:
+            return None
+        s    = pd.Series(prices)
+        rsi  = RSIIndicator(close=s, window=window).rsi().dropna()
+        if len(rsi) < 3:
+            return None
+        delta = rsi.iloc[-1] - rsi.iloc[-3]
+        if delta > 1:
+            return "▲"
+        if delta < -1:
+            return "▼"
+        return "—"
+    except Exception:
+        return None
+
+
 def calculate_macd(prices: list[float]) -> Optional[float]:
-    """Возвращает MACD-гистограмму последней свечи."""
+    """MACD-гистограмма последней точки."""
     try:
         if len(prices) < 26:
             return None
@@ -302,6 +325,69 @@ def calculate_macd(prices: list[float]) -> Optional[float]:
     except Exception as e:
         log.error("MACD error: %s", e)
         return None
+
+
+def calculate_acceleration(recent: list[tuple[float, float]]) -> Optional[float]:
+    """
+    Ускорение цены: сравниваем скорость роста первой и второй половины окна.
+    Возвращает множитель (>1 = ускорение, <1 = замедление).
+    """
+    try:
+        if len(recent) < 6:
+            return None
+        mid  = len(recent) // 2
+        half1 = recent[:mid]
+        half2 = recent[mid:]
+        speed1 = (half1[-1][1] - half1[0][1]) / half1[0][1] * 100 / max(half1[-1][0] - half1[0][0], 1)
+        speed2 = (half2[-1][1] - half2[0][1]) / half2[0][1] * 100 / max(half2[-1][0] - half2[0][0], 1)
+        if speed1 == 0:
+            return None
+        return round(speed2 / abs(speed1), 2)
+    except Exception:
+        return None
+
+
+def calculate_growth_duration(recent: list[tuple[float, float]]) -> int:
+    """Сколько секунд занял рост/падение (от первой до последней точки окна)."""
+    if len(recent) < 2:
+        return 0
+    return int(recent[-1][0] - recent[0][0])
+
+
+def check_24h_breakout(sym: str, price: float) -> Optional[str]:
+    """
+    Проверяет пробой 24h High или Low.
+    Возвращает строку с описанием или None.
+    """
+    hist = price_history.get(sym, [])
+    now  = time.time()
+    day_prices = [p for t, p in hist if now - t <= 86400]
+    if len(day_prices) < 20:
+        return None
+    high24 = max(day_prices[:-1])
+    low24  = min(day_prices[:-1])
+    if price > high24:
+        return f"🔺 пробой хая 24h ({high24:.4g})"
+    if price < low24:
+        return f"🔻 пробой лоя 24h ({low24:.4g})"
+    return None
+
+
+def get_24h_context(sym: str, price: float) -> Optional[str]:
+    """
+    Расстояние до 24h High/Low в процентах — показывает где цена в диапазоне дня.
+    Например: 'хай 24h: -3.2% | лой 24h: +18.4%'
+    """
+    hist = price_history.get(sym, [])
+    now  = time.time()
+    day_prices = [p for t, p in hist if now - t <= 86400]
+    if len(day_prices) < 20:
+        return None
+    high24 = max(day_prices)
+    low24  = min(day_prices)
+    dist_high = (price - high24) / high24 * 100
+    dist_low  = (price - low24)  / low24  * 100
+    return f"📉 от хая: {dist_high:+.1f}%  📈 от лоя: {dist_low:+.1f}%"
 
 
 # ================================================================
@@ -384,30 +470,64 @@ def alert_emoji(growth: float) -> str:
     return "🚀" if growth > 0 else "📉"
 
 
-def format_alert(sym: str, price: float, growth: float,
-                 rsi: Optional[float], macd: Optional[float],
-                 source: str) -> str:
+def format_alert(
+    sym: str, price: float, growth: float,
+    rsi: Optional[float], macd: Optional[float], source: str,
+    rsi_trend: Optional[str] = None,
+    accel: Optional[float] = None,
+    duration_sec: int = 0,
+    breakout: Optional[str] = None,
+    day_context: Optional[str] = None,
+) -> str:
     emoji  = alert_emoji(growth)
     label  = "Рост" if growth > 0 else "Падение"
     sign   = "+" if growth > 0 else ""
-    rsi_s  = f"{rsi:.1f}" if rsi is not None else "—"
-    macd_s = f"{macd:+.6f}" if macd is not None else "—"
 
-    # RSI-подсказка
+    # RSI
+    rsi_s = f"{rsi:.1f}" if rsi is not None else "—"
     rsi_hint = ""
     if rsi is not None:
         if rsi >= 70:
             rsi_hint = " ⚠️ перекуплен"
         elif rsi <= 30:
             rsi_hint = " ⚠️ перепродан"
+    rsi_trend_s = f" {rsi_trend}" if rsi_trend else ""
+
+    # MACD
+    macd_s = f"{macd:+.6f}" if macd is not None else "—"
+
+    # Ускорение
+    accel_s = ""
+    if accel is not None:
+        if accel >= 2.0:
+            accel_s = f"\n⚡ Ускорение: <b>×{accel:.1f}</b> 🔥"
+        elif accel >= 1.3:
+            accel_s = f"\n⚡ Ускорение: ×{accel:.1f}"
+        elif accel < 0.7:
+            accel_s = f"\n🐢 Замедление: ×{accel:.1f}"
+
+    # Длительность
+    if duration_sec >= 3600:
+        dur_s = f"{duration_sec // 3600}ч {(duration_sec % 3600) // 60}м"
+    elif duration_sec >= 60:
+        dur_s = f"{duration_sec // 60}м"
+    else:
+        dur_s = f"{duration_sec}с"
+
+    # Пробой
+    breakout_s   = f"\n{breakout}"    if breakout    else ""
+    day_context_s = f"\n{day_context}" if day_context else ""
 
     return (
         f"{emoji} <b>СИГНАЛ</b>\n\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
-        f"📈 {label}: <b>{sign}{growth:.2f}%</b>\n"
-        f"📊 RSI: <code>{rsi_s}</code>{rsi_hint}\n"
+        f"📈 {label}: <b>{sign}{growth:.2f}%</b> за {dur_s}\n"
+        f"📊 RSI: <code>{rsi_s}</code>{rsi_trend_s}{rsi_hint}\n"
         f"〽️ MACD: <code>{macd_s}</code>"
+        f"{accel_s}"
+        f"{breakout_s}"
+        f"{day_context_s}"
     )
 
 
@@ -578,7 +698,9 @@ async def monitor():
                 price_history[sym] = [(t, p) for t, p in hist if now - t <= cutoff]
 
                 recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
-                if len(recent) < 2:
+
+                # Минимум точек — фильтр шумовых пиков
+                if len(recent) < MIN_SAMPLES:
                     continue
 
                 old_price = recent[0][1]
@@ -589,33 +711,52 @@ async def monitor():
                 direction = 1 if growth > 0 else -1
 
                 if abs(growth) < current_percent:
-                    # Цена вернулась в нейтральную зону — сбрасываем уровень,
-                    # чтобы следующий выход за порог снова сработал
                     level = db_get_alert_level(sym)
                     if level and level["direction"] != direction:
                         db_clear_alert_level(sym)
                     continue
 
-                # ── Проверка: нужен ли новый алерт? ──────────────────────────
+                # ── Фильтр RSI по направлению ─────────────────────────────────
+                vals = [p for _, p in price_history[sym][-100:]]
+                rsi  = calculate_rsi(vals)
+                if rsi is not None:
+                    if direction == 1 and rsi < 50:
+                        # Рост, но RSI ниже 50 — сигнал против тренда, пропускаем
+                        log.debug("Skip %s: growth but RSI=%.1f < 50", sym, rsi)
+                        continue
+                    if direction == -1 and rsi > 50:
+                        # Падение, но RSI выше 50 — пропускаем
+                        log.debug("Skip %s: drop but RSI=%.1f > 50", sym, rsi)
+                        continue
+
+                # ── Проверка уровня (повторный алерт) ────────────────────────
                 level = db_get_alert_level(sym)
                 if level:
                     prev_price = level["alert_price"]
                     prev_dir   = level["direction"]
-
                     if prev_dir == direction:
-                        # То же направление: алерт только если цена пробила
-                        # следующий порог относительно цены предыдущего алерта
                         step = abs(price - prev_price) / prev_price * 100
                         if step < current_percent:
-                            continue   # монета не доросла до следующего уровня
-                    # Смена направления → сбрасываем и даём новый алерт
+                            continue
+                    # смена направления → новый алерт
 
-                vals   = [p for _, p in price_history[sym][-100:]]
-                rsi    = calculate_rsi(vals)
-                macd   = calculate_macd(vals)
-                source = sources.get(sym, "UNKNOWN")
+                # ── Вычисляем дополнительный контекст ────────────────────────
+                macd      = calculate_macd(vals)
+                rsi_trend = calculate_rsi_trend(vals)
+                accel     = calculate_acceleration(recent)
+                duration  = calculate_growth_duration(recent)
+                breakout  = check_24h_breakout(sym, price)
+                day_ctx   = get_24h_context(sym, price)
+                source    = sources.get(sym, "UNKNOWN")
 
-                text = format_alert(sym, price, growth, rsi, macd, source)
+                text = format_alert(
+                    sym, price, growth, rsi, macd, source,
+                    rsi_trend=rsi_trend,
+                    accel=accel,
+                    duration_sec=duration,
+                    breakout=breakout,
+                    day_context=day_ctx,
+                )
                 await broadcast(text)
 
                 db_save_alert(sym, price, growth, rsi, macd, source)
