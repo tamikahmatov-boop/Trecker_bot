@@ -336,27 +336,28 @@ async def broadcast(text: str, reply_markup=None):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def inline_keyboard(*rows):
-    """Хелпер: создать InlineKeyboardMarkup из списков (text, callback_data)."""
+def reply_keyboard():
+    """Постоянная клавиатура внизу экрана — одно нажатие, никаких всплывающих меню."""
     return {
-        "inline_keyboard": [
-            [{"text": t, "callback_data": d} for t, d in row]
-            for row in rows
-        ]
+        "keyboard": [
+            ["📈 0.2%",    "📈 5%",       "📈 10%"         ],
+            ["📈 15%",     "📈 20%"                         ],
+            ["⏱ 5 мин",   "⏱ 1 час",    "⏱ 4 ч", "⏱ 1 д"],
+            ["📊 Статус",  "📋 История",  "🏆 Топ-5"        ],
+            ["⏸ Пауза",   "▶️ Продолжить"                  ],
+            ["📤 Экспорт", "🗑 Кулдауны", "/status"         ],
+        ],
+        "resize_keyboard": True,
+        "persistent":       True,
     }
 
 
 async def send_main_menu(chat_id):
-    kb = inline_keyboard(
-        [("📈 0.2%", "pct_0.2"), ("📈 5%", "pct_5"), ("📈 10%", "pct_10")],
-        [("📈 15%", "pct_15"), ("📈 20%", "pct_20")],
-        [("⏱ 5 мин", "win_5"), ("⏱ 1 час", "win_60"), ("⏱ 4 ч", "win_240"), ("⏱ 1 д", "win_1440")],
-        [("📊 Статистика", "stat"), ("📋 История", "hist")],
-        [("🏆 Топ-5", "top5"), ("📤 Экспорт CSV", "export")],
-        [("⏸ Пауза", "pause"), ("▶️ Продолжить", "resume")],
-        [("🗑 Сбросить кулдауны", "clear_cd")],
+    await send_message(
+        "⚙️ <b>Панель управления</b>",
+        chat_id,
+        reply_markup=reply_keyboard(),
     )
-    await send_message("⚙️ <b>Панель управления</b>", chat_id, reply_markup=kb)
 
 
 # ================================================================
@@ -618,9 +619,8 @@ async def handle_message(msg: dict):
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
 
-    # Авторизация (только admin)
+    # ── Авторизация ────────────────────────────────────────────────────────────
     if chat_id != int(config.CHAT_ID):
-        # Разрешаем /subscribe любому
         if text == "/subscribe":
             db_add_subscriber(chat_id)
             await send_message("✅ Вы подписались на сигналы", chat_id)
@@ -628,9 +628,10 @@ async def handle_message(msg: dict):
             db_remove_subscriber(chat_id)
             await send_message("❌ Вы отписались от сигналов", chat_id)
         else:
-            await send_message("⛔ Нет доступа. Используйте /subscribe для подписки на алерты.", chat_id)
+            await send_message("⛔ Нет доступа. /subscribe — подписаться на алерты.", chat_id)
         return
 
+    # ── /start / /menu ─────────────────────────────────────────────────────────
     if text in ("/start", "/menu"):
         await send_message(
             f"🚀 <b>Бот запущен</b>\n\n"
@@ -638,20 +639,95 @@ async def handle_message(msg: dict):
             f"⏱ Период: <b>{current_window // 60} мин</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг идёт'}",
             chat_id,
+            reply_markup=reply_keyboard(),
         )
-        await send_main_menu(chat_id)
+        return
 
-    elif text == "/status":
+    # ── Пороги роста ──────────────────────────────────────────────────────────
+    _pct_map = {
+        "📈 0.2%": 0.2, "📈 5%": 5.0, "📈 10%": 10.0,
+        "📈 15%": 15.0, "📈 20%": 20.0,
+    }
+    if text in _pct_map:
+        current_percent = _pct_map[text]
+        await send_message(f"✅ Порог: <b>{current_percent}%</b>", chat_id)
+        return
+
+    # ── Периоды ────────────────────────────────────────────────────────────────
+    _win_map = {
+        "⏱ 5 мин": (300,   "5 мин"),
+        "⏱ 1 час": (3600,  "1 час"),
+        "⏱ 4 ч":   (14400, "4 часа"),
+        "⏱ 1 д":   (86400, "1 день"),
+    }
+    if text in _win_map:
+        current_window, label = _win_map[text]
+        await send_message(f"✅ Период: <b>{label}</b>", chat_id)
+        return
+
+    # ── Пауза / Продолжить ────────────────────────────────────────────────────
+    if text == "⏸ Пауза":
+        if monitor_paused:
+            await send_message("⏸ Мониторинг уже на паузе", chat_id)
+        else:
+            monitor_paused = True
+            await send_message("⏸ Мониторинг приостановлен", chat_id)
+        return
+
+    if text == "▶️ Продолжить":
+        if not monitor_paused:
+            await send_message("▶️ Мониторинг уже активен", chat_id)
+        else:
+            monitor_paused = False
+            await send_message("▶️ Мониторинг возобновлён", chat_id)
+        return
+
+    # ── Статус ────────────────────────────────────────────────────────────────
+    if text in ("📊 Статус", "/status"):
+        uptime  = int(time.time() - start_time)
+        d, rem  = divmod(uptime, 86400)
+        h, rem  = divmod(rem, 3600)
+        m       = rem // 60
         await send_message(
-            f"📊 <b>Статус</b>\n\n"
+            f"📊 <b>СТАТУС</b>\n\n"
+            f"🟢 Аптайм: {d}д {h}ч {m}м\n"
+            f"🪙 Монет в истории: {len(price_history)}\n"
+            f"🔔 Сигналов: {signals_count}\n"
+            f"🔄 Циклов: {checks_count}\n"
             f"📈 Порог: <b>{current_percent}%</b>\n"
-            f"⏱ Период: <b>{current_window} сек</b>\n"
-            f"🔔 Кулдаун: <b>{config.COOLDOWN // 60} мин</b>\n"
+            f"⏱ Период: <b>{current_window // 60} мин</b>\n"
+            f"⚡ Интервал: {config.INTERVAL} сек\n"
+            f"🕒 Кулдаун: {config.COOLDOWN // 60} мин\n"
+            f"👥 Подписчиков: {len(db_get_subscribers())}\n"
             f"{'⏸ Пауза' if monitor_paused else '▶️ Активен'}",
             chat_id,
         )
+        return
 
-    elif text.startswith("/set_percent"):
+    # ── История — мгновенный ответ + фоновая задача ───────────────────────────
+    if text in ("📋 История", "/history"):
+        asyncio.create_task(_cmd_history(chat_id))
+        return
+
+    # ── Топ-5 — мгновенный ответ + фоновая задача ────────────────────────────
+    if text in ("🏆 Топ-5", "/top5"):
+        asyncio.create_task(_cmd_top5(chat_id))
+        return
+
+    # ── Экспорт CSV — сообщение сразу, файл в фоне ───────────────────────────
+    if text in ("📤 Экспорт", "/export"):
+        await send_message("📤 Генерирую CSV...", chat_id)
+        asyncio.create_task(_cmd_export(chat_id))
+        return
+
+    # ── Сброс кулдаунов ───────────────────────────────────────────────────────
+    if text in ("🗑 Кулдауны", "/clear_cooldowns"):
+        db_clear_cooldowns()
+        await send_message("🗑 Кулдауны сброшены", chat_id)
+        return
+
+    # ── Произвольный порог: /set_percent 2.5 ─────────────────────────────────
+    if text.startswith("/set_percent"):
         try:
             val = float(text.split()[1])
             assert 0.01 <= val <= 100
@@ -659,8 +735,10 @@ async def handle_message(msg: dict):
             await send_message(f"✅ Новый порог: <b>{val}%</b>", chat_id)
         except Exception:
             await send_message("❌ Использование: /set_percent 2.5", chat_id)
+        return
 
-    elif text.startswith("/set_window"):
+    # ── Произвольный период: /set_window 60 (мин) ────────────────────────────
+    if text.startswith("/set_window"):
         try:
             val = int(text.split()[1])
             assert 1 <= val <= 10080
@@ -668,100 +746,14 @@ async def handle_message(msg: dict):
             await send_message(f"✅ Новый период: <b>{val} мин</b>", chat_id)
         except Exception:
             await send_message("❌ Использование: /set_window 60  (в минутах)", chat_id)
-
-    elif text in ("📋 История", "/history"):
-        await _cmd_history(chat_id)
-
-    elif text in ("/top5",):
-        await _cmd_top5(chat_id)
-
-    elif text == "/export":
-        await _cmd_export(chat_id)
-
-    elif text == "/clear_cooldowns":
-        db_clear_cooldowns()
-        await send_message("🗑 Кулдауны сброшены", chat_id)
-
-    elif text == "/subscribe":
-        db_add_subscriber(chat_id)
-        await send_message("✅ Вы уже в списке получателей", chat_id)
-
-    else:
-        await send_message("❓ Неизвестная команда. /menu — открыть панель", chat_id)
-
-
-async def handle_callback(cb: dict):
-    global current_percent, current_window, monitor_paused
-
-    data    = cb.get("data", "")
-    chat_id = cb["message"]["chat"]["id"]
-    cb_id   = cb["id"]
-
-    # Авторизация
-    if chat_id != int(config.CHAT_ID):
-        await _tg_post("answerCallbackQuery", {"callback_query_id": cb_id, "text": "⛔ Нет доступа"})
         return
 
-    answer = "✅"
+    if text == "/subscribe":
+        db_add_subscriber(chat_id)
+        await send_message("✅ Вы уже в списке получателей", chat_id)
+        return
 
-    if data.startswith("pct_"):
-        current_percent = float(data[4:])
-        answer = f"✅ Порог: {current_percent}%"
-
-    elif data.startswith("win_"):
-        mins           = int(data[4:])
-        current_window = mins * 60
-        label = f"{mins} мин" if mins < 60 else (f"{mins // 60} ч" if mins < 1440 else "1 день")
-        answer = f"✅ Период: {label}"
-
-    elif data == "stat":
-        uptime  = int(time.time() - start_time)
-        d, rem  = divmod(uptime, 86400)
-        h, rem  = divmod(rem, 3600)
-        m       = rem // 60
-        text = (
-            f"📊 <b>СТАТИСТИКА</b>\n\n"
-            f"🟢 Аптайм: {d}д {h}ч {m}м\n"
-            f"🪙 Монет в истории: {len(price_history)}\n"
-            f"🔔 Сигналов: {signals_count}\n"
-            f"🔄 Циклов: {checks_count}\n"
-            f"📈 Порог: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n"
-            f"⚡ Интервал: {config.INTERVAL} сек\n"
-            f"🕒 Кулдаун: {config.COOLDOWN // 60} мин\n"
-            f"👥 Подписчиков: {len(db_get_subscribers())}\n"
-            f"{'⏸ Пауза' if monitor_paused else '▶️ Активен'}"
-        )
-        await send_message(text, chat_id)
-
-    elif data == "hist":
-        await _cmd_history(chat_id)
-
-    elif data == "top5":
-        await _cmd_top5(chat_id)
-
-    elif data == "export":
-        await _cmd_export(chat_id)
-
-    elif data == "pause":
-        if monitor_paused:
-            answer = "⏸ Уже на паузе"
-        else:
-            monitor_paused = True
-            answer = "⏸ Мониторинг приостановлен"
-
-    elif data == "resume":
-        if not monitor_paused:
-            answer = "▶️ Уже активен"
-        else:
-            monitor_paused = False
-            answer = "▶️ Мониторинг возобновлён"
-
-    elif data == "clear_cd":
-        db_clear_cooldowns()
-        answer = "🗑 Кулдауны сброшены"
-
-    await _tg_post("answerCallbackQuery", {"callback_query_id": cb_id, "text": answer})
+    await send_message("❓ Неизвестная команда. /menu — открыть панель", chat_id)
 
 
 async def _cmd_history(chat_id):
@@ -825,9 +817,9 @@ async def telegram_loop():
             for update in await get_updates():
                 offset = update["update_id"] + 1
                 if "message" in update:
-                    await handle_message(update["message"])
-                elif "callback_query" in update:
-                    await handle_callback(update["callback_query"])
+                    # Каждое сообщение обрабатываем в отдельной задаче —
+                    # telegram_loop не блокируется на медленных командах
+                    asyncio.create_task(handle_message(update["message"]))
         except Exception as e:
             log.exception("telegram_loop: %s", e)
         await asyncio.sleep(0.2)
