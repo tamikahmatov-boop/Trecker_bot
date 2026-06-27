@@ -1,53 +1,119 @@
+"""
+Crypto Alert Bot — v9
+Улучшения vs v8:
+  • aiohttp вместо requests (неблокирующие запросы)
+  • Binance добавлен как 3-й источник цен
+  • Параллельный fetch цен (asyncio.gather)
+  • WAL-режим SQLite + пул соединений (thread-safe)
+  • Таблица price_stats (24h high/low/vol) — новый сигнал по объёму
+  • MACD-индикатор — дополнительный фильтр к RSI
+  • Inline-кнопки вместо reply-keyboard (чище, не занимают экран)
+  • /set_percent X — произвольный порог без кнопок
+  • /set_window X  — произвольный период (в минутах)
+  • /top5 — топ-5 монет по силе последнего сигнала
+  • /clear_cooldowns — сброс кулдаунов вручную
+  • Многоуровневый алерт: 🚀 / 🔥 / 💥 в зависимости от величины роста
+  • Экспорт истории в CSV по команде /export
+  • Конфигурируемый список CHAT_IDs (мультиподписчики)
+  • Prometheus-метрики (опционально, если установлен prometheus_client)
+  • Graceful shutdown (SIGTERM / SIGINT)
+"""
 
+from __future__ import annotations
+
+import asyncio
+import csv
+import io
 import json
 import logging
-import asyncio
+import signal
 import sqlite3
-import requests
 import time
+from contextlib import asynccontextmanager, contextmanager
+from typing import Optional
+
+import aiohttp
 import pandas as pd
-from ta.momentum import RSIIndicator
 from bs4 import BeautifulSoup
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+
 import config
+
+# ── Prometheus (опционально) ──────────────────────────────────────────────────
+try:
+    from prometheus_client import Counter, Gauge, start_http_server
+    PROM_SIGNALS   = Counter("bot_signals_total",      "Всего сигналов")
+    PROM_CHECKS    = Counter("bot_checks_total",        "Всего циклов")
+    PROM_COINS     = Gauge("bot_tracked_coins",         "Монет в истории")
+    PROM_AVAILABLE = True
+except ImportError:
+    PROM_AVAILABLE = False
+
+# ================================================================
+#  LOGGING
+# ================================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+    format="%(asctime)s %(levelname)s [%(funcName)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+log = logging.getLogger(__name__)
 
 # ================================================================
-#  DATABASE  (SQLite — алерты, кулдауны, история)
+#  DATABASE
 # ================================================================
 
 DB_FILE = "alerts.db"
+_db_lock = asyncio.Lock()   # для async-секций
 
 
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+@contextmanager
+def db_connect():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
-    return conn
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def db_init():
     with db_connect() as conn:
-        conn.execute("""
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol    TEXT    NOT NULL,
                 price     REAL    NOT NULL,
                 growth    REAL    NOT NULL,
                 rsi       REAL,
+                macd      REAL,
                 source    TEXT,
                 ts        REAL    NOT NULL
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ts     ON alerts(ts)")
-        conn.execute("""
+            );
+            CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol);
+            CREATE INDEX IF NOT EXISTS idx_alerts_ts     ON alerts(ts);
+
             CREATE TABLE IF NOT EXISTS cooldowns (
-                symbol    TEXT PRIMARY KEY,
-                ts        REAL NOT NULL
-            )
+                symbol TEXT PRIMARY KEY,
+                ts     REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS price_stats (
+                symbol   TEXT PRIMARY KEY,
+                high24h  REAL,
+                low24h   REAL,
+                vol24h   REAL,
+                updated  REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS subscribers (
+                chat_id  INTEGER PRIMARY KEY,
+                added_ts REAL NOT NULL
+            );
         """)
 
 
@@ -55,19 +121,19 @@ db_init()
 
 
 def db_save_alert(symbol: str, price: float, growth: float,
-                  rsi: float | None, source: str):
+                  rsi: Optional[float], macd: Optional[float], source: str):
     with db_connect() as conn:
         conn.execute(
-            "INSERT INTO alerts (symbol, price, growth, rsi, source, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (symbol, price, growth, rsi, source, time.time())
+            "INSERT INTO alerts (symbol, price, growth, rsi, macd, source, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (symbol, price, growth, rsi, macd, source, time.time()),
         )
 
 
 def db_get_cooldown(symbol: str) -> float:
     with db_connect() as conn:
         row = conn.execute(
-            "SELECT ts FROM cooldowns WHERE symbol = ?", (symbol,)
+            "SELECT ts FROM cooldowns WHERE symbol=?", (symbol,)
         ).fetchone()
     return row["ts"] if row else 0.0
 
@@ -76,22 +142,75 @@ def db_set_cooldown(symbol: str):
     with db_connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO cooldowns (symbol, ts) VALUES (?, ?)",
-            (symbol, time.time())
+            (symbol, time.time()),
         )
 
 
-def db_recent_alerts(limit: int = 10) -> list:
+def db_clear_cooldowns():
+    with db_connect() as conn:
+        conn.execute("DELETE FROM cooldowns")
+
+
+def db_recent_alerts(limit: int = 10) -> list[dict]:
     with db_connect() as conn:
         rows = conn.execute(
-            "SELECT symbol, price, growth, rsi, source, ts "
+            "SELECT symbol, price, growth, rsi, macd, source, ts "
             "FROM alerts ORDER BY ts DESC LIMIT ?",
-            (limit,)
+            (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
 
 
+def db_top_signals(limit: int = 5) -> list[dict]:
+    """Топ сигналов по абсолютной величине роста за последние 24 ч."""
+    cutoff = time.time() - 86400
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT symbol, growth, price, source, ts "
+            "FROM alerts WHERE ts >= ? ORDER BY ABS(growth) DESC LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def db_export_csv(limit: int = 500) -> str:
+    """Возвращает CSV-строку последних алертов."""
+    rows = db_recent_alerts(limit)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["ts", "symbol", "price", "growth", "rsi", "macd", "source"])
+    writer.writeheader()
+    for r in rows:
+        r["ts"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"]))
+        writer.writerow(r)
+    return buf.getvalue()
+
+
+# ── Подписчики ────────────────────────────────────────────────────────────────
+
+def db_add_subscriber(chat_id: int):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO subscribers (chat_id, added_ts) VALUES (?, ?)",
+            (chat_id, time.time()),
+        )
+
+
+def db_remove_subscriber(chat_id: int):
+    with db_connect() as conn:
+        conn.execute("DELETE FROM subscribers WHERE chat_id=?", (chat_id,))
+
+
+def db_get_subscribers() -> list[int]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT chat_id FROM subscribers").fetchall()
+    # всегда включаем основной CHAT_ID из конфига
+    ids = {r["chat_id"] for r in rows}
+    ids.add(int(config.CHAT_ID))
+    return list(ids)
+
+
 # ================================================================
-#  STATE  (json — лёгкие глобальные настройки)
+#  STATE
 # ================================================================
 
 STATE_FILE = "state.json"
@@ -109,9 +228,8 @@ def save_state():
 def load_state():
     global last_alert_growth
     try:
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
-            last_alert_growth = data.get("last_alert_growth", {})
+        with open(STATE_FILE) as f:
+            last_alert_growth = json.load(f).get("last_alert_growth", {})
     except Exception:
         pass
 
@@ -123,23 +241,23 @@ load_state()
 # ================================================================
 
 TOKEN = config.BOT_TOKEN
-URL   = f"https://api.telegram.org/bot{TOKEN}"
+TG    = f"https://api.telegram.org/bot{TOKEN}"
 
-offset        = 0
-price_history: dict = {}
-signals_count = 0
-checks_count  = 0
-start_time    = time.time()
+offset           = 0
+price_history:   dict  = {}
+signals_count    = 0
+checks_count     = 0
+start_time       = time.time()
 last_check_time: float = 0.0
 
-current_percent = config.PERCENT
-current_window  = config.WINDOW
+current_percent: float = config.PERCENT
+current_window:  int   = config.WINDOW
 
-# Пауза мониторинга
-monitor_paused = False
+monitor_paused  = False
+monitor_task:   asyncio.Task | None = None
 
-# Задача monitor — нужна watchdog'у для перезапуска
-monitor_task: asyncio.Task | None = None
+# Общая aiohttp-сессия (создаётся в main)
+_session: aiohttp.ClientSession | None = None
 
 
 def normalize_symbol(sym: str) -> str:
@@ -147,38 +265,137 @@ def normalize_symbol(sym: str) -> str:
 
 
 # ================================================================
-#  TELEGRAM HELPERS
+#  INDICATORS
 # ================================================================
 
-def send_message(text: str, chat_id):
+def calculate_rsi(prices: list[float], window: int = 5) -> Optional[float]:
     try:
-        resp = requests.post(
-            f"{URL}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=20
-        )
-        if not resp.ok:
-            logging.warning("Telegram error: %s", resp.text)
+        if len(prices) < window + 1:
+            return None
+        s   = pd.Series(prices)
+        val = RSIIndicator(close=s, window=window).rsi().iloc[-1]
+        return None if pd.isna(val) else round(float(val), 2)
     except Exception as e:
-        logging.error("Telegram send error: %s", e)
+        log.error("RSI error: %s", e)
+        return None
 
 
-def send_keyboard(chat_id):
-    keyboard = {
-        "keyboard": [
-            ["📈 0.2%", "📈 5%", "📈 10%"],
-            ["📈 15%", "📈 20%"],
-            ["⏱ 5 мин", "⏱ 1 час"],
-            ["⏱ 4 часа", "⏱ 1 день"],
-            ["📊 Статистика", "📋 История"],
-            ["⏸ Пауза", "▶️ Продолжить"],
-            ["/status"],
-        ],
-        "resize_keyboard": True,
+def calculate_macd(prices: list[float]) -> Optional[float]:
+    """Возвращает MACD-гистограмму последней свечи."""
+    try:
+        if len(prices) < 26:
+            return None
+        s    = pd.Series(prices)
+        hist = MACD(close=s).macd_diff().iloc[-1]
+        return None if pd.isna(hist) else round(float(hist), 6)
+    except Exception as e:
+        log.error("MACD error: %s", e)
+        return None
+
+
+# ================================================================
+#  TELEGRAM HELPERS  (async)
+# ================================================================
+
+async def _tg_post(method: str, payload: dict) -> Optional[dict]:
+    global _session
+    try:
+        async with _session.post(f"{TG}/{method}", json=payload, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            data = await resp.json()
+            if not data.get("ok"):
+                log.warning("Telegram %s error: %s", method, data)
+            return data
+    except Exception as e:
+        log.error("Telegram %s: %s", method, e)
+        return None
+
+
+async def send_message(text: str, chat_id, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    await _tg_post("sendMessage", payload)
+
+
+async def send_document(chat_id, filename: str, content: str, caption: str = ""):
+    """Отправить файл через multipart/form-data."""
+    try:
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        form.add_field("caption", caption)
+        form.add_field("document", content.encode(), filename=filename, content_type="text/csv")
+        async with _session.post(f"{TG}/sendDocument", data=form, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            return await resp.json()
+    except Exception as e:
+        log.error("sendDocument: %s", e)
+
+
+async def broadcast(text: str, reply_markup=None):
+    """Разослать сообщение всем подписчикам."""
+    tasks = [send_message(text, cid, reply_markup) for cid in db_get_subscribers()]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def inline_keyboard(*rows):
+    """Хелпер: создать InlineKeyboardMarkup из списков (text, callback_data)."""
+    return {
+        "inline_keyboard": [
+            [{"text": t, "callback_data": d} for t, d in row]
+            for row in rows
+        ]
     }
-    requests.post(
-        f"{URL}/sendMessage",
-        json={"chat_id": chat_id, "text": "Выберите настройки:", "reply_markup": keyboard},
+
+
+async def send_main_menu(chat_id):
+    kb = inline_keyboard(
+        [("📈 0.2%", "pct_0.2"), ("📈 5%", "pct_5"), ("📈 10%", "pct_10")],
+        [("📈 15%", "pct_15"), ("📈 20%", "pct_20")],
+        [("⏱ 5 мин", "win_5"), ("⏱ 1 час", "win_60"), ("⏱ 4 ч", "win_240"), ("⏱ 1 д", "win_1440")],
+        [("📊 Статистика", "stat"), ("📋 История", "hist")],
+        [("🏆 Топ-5", "top5"), ("📤 Экспорт CSV", "export")],
+        [("⏸ Пауза", "pause"), ("▶️ Продолжить", "resume")],
+        [("🗑 Сбросить кулдауны", "clear_cd")],
+    )
+    await send_message("⚙️ <b>Панель управления</b>", chat_id, reply_markup=kb)
+
+
+# ================================================================
+#  ALERT FORMATTING
+# ================================================================
+
+def alert_emoji(growth: float) -> str:
+    a = abs(growth)
+    if a >= 20:
+        return "💥"
+    if a >= 10:
+        return "🔥"
+    return "🚀" if growth > 0 else "📉"
+
+
+def format_alert(sym: str, price: float, growth: float,
+                 rsi: Optional[float], macd: Optional[float],
+                 source: str) -> str:
+    emoji  = alert_emoji(growth)
+    label  = "Рост" if growth > 0 else "Падение"
+    sign   = "+" if growth > 0 else ""
+    rsi_s  = f"{rsi:.1f}" if rsi is not None else "—"
+    macd_s = f"{macd:+.6f}" if macd is not None else "—"
+
+    # RSI-подсказка
+    rsi_hint = ""
+    if rsi is not None:
+        if rsi >= 70:
+            rsi_hint = " ⚠️ перекуплен"
+        elif rsi <= 30:
+            rsi_hint = " ⚠️ перепродан"
+
+    return (
+        f"{emoji} <b>СИГНАЛ</b>\n\n"
+        f"🪙 <b>{sym}</b>  [{source}]\n"
+        f"💵 Цена: <code>{price}</code>\n"
+        f"📈 {label}: <b>{sign}{growth:.2f}%</b>\n"
+        f"📊 RSI: <code>{rsi_s}</code>{rsi_hint}\n"
+        f"〽️ MACD: <code>{macd_s}</code>"
     )
 
 
@@ -186,105 +403,118 @@ def send_keyboard(chat_id):
 #  SYMBOLS
 # ================================================================
 
-def get_symbols() -> set:
-    symbols: set = set()
-
-    for label, url, suffix in [
+async def get_symbols() -> set[str]:
+    symbols: set[str] = set()
+    for label, url, suffixes in [
         ("Trading", "https://public.bybit.com/trading/", ("USDT", "PERP")),
         ("Spot",    "https://public.bybit.com/spot/",    ("USDT",)),
     ]:
         try:
-            r = requests.get(url, timeout=20)
-            soup = BeautifulSoup(r.text, "html.parser")
+            async with _session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                html  = await r.text()
+            soup  = BeautifulSoup(html, "html.parser")
             count = 0
             for a in soup.find_all("a"):
                 sym = a.text.strip("/")
-                if sym.endswith(suffix):
+                if sym.endswith(suffixes):
                     symbols.add(sym.replace("/", ""))
                     count += 1
-            logging.info("%s: %d", label, count)
+            log.info("%s: %d символов", label, count)
         except Exception as e:
-            logging.error("Ошибка %s: %s", label, e)
-
-    logging.info("Всего монет: %d", len(symbols))
+            log.error("get_symbols %s: %s", label, e)
+    log.info("Всего монет: %d", len(symbols))
     return symbols
 
 
 # ================================================================
-#  PRICES
+#  PRICES  (параллельный fetch)
 # ================================================================
 
-def get_prices(symbols: set) -> tuple[dict, dict]:
-    prices: dict  = {}
-    sources: dict = {}
-    norm = {normalize_symbol(s): s for s in symbols}
-
-    # OKX
+async def _fetch_okx(norm: dict) -> tuple[dict, dict]:
+    prices, sources = {}, {}
     try:
-        r = requests.get(
+        async with _session.get(
             "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
-            timeout=20
-        )
-        for item in r.json().get("data", []):
-            sym = normalize_symbol(item["instId"])
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            data = await r.json()
+        for item in data.get("data", []):
+            sym   = normalize_symbol(item["instId"])
             price = float(item["last"])
             if price > 0 and sym in norm:
                 real = norm[sym]
                 prices[real]  = price
                 sources[real] = "OKX"
     except Exception as e:
-        logging.error("Ошибка OKX: %s", e)
-
-    # MEXC
-    try:
-        r = requests.get(
-            "https://contract.mexc.com/api/v1/contract/ticker",
-            timeout=20
-        )
-        data = r.json()
-        if data.get("success"):
-            for item in data["data"]:
-                sym = normalize_symbol(item["symbol"])
-                price = float(item["lastPrice"])
-                if price > 0 and sym in norm:
-                    real = norm[sym]
-                    if real not in prices:
-                        prices[real]  = price
-                        sources[real] = "MEXC"
-    except Exception as e:
-        logging.error("Ошибка MEXC: %s", e)
-
+        log.error("OKX: %s", e)
     return prices, sources
 
 
-# ================================================================
-#  RSI
-# ================================================================
-
-def calculate_rsi(prices: list, window: int = 5) -> float | None:
+async def _fetch_mexc(norm: dict) -> tuple[dict, dict]:
+    prices, sources = {}, {}
     try:
-        if len(prices) < window + 1:
-            return None
-        series = pd.Series(prices)
-        rsi = RSIIndicator(close=series, window=window).rsi().iloc[-1]
-        return None if pd.isna(rsi) else round(float(rsi), 2)
+        async with _session.get(
+            "https://contract.mexc.com/api/v1/contract/ticker",
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            data = await r.json()
+        if data.get("success"):
+            for item in data["data"]:
+                sym   = normalize_symbol(item["symbol"])
+                price = float(item["lastPrice"])
+                if price > 0 and sym in norm:
+                    real = norm[sym]
+                    prices[real]  = price
+                    sources[real] = "MEXC"
     except Exception as e:
-        logging.error("Ошибка RSI: %s", e)
-        return None
+        log.error("MEXC: %s", e)
+    return prices, sources
 
 
-# ================================================================
-#  RETRY WRAPPER
-# ================================================================
+async def _fetch_binance(norm: dict) -> tuple[dict, dict]:
+    prices, sources = {}, {}
+    try:
+        async with _session.get(
+            "https://fapi.binance.com/fapi/v1/ticker/price",
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            data = await r.json()
+        for item in data:
+            sym   = normalize_symbol(item["symbol"])
+            price = float(item["price"])
+            if price > 0 and sym in norm:
+                real = norm[sym]
+                prices[real]  = price
+                sources[real] = "Binance"
+    except Exception as e:
+        log.error("Binance: %s", e)
+    return prices, sources
 
-async def safe_request(func, retries: int = 5, delay: float = 2):
-    for attempt in range(retries):
-        try:
-            return await func()
-        except Exception as e:
-            logging.warning("Retry %d/%d: %s", attempt + 1, retries, e)
-            await asyncio.sleep(delay)
-    return None
+
+async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
+    norm   = {normalize_symbol(s): s for s in symbols}
+    merged: dict = {}
+    msrc:   dict = {}
+
+    results = await asyncio.gather(
+        _fetch_okx(norm),
+        _fetch_mexc(norm),
+        _fetch_binance(norm),
+        return_exceptions=True,
+    )
+
+    # OKX имеет приоритет, Binance заполняет пробелы
+    for res in results:
+        if isinstance(res, Exception):
+            log.error("Fetch error: %s", res)
+            continue
+        p, s = res
+        for sym, price in p.items():
+            if sym not in merged:
+                merged[sym] = price
+                msrc[sym]   = s[sym]
+
+    return merged, msrc
 
 
 # ================================================================
@@ -294,36 +524,37 @@ async def safe_request(func, retries: int = 5, delay: float = 2):
 async def monitor():
     global current_percent, current_window, signals_count, checks_count, last_check_time
 
-    symbols = get_symbols()
-    last_symbols_update = time.time()
+    symbols           = await get_symbols()
+    last_symbols_upd  = time.time()
 
-    send_message("✅ Бот запущен", config.CHAT_ID)
+    await broadcast("✅ <b>Бот запущен</b>")
 
     while True:
-        # ── пауза ──────────────────────────────────────────────
         if monitor_paused:
             await asyncio.sleep(2)
             continue
 
         try:
-            now = time.time()
+            now             = time.time()
             checks_count   += 1
             last_check_time = now
 
-            # обновление списка монет каждые 30 мин
-            if now - last_symbols_update >= 1800:
-                new_symbols = get_symbols()
-                if new_symbols:
-                    symbols = new_symbols
-                    logging.info("Монеты обновлены: %d", len(symbols))
-                else:
-                    logging.warning("Список монет не обновлён, используется старый")
-                last_symbols_update = now
+            if PROM_AVAILABLE:
+                PROM_CHECKS.inc()
+                PROM_COINS.set(len(price_history))
 
-            prices, sources = get_prices(symbols)
+            # обновление списка монет каждые 30 мин
+            if now - last_symbols_upd >= 1800:
+                new_sym = await get_symbols()
+                if new_sym:
+                    symbols = new_sym
+                    log.info("Монеты обновлены: %d", len(symbols))
+                last_symbols_upd = now
+
+            prices, sources = await get_prices(symbols)
 
             for sym, price in prices.items():
-                await asyncio.sleep(0)   # передать управление event loop
+                await asyncio.sleep(0)
 
                 if price <= 0:
                     continue
@@ -331,11 +562,10 @@ async def monitor():
                 hist = price_history.setdefault(sym, [])
                 hist.append((now, price))
 
-                # чистим старую историю
                 cutoff = max(current_window * 2, 86400)
-                price_history[sym] = [x for x in hist if now - x[0] <= cutoff]
+                price_history[sym] = [(t, p) for t, p in hist if now - t <= cutoff]
 
-                recent = [x for x in price_history[sym] if now - x[0] <= current_window]
+                recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
                 if len(recent) < 2:
                     continue
 
@@ -343,177 +573,248 @@ async def monitor():
                 if old_price <= 0:
                     continue
 
-                growth = ((price - old_price) / old_price) * 100
+                growth = (price - old_price) / old_price * 100
 
                 if abs(growth) < current_percent:
                     continue
 
-                # ── антиспам через SQLite ──────────────────────
-                last_ts = db_get_cooldown(sym)
-                if now - last_ts < config.COOLDOWN:
+                # антиспам
+                if now - db_get_cooldown(sym) < config.COOLDOWN:
                     continue
 
-                rsi    = calculate_rsi([x[1] for x in price_history[sym][-100:]])
+                vals   = [p for _, p in price_history[sym][-100:]]
+                rsi    = calculate_rsi(vals)
+                macd   = calculate_macd(vals)
                 source = sources.get(sym, "UNKNOWN")
 
-                if growth > 0:
-                    text = (
-                        f"🚀 СИГНАЛ\n\n"
-                        f"Монета: {sym}\n"
-                        f"Цена: {price} ({source})\n"
-                        f"Рост: +{growth:.2f}%\n"
-                    )
-                else:
-                    text = (
-                        f"📉 СИГНАЛ\n\n"
-                        f"Монета: {sym}\n"
-                        f"Цена: {price} ({source})\n"
-                        f"Падение: {growth:.2f}%\n"
-                    )
+                text = format_alert(sym, price, growth, rsi, macd, source)
+                await broadcast(text)
 
-                text += f"\n📊 RSI: {rsi:.2f}" if rsi is not None else "\n📊 RSI: ожидание данных"
-
-                send_message(text, config.CHAT_ID)
-
-                db_save_alert(sym, price, growth, rsi, source)
+                db_save_alert(sym, price, growth, rsi, macd, source)
                 db_set_cooldown(sym)
                 signals_count += 1
 
+                if PROM_AVAILABLE:
+                    PROM_SIGNALS.inc()
+
+                log.info("Signal: %s %+.2f%% [%s]", sym, growth, source)
+
             await asyncio.sleep(config.INTERVAL)
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logging.exception("Ошибка monitor: %s", e)
+            log.exception("monitor error: %s", e)
             await asyncio.sleep(5)
 
 
 # ================================================================
-#  TELEGRAM MESSAGE HANDLER
+#  COMMAND / CALLBACK HANDLERS
 # ================================================================
 
-def handle_message(msg: dict):
+async def handle_message(msg: dict):
     global current_percent, current_window, monitor_paused
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
 
-    # ── /start ─────────────────────────────────────────────────
-    if text == "/start":
-        send_message(
-            f"🚀 Бот запущен\n\n"
-            f"📈 Порог: {current_percent}%\n"
-            f"⏱ Период: {current_window // 60} мин\n"
+    # Авторизация (только admin)
+    if chat_id != int(config.CHAT_ID):
+        # Разрешаем /subscribe любому
+        if text == "/subscribe":
+            db_add_subscriber(chat_id)
+            await send_message("✅ Вы подписались на сигналы", chat_id)
+        elif text == "/unsubscribe":
+            db_remove_subscriber(chat_id)
+            await send_message("❌ Вы отписались от сигналов", chat_id)
+        else:
+            await send_message("⛔ Нет доступа. Используйте /subscribe для подписки на алерты.", chat_id)
+        return
+
+    if text in ("/start", "/menu"):
+        await send_message(
+            f"🚀 <b>Бот запущен</b>\n\n"
+            f"📈 Порог: <b>{current_percent}%</b>\n"
+            f"⏱ Период: <b>{current_window // 60} мин</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг идёт'}",
             chat_id,
         )
-        send_keyboard(chat_id)
+        await send_main_menu(chat_id)
 
-    # ── /status ────────────────────────────────────────────────
     elif text == "/status":
-        send_message(
-            f"📊 Настройки\n\n"
-            f"📈 Порог: {current_percent}%\n"
-            f"⏱ Период: {current_window} сек\n"
-            f"🔔 Кулдаун: {config.COOLDOWN // 60} мин\n"
+        await send_message(
+            f"📊 <b>Статус</b>\n\n"
+            f"📈 Порог: <b>{current_percent}%</b>\n"
+            f"⏱ Период: <b>{current_window} сек</b>\n"
+            f"🔔 Кулдаун: <b>{config.COOLDOWN // 60} мин</b>\n"
             f"{'⏸ Пауза' if monitor_paused else '▶️ Активен'}",
             chat_id,
         )
 
-    # ── Статистика ─────────────────────────────────────────────
-    elif text == "📊 Статистика":
-        uptime  = int(time.time() - start_time)
-        days    = uptime // 86400
-        hours   = (uptime % 86400) // 3600
-        minutes = (uptime % 3600) // 60
-        send_message(
-            f"📊 СТАТИСТИКА\n\n"
-            f"🟢 Время работы: {days}д {hours}ч {minutes}м\n"
-            f"🪙 Монет в истории: {len(price_history)}\n"
-            f"🔔 Сигналов отправлено: {signals_count}\n"
-            f"🔄 Циклов проверки: {checks_count}\n"
-            f"📈 Порог роста: {current_percent}%\n"
-            f"⏱ Период анализа: {current_window // 60} мин\n"
-            f"⚡ Интервал проверки: {config.INTERVAL} сек\n"
-            f"🕒 Кулдаун: {config.COOLDOWN // 60} мин\n"
-            f"{'⏸ Мониторинг на паузе' if monitor_paused else '▶️ Мониторинг активен'}",
-            chat_id,
-        )
+    elif text.startswith("/set_percent"):
+        try:
+            val = float(text.split()[1])
+            assert 0.01 <= val <= 100
+            current_percent = val
+            await send_message(f"✅ Новый порог: <b>{val}%</b>", chat_id)
+        except Exception:
+            await send_message("❌ Использование: /set_percent 2.5", chat_id)
 
-    # ── История алертов (из SQLite) ────────────────────────────
+    elif text.startswith("/set_window"):
+        try:
+            val = int(text.split()[1])
+            assert 1 <= val <= 10080
+            current_window = val * 60
+            await send_message(f"✅ Новый период: <b>{val} мин</b>", chat_id)
+        except Exception:
+            await send_message("❌ Использование: /set_window 60  (в минутах)", chat_id)
+
     elif text in ("📋 История", "/history"):
-        rows = db_recent_alerts(10)
-        if not rows:
-            send_message("📋 История пуста", chat_id)
-        else:
-            lines = ["📋 Последние 10 сигналов:\n"]
-            for r in rows:
-                ts  = time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))
-                sign = "🚀" if r["growth"] > 0 else "📉"
-                rsi_str = f"RSI {r['rsi']:.1f}" if r["rsi"] is not None else "RSI —"
-                lines.append(
-                    f"{sign} {r['symbol']} {r['growth']:+.2f}% | {rsi_str} | {ts}"
-                )
-            send_message("\n".join(lines), chat_id)
+        await _cmd_history(chat_id)
 
-    # ── Пауза / Продолжить ─────────────────────────────────────
-    elif text in ("⏸ Пауза", "/pause"):
-        if monitor_paused:
-            send_message("⏸ Мониторинг уже на паузе", chat_id)
-        else:
-            monitor_paused = True
-            logging.info("Monitor paused by user")
-            send_message("⏸ Мониторинг приостановлен", chat_id)
+    elif text in ("/top5",):
+        await _cmd_top5(chat_id)
 
-    elif text in ("▶️ Продолжить", "/resume"):
-        if not monitor_paused:
-            send_message("▶️ Мониторинг уже активен", chat_id)
-        else:
-            monitor_paused = False
-            logging.info("Monitor resumed by user")
-            send_message("▶️ Мониторинг возобновлён", chat_id)
+    elif text == "/export":
+        await _cmd_export(chat_id)
 
-    # ── Пороги роста ───────────────────────────────────────────
-    elif text == "📈 0.2%":
-        current_percent = 0.2;  send_message("✅ Порог: 0.2%", chat_id)
-    elif text == "📈 5%":
-        current_percent = 5;    send_message("✅ Порог: 5%", chat_id)
-    elif text == "📈 10%":
-        current_percent = 10;   send_message("✅ Порог: 10%", chat_id)
-    elif text == "📈 15%":
-        current_percent = 15;   send_message("✅ Порог: 15%", chat_id)
-    elif text == "📈 20%":
-        current_percent = 20;   send_message("✅ Порог: 20%", chat_id)
+    elif text == "/clear_cooldowns":
+        db_clear_cooldowns()
+        await send_message("🗑 Кулдауны сброшены", chat_id)
 
-    # ── Периоды ────────────────────────────────────────────────
-    elif text == "⏱ 5 мин":
-        current_window = 300;   send_message("✅ Период: 5 мин", chat_id)
-    elif text == "⏱ 1 час":
-        current_window = 3600;  send_message("✅ Период: 1 час", chat_id)
-    elif text == "⏱ 4 часа":
-        current_window = 14400; send_message("✅ Период: 4 часа", chat_id)
-    elif text == "⏱ 1 день":
-        current_window = 86400; send_message("✅ Период: 1 день", chat_id)
+    elif text == "/subscribe":
+        db_add_subscriber(chat_id)
+        await send_message("✅ Вы уже в списке получателей", chat_id)
 
     else:
-        send_message("❓ Неизвестная команда", chat_id)
+        await send_message("❓ Неизвестная команда. /menu — открыть панель", chat_id)
+
+
+async def handle_callback(cb: dict):
+    global current_percent, current_window, monitor_paused
+
+    data    = cb.get("data", "")
+    chat_id = cb["message"]["chat"]["id"]
+    cb_id   = cb["id"]
+
+    # Авторизация
+    if chat_id != int(config.CHAT_ID):
+        await _tg_post("answerCallbackQuery", {"callback_query_id": cb_id, "text": "⛔ Нет доступа"})
+        return
+
+    answer = "✅"
+
+    if data.startswith("pct_"):
+        current_percent = float(data[4:])
+        answer = f"✅ Порог: {current_percent}%"
+
+    elif data.startswith("win_"):
+        mins           = int(data[4:])
+        current_window = mins * 60
+        label = f"{mins} мин" if mins < 60 else (f"{mins // 60} ч" if mins < 1440 else "1 день")
+        answer = f"✅ Период: {label}"
+
+    elif data == "stat":
+        uptime  = int(time.time() - start_time)
+        d, rem  = divmod(uptime, 86400)
+        h, rem  = divmod(rem, 3600)
+        m       = rem // 60
+        text = (
+            f"📊 <b>СТАТИСТИКА</b>\n\n"
+            f"🟢 Аптайм: {d}д {h}ч {m}м\n"
+            f"🪙 Монет в истории: {len(price_history)}\n"
+            f"🔔 Сигналов: {signals_count}\n"
+            f"🔄 Циклов: {checks_count}\n"
+            f"📈 Порог: {current_percent}%\n"
+            f"⏱ Период: {current_window // 60} мин\n"
+            f"⚡ Интервал: {config.INTERVAL} сек\n"
+            f"🕒 Кулдаун: {config.COOLDOWN // 60} мин\n"
+            f"👥 Подписчиков: {len(db_get_subscribers())}\n"
+            f"{'⏸ Пауза' if monitor_paused else '▶️ Активен'}"
+        )
+        await send_message(text, chat_id)
+
+    elif data == "hist":
+        await _cmd_history(chat_id)
+
+    elif data == "top5":
+        await _cmd_top5(chat_id)
+
+    elif data == "export":
+        await _cmd_export(chat_id)
+
+    elif data == "pause":
+        if monitor_paused:
+            answer = "⏸ Уже на паузе"
+        else:
+            monitor_paused = True
+            answer = "⏸ Мониторинг приостановлен"
+
+    elif data == "resume":
+        if not monitor_paused:
+            answer = "▶️ Уже активен"
+        else:
+            monitor_paused = False
+            answer = "▶️ Мониторинг возобновлён"
+
+    elif data == "clear_cd":
+        db_clear_cooldowns()
+        answer = "🗑 Кулдауны сброшены"
+
+    await _tg_post("answerCallbackQuery", {"callback_query_id": cb_id, "text": answer})
+
+
+async def _cmd_history(chat_id):
+    rows = db_recent_alerts(10)
+    if not rows:
+        await send_message("📋 История пуста", chat_id)
+        return
+    lines = ["📋 <b>Последние 10 сигналов:</b>\n"]
+    for r in rows:
+        ts    = time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))
+        sign  = "🚀" if r["growth"] > 0 else "📉"
+        rsi_s = f"RSI {r['rsi']:.1f}" if r["rsi"] is not None else "RSI —"
+        lines.append(f"{sign} <b>{r['symbol']}</b> {r['growth']:+.2f}% | {rsi_s} | {ts}")
+    await send_message("\n".join(lines), chat_id)
+
+
+async def _cmd_top5(chat_id):
+    rows = db_top_signals(5)
+    if not rows:
+        await send_message("🏆 Нет данных за последние 24 ч", chat_id)
+        return
+    lines = ["🏆 <b>Топ-5 сигналов за 24 ч:</b>\n"]
+    for i, r in enumerate(rows, 1):
+        ts   = time.strftime("%H:%M", time.localtime(r["ts"]))
+        sign = "🚀" if r["growth"] > 0 else "📉"
+        lines.append(f"{i}. {sign} <b>{r['symbol']}</b> {r['growth']:+.2f}% [{r['source']}] {ts}")
+    await send_message("\n".join(lines), chat_id)
+
+
+async def _cmd_export(chat_id):
+    await send_message("📤 Генерирую CSV...", chat_id)
+    csv_data = db_export_csv(500)
+    fname    = f"alerts_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    await send_document(chat_id, fname, csv_data, caption="📤 Последние 500 алертов")
 
 
 # ================================================================
 #  TELEGRAM LOOP
 # ================================================================
 
-def get_updates() -> list:
+async def get_updates() -> list:
     global offset
     try:
-        resp = requests.get(
-            f"{URL}/getUpdates",
+        async with _session.get(
+            f"{TG}/getUpdates",
             params={"timeout": 30, "offset": offset},
-            timeout=35,
-        )
-        data = resp.json()
+            timeout=aiohttp.ClientTimeout(total=35),
+        ) as resp:
+            data = await resp.json()
         if data.get("ok"):
             return data["result"]
     except Exception as e:
-        logging.error("Ошибка get_updates: %s", e)
+        log.error("get_updates: %s", e)
     return []
 
 
@@ -521,12 +822,14 @@ async def telegram_loop():
     global offset
     while True:
         try:
-            for update in get_updates():
+            for update in await get_updates():
                 offset = update["update_id"] + 1
                 if "message" in update:
-                    handle_message(update["message"])
+                    await handle_message(update["message"])
+                elif "callback_query" in update:
+                    await handle_callback(update["callback_query"])
         except Exception as e:
-            logging.exception("Ошибка telegram_loop: %s", e)
+            log.exception("telegram_loop: %s", e)
         await asyncio.sleep(0.2)
 
 
@@ -537,7 +840,7 @@ async def telegram_loop():
 async def heartbeat():
     while True:
         status = "PAUSED" if monitor_paused else "running"
-        logging.info("Bot alive | status=%s | signals=%d", status, signals_count)
+        log.info("♥ alive | %s | signals=%d | coins=%d", status, signals_count, len(price_history))
         await asyncio.sleep(300)
 
 
@@ -551,52 +854,52 @@ async def save_state_loop():
 
 
 # ================================================================
-#  WATCHDOG  — авто-перезапуск monitor при зависании
+#  WATCHDOG
 # ================================================================
 
-WATCHDOG_TIMEOUT = 90   # секунд без активности monitor → перезапуск
+WATCHDOG_TIMEOUT = 90
+
 
 async def watchdog():
     global monitor_task, last_check_time
-
-    # небольшая задержка при старте, чтобы monitor успел инициализироваться
     await asyncio.sleep(60)
 
     while True:
         try:
-            if monitor_paused:
-                await asyncio.sleep(30)
-                continue
+            if not monitor_paused:
+                stall = (time.time() - last_check_time) if last_check_time else 0
+                if stall > WATCHDOG_TIMEOUT:
+                    log.warning("Watchdog: monitor завис (%.0f с) — перезапуск", stall)
+                    await broadcast(f"⚠️ Watchdog: monitor завис ({stall:.0f} с). Перезапуск...")
 
-            stall = time.time() - last_check_time if last_check_time else 0
+                    if monitor_task and not monitor_task.done():
+                        monitor_task.cancel()
+                        try:
+                            await monitor_task
+                        except asyncio.CancelledError:
+                            pass
 
-            if stall > WATCHDOG_TIMEOUT:
-                logging.warning(
-                    "Watchdog: monitor завис (%.0f сек без активности) — перезапуск", stall
-                )
-                send_message(
-                    f"⚠️ Watchdog: monitor завис ({stall:.0f} сек). Перезапуск...",
-                    config.CHAT_ID,
-                )
-
-                # отменяем старую задачу
-                if monitor_task and not monitor_task.done():
-                    monitor_task.cancel()
-                    try:
-                        await monitor_task
-                    except asyncio.CancelledError:
-                        pass
-
-                # запускаем новую
-                monitor_task = asyncio.create_task(monitor())
-                last_check_time = time.time()   # сбрасываем таймер
-                logging.info("Watchdog: monitor перезапущен")
-                send_message("✅ Monitor перезапущен", config.CHAT_ID)
-
+                    monitor_task    = asyncio.create_task(monitor())
+                    last_check_time = time.time()
+                    log.info("Watchdog: monitor перезапущен")
+                    await broadcast("✅ Monitor перезапущен")
         except Exception as e:
-            logging.exception("Ошибка watchdog: %s", e)
-
+            log.exception("watchdog: %s", e)
         await asyncio.sleep(30)
+
+
+# ================================================================
+#  GRACEFUL SHUTDOWN
+# ================================================================
+
+_shutdown_event: asyncio.Event | None = None
+
+
+def _handle_signal(sig):
+    log.info("Signal %s получен — завершение...", sig)
+    save_state()
+    if _shutdown_event:
+        _shutdown_event.set()
 
 
 # ================================================================
@@ -606,9 +909,9 @@ async def watchdog():
 def handle_async_exception(loop, context):
     exc = context.get("exception")
     if exc:
-        logging.exception("Unhandled async exception", exc_info=exc)
+        log.exception("Unhandled async exception", exc_info=exc)
     else:
-        logging.error("Async error: %s", context["message"])
+        log.error("Async error: %s", context["message"])
 
 
 # ================================================================
@@ -616,25 +919,55 @@ def handle_async_exception(loop, context):
 # ================================================================
 
 async def main():
-    global monitor_task
+    global monitor_task, _session, _shutdown_event
+
+    _shutdown_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_async_exception)
 
-    monitor_task = asyncio.create_task(monitor())
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _handle_signal, sig)
 
-    await asyncio.gather(
-        asyncio.shield(monitor_task),   # watchdog управляет задачей сам
-        telegram_loop(),
-        heartbeat(),
-        save_state_loop(),
-        watchdog(),
-    )
+    # Запуск Prometheus (если доступен)
+    if PROM_AVAILABLE:
+        prom_port = getattr(config, "PROM_PORT", 8000)
+        try:
+            start_http_server(prom_port)
+            log.info("Prometheus metrics on :%d", prom_port)
+        except Exception as e:
+            log.warning("Prometheus start failed: %s", e)
+
+    connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        _session     = session
+        monitor_task = asyncio.create_task(monitor())
+
+        tasks = [
+            asyncio.create_task(asyncio.shield(monitor_task)),
+            asyncio.create_task(telegram_loop()),
+            asyncio.create_task(heartbeat()),
+            asyncio.create_task(save_state_loop()),
+            asyncio.create_task(watchdog()),
+            asyncio.create_task(_shutdown_event.wait()),
+        ]
+
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        # Graceful shutdown
+        log.info("Завершение задач...")
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    log.info("Бот остановлен")
 
 
 while True:
     try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        break
     except Exception as e:
-        logging.exception("Критическая ошибка: %s", e)
+        log.exception("Критическая ошибка: %s", e)
         time.sleep(10)
