@@ -33,7 +33,6 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
 import aiohttp
-from aiohttp import web
 import pandas as pd
 from bs4 import BeautifulSoup
 from ta.momentum import RSIIndicator
@@ -493,83 +492,6 @@ async def send_document(chat_id, filename: str, content: str, caption: str = "")
         log.error("sendDocument: %s", e)
 
 
-# ================================================================
-#  BYBIT REDIRECT SERVER
-# ================================================================
-# Railway даёт один публичный порт через переменную PORT.
-# Домен берётся из переменной RAILWAY_PUBLIC_DOMAIN (ставится Railway автоматически)
-# или из REDIRECT_HOST в config.py.
-
-import os as _os
-
-_RAILWAY_DOMAIN: str = _os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-_REDIRECT_HOST: str  = _RAILWAY_DOMAIN or getattr(config, "REDIRECT_HOST", "")
-_REDIRECT_PORT: int  = int(_os.environ.get("PORT", getattr(config, "REDIRECT_PORT", 8080)))
-# https если Railway-домен, иначе http
-_REDIRECT_SCHEME: str = "https" if _RAILWAY_DOMAIN else "http"
-
-
-async def _bybit_redirect(request: web.Request) -> web.Response:
-    """
-    GET /bybit?sym=BTCUSDT
-    Отдаёт HTML-страницу, которая немедленно открывает приложение Bybit
-    через bybit:// deep link, с fallback на сайт.
-    """
-    sym = request.rel_url.query.get("sym", "").upper()
-    if not sym:
-        raise web.HTTPBadRequest(text="sym required")
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Открываю {sym} в Bybit...</title>
-<meta http-equiv="refresh" content="2; url=https://www.bybit.com/trade/usdt/{sym}">
-<script>
-  window.location.href = "bybit://home?symbol={sym}&type=linear";
-  setTimeout(function(){{
-    window.location.href = "https://www.bybit.com/trade/usdt/{sym}";
-  }}, 1500);
-</script>
-</head>
-<body style="font-family:sans-serif;text-align:center;padding-top:60px">
-  <h2>Открываю {sym} в Bybit...</h2>
-  <p>Если приложение не открылось — <a href="https://www.bybit.com/trade/usdt/{sym}">нажми сюда</a></p>
-</body>
-</html>"""
-    return web.Response(text=html, content_type="text/html")
-
-
-async def start_redirect_server():
-    app = web.Application()
-    app.router.add_get("/bybit", _bybit_redirect)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    # Railway требует слушать 0.0.0.0
-    site = web.TCPSite(runner, "0.0.0.0", _REDIRECT_PORT)
-    await site.start()
-    log.info("Redirect server on port %d (domain: %s)", _REDIRECT_PORT, _REDIRECT_HOST or "не задан")
-    while True:
-        await asyncio.sleep(3600)
-
-
-def bybit_markup(sym: str) -> dict:
-    """
-    Inline-кнопка открытия монеты в приложении Bybit через редирект-страницу.
-    На Railway домен подхватывается автоматически из RAILWAY_PUBLIC_DOMAIN.
-    """
-    if not _REDIRECT_HOST:
-        # домен не настроен — просто ссылка на сайт
-        url = f"https://www.bybit.com/trade/usdt/{sym}"
-    else:
-        url = f"{_REDIRECT_SCHEME}://{_REDIRECT_HOST}/bybit?sym={sym}"
-    return {
-        "inline_keyboard": [[
-            {"text": f"📲 Открыть {sym} на Bybit", "url": url}
-        ]]
-    }
-
-
 async def broadcast(text: str, reply_markup=None):
     """Разослать сообщение всем подписчикам."""
     tasks = [send_message(text, cid, reply_markup) for cid in db_get_subscribers()]
@@ -671,6 +593,7 @@ def format_alert(
         f"{accel_s}"
         f"{breakout_s}"
         f"{day_context_s}"
+        f"\n\n📋 <code>{sym}</code>"
     )
 
 
@@ -911,7 +834,7 @@ async def monitor():
                 _alert_cooldown[sym] = now
                 db_save_alert(sym, price, growth, rsi, macd, source)
 
-                await broadcast(text, reply_markup=bybit_markup(sym))
+                await broadcast(text)
                 signals_count += 1
 
                 if PROM_AVAILABLE:
@@ -1322,7 +1245,6 @@ async def main():
             asyncio.create_task(save_state_loop()),
             asyncio.create_task(db_cleanup_loop()),
             asyncio.create_task(watchdog()),
-            asyncio.create_task(start_redirect_server()),
             asyncio.create_task(_shutdown_event.wait()),
         ]
 
