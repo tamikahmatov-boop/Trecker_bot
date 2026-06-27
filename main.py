@@ -121,6 +121,11 @@ def db_init():
 
 db_init()
 
+# ── Настройки хранения (дней) ─────────────────────────────────────────────────
+DB_KEEP_ALERTS_DAYS    = getattr(config, "DB_KEEP_ALERTS_DAYS",    30)   # алерты
+DB_KEEP_LEVELS_DAYS    = getattr(config, "DB_KEEP_LEVELS_DAYS",     7)   # уровни монет
+DB_VACUUM_INTERVAL_H   = getattr(config, "DB_VACUUM_INTERVAL_H",   24)   # VACUUM раз в N часов
+
 
 def db_save_alert(symbol: str, price: float, growth: float,
                   rsi: Optional[float], macd: Optional[float], source: str):
@@ -160,6 +165,62 @@ def db_clear_alert_level(symbol: str):
     """Сброс уровня для одной монеты (при смене направления)."""
     with db_connect() as conn:
         conn.execute("DELETE FROM alert_levels WHERE symbol=?", (symbol,))
+
+
+    """
+    Удаляет устаревшие записи из всех таблиц.
+    Возвращает словарь {таблица: удалено строк}.
+    """
+    now     = time.time()
+    deleted = {}
+    with db_connect() as conn:
+        # alerts старше N дней
+        cutoff_alerts = now - DB_KEEP_ALERTS_DAYS * 86400
+        cur = conn.execute("DELETE FROM alerts WHERE ts < ?", (cutoff_alerts,))
+        deleted["alerts"] = cur.rowcount
+
+        # alert_levels монет которые не обновлялись N дней
+        cutoff_levels = now - DB_KEEP_LEVELS_DAYS * 86400
+        cur = conn.execute("DELETE FROM alert_levels WHERE ts < ?", (cutoff_levels,))
+        deleted["alert_levels"] = cur.rowcount
+
+        # price_stats устаревшие записи (нет смысла хранить дольше суток)
+        cutoff_stats = now - 86400
+        cur = conn.execute("DELETE FROM price_stats WHERE updated < ?", (cutoff_stats,))
+        deleted["price_stats"] = cur.rowcount
+
+    return deleted
+
+
+def db_vacuum():
+    """VACUUM — возвращает место на диске после удалений."""
+    with db_connect() as conn:
+        conn.execute("VACUUM")
+
+
+def db_size_mb() -> float:
+    """Размер файла БД в мегабайтах."""
+    import os
+    try:
+        return os.path.getsize(DB_FILE) / 1_048_576
+    except OSError:
+        return 0.0
+
+
+def db_stats() -> dict:
+    """Статистика таблиц: количество строк и диапазон дат."""
+    with db_connect() as conn:
+        alerts_count = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        oldest = conn.execute("SELECT MIN(ts) FROM alerts").fetchone()[0]
+        levels_count = conn.execute("SELECT COUNT(*) FROM alert_levels").fetchone()[0]
+    oldest_s = time.strftime("%d.%m.%Y", time.localtime(oldest)) if oldest else "—"
+    return {
+        "alerts":       alerts_count,
+        "oldest_alert": oldest_s,
+        "levels":       levels_count,
+        "size_mb":      db_size_mb(),
+    }
+
 
 
 def db_recent_alerts(limit: int = 10) -> list[dict]:
@@ -894,6 +955,34 @@ async def handle_message(msg: dict):
         await send_message("🗑 Уровни алертов сброшены", chat_id)
         return
 
+    if text == "/db_stats":
+        s = db_stats()
+        await send_message(
+            f"🗄 <b>База данных</b>\n\n"
+            f"📋 Алертов: <b>{s['alerts']}</b>\n"
+            f"📅 Старейший: <b>{s['oldest_alert']}</b>\n"
+            f"🪙 Уровней монет: <b>{s['levels']}</b>\n"
+            f"💾 Размер файла: <b>{s['size_mb']:.2f} МБ</b>\n\n"
+            f"⚙️ Хранение алертов: <b>{DB_KEEP_ALERTS_DAYS} дн.</b>\n"
+            f"⚙️ Хранение уровней: <b>{DB_KEEP_LEVELS_DAYS} дн.</b>",
+            chat_id,
+        )
+        return
+
+    if text == "/db_cleanup":
+        deleted = db_cleanup()
+        total   = sum(deleted.values())
+        await send_message(
+            f"🧹 <b>Очистка выполнена</b>\n\n"
+            f"Удалено строк: <b>{total}</b>\n"
+            f"  alerts: {deleted['alerts']}\n"
+            f"  levels: {deleted['alert_levels']}\n"
+            f"  stats:  {deleted['price_stats']}\n\n"
+            f"💾 Размер БД: <b>{db_size_mb():.2f} МБ</b>",
+            chat_id,
+        )
+        return
+
     # ── Произвольный порог: /set_percent 2.5 ─────────────────────────────────
     if text.startswith("/set_percent"):
         try:
@@ -1013,6 +1102,39 @@ async def save_state_loop():
         await asyncio.sleep(30)
 
 
+async def db_cleanup_loop():
+    """
+    Фоновая задача автоочистки БД.
+    Каждые 6 часов удаляет устаревшие строки.
+    Раз в DB_VACUUM_INTERVAL_H часов запускает VACUUM.
+    """
+    last_vacuum = time.time()
+
+    while True:
+        await asyncio.sleep(6 * 3600)   # проверяем каждые 6 часов
+        try:
+            deleted = db_cleanup()
+            total   = sum(deleted.values())
+            stats   = db_stats()
+
+            log.info(
+                "DB cleanup: удалено %d строк %s | размер %.2f МБ | алертов всего %d",
+                total, deleted, stats["size_mb"], stats["alerts"],
+            )
+
+            # VACUUM только если что-то удалили и подошло время
+            now = time.time()
+            if total > 0 and now - last_vacuum >= DB_VACUUM_INTERVAL_H * 3600:
+                log.info("DB VACUUM начат...")
+                await asyncio.get_event_loop().run_in_executor(None, db_vacuum)
+                last_vacuum = now
+                new_size = db_size_mb()
+                log.info("DB VACUUM завершён | размер %.2f МБ", new_size)
+
+        except Exception as e:
+            log.exception("db_cleanup_loop error: %s", e)
+
+
 # ================================================================
 #  WATCHDOG
 # ================================================================
@@ -1104,10 +1226,11 @@ async def main():
         monitor_task = asyncio.create_task(monitor())
 
         tasks = [
-            monitor_task,  # уже Task; watchdog управляет им сам
+            monitor_task,
             asyncio.create_task(telegram_loop()),
             asyncio.create_task(heartbeat()),
             asyncio.create_task(save_state_loop()),
+            asyncio.create_task(db_cleanup_loop()),
             asyncio.create_task(watchdog()),
             asyncio.create_task(_shutdown_event.wait()),
         ]
