@@ -331,6 +331,10 @@ monitor_task:   asyncio.Task | None = None
 # Общая aiohttp-сессия (создаётся в main)
 _session: aiohttp.ClientSession | None = None
 
+# Кулдаун в памяти: symbol → timestamp последнего отправленного алерта
+_alert_cooldown: dict[str, float] = {}
+ALERT_COOLDOWN_SEC: int = getattr(config, "ALERT_COOLDOWN_SEC", 60)
+
 
 def normalize_symbol(sym: str) -> str:
     return sym.upper().replace("-", "").replace("_", "").replace("/", "")
@@ -790,6 +794,12 @@ async def monitor():
                         log.debug("Skip %s: drop but RSI=%.1f > 50", sym, rsi)
                         continue
 
+                # ── Кулдаун в памяти (защита от дублей при быстрых циклах) ──
+                last_sent = _alert_cooldown.get(sym, 0)
+                if now - last_sent < ALERT_COOLDOWN_SEC:
+                    log.debug("Cooldown skip %s (%.0f с назад)", sym, now - last_sent)
+                    continue
+
                 # ── Проверка уровня (повторный алерт) ────────────────────────
                 level = db_get_alert_level(sym)
                 if level:
@@ -818,10 +828,12 @@ async def monitor():
                     breakout=breakout,
                     day_context=day_ctx,
                 )
-                await broadcast(text)
-
-                db_save_alert(sym, price, growth, rsi, macd, source)
+                # Записываем уровень и кулдаун ДО await — защита от race condition
                 db_set_alert_level(sym, price, direction)
+                _alert_cooldown[sym] = now
+                db_save_alert(sym, price, growth, rsi, macd, source)
+
+                await broadcast(text)
                 signals_count += 1
 
                 if PROM_AVAILABLE:
