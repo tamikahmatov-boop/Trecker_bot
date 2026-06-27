@@ -1480,7 +1480,6 @@ async def handle_message(msg: dict):
 
     # ── Настройка порога разворота: /set_reversal_score 3 ────────────────────
     if text.startswith("/set_reversal_score"):
-        global REVERSAL_MIN_SCORE
         try:
             val = int(text.split()[1])
             assert 1 <= val <= 8
