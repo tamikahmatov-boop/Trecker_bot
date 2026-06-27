@@ -495,12 +495,12 @@ async def send_document(chat_id, filename: str, content: str, caption: str = "")
 def bybit_markup(sym: str) -> dict:
     """
     Inline-клавиатура с кнопкой открытия монеты в приложении Bybit.
-    Используем url с universal link — открывает приложение если установлено,
-    иначе браузер.
-    Символ приводим к формату Bybit: BTCUSDT → BTC/USDT (перп) или BTC/USDT (спот).
+    app.bybit.com — официальный universal link, который iOS/Android
+    перехватывают и открывают сразу в приложении Bybit.
     """
-    # Bybit universal link открывает приложение на нужном инструменте
-    url = f"https://www.bybit.com/trade/usdt/{sym}"
+    # Убираем суффикс типа "USDT" чтобы получить базовую пару для URL
+    # app.bybit.com/trade/usdt/BTCUSDT открывает перп-контракт в приложении
+    url = f"https://app.bybit.com/trade/usdt/{sym}"
     return {
         "inline_keyboard": [[
             {"text": f"📲 Открыть {sym} на Bybit", "url": url}
