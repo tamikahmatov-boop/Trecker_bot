@@ -492,6 +492,22 @@ async def send_document(chat_id, filename: str, content: str, caption: str = "")
         log.error("sendDocument: %s", e)
 
 
+def bybit_markup(sym: str) -> dict:
+    """
+    Inline-клавиатура с кнопкой открытия монеты в приложении Bybit.
+    Используем url с universal link — открывает приложение если установлено,
+    иначе браузер.
+    Символ приводим к формату Bybit: BTCUSDT → BTC/USDT (перп) или BTC/USDT (спот).
+    """
+    # Bybit universal link открывает приложение на нужном инструменте
+    url = f"https://www.bybit.com/trade/usdt/{sym}"
+    return {
+        "inline_keyboard": [[
+            {"text": f"📲 Открыть {sym} на Bybit", "url": url}
+        ]]
+    }
+
+
 async def broadcast(text: str, reply_markup=None):
     """Разослать сообщение всем подписчикам."""
     tasks = [send_message(text, cid, reply_markup) for cid in db_get_subscribers()]
@@ -833,7 +849,7 @@ async def monitor():
                 _alert_cooldown[sym] = now
                 db_save_alert(sym, price, growth, rsi, macd, source)
 
-                await broadcast(text)
+                await broadcast(text, reply_markup=bybit_markup(sym))
                 signals_count += 1
 
                 if PROM_AVAILABLE:
