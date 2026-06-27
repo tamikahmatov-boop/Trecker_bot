@@ -1,13 +1,13 @@
 """
-Crypto Alert Bot — v9
-Улучшения vs v8:
-  • aiohttp вместо requests (неблокирующие запросы)
-  • Binance добавлен как 3-й источник цен
+Crypto Alert Bot — v10
+Улучшения vs v9:
+  • Убран Binance — единственные источники цен: MEXC (приоритет) и OKX
+  • RSI считается по реальным kline-свечам MEXC (не по тикам бота) — совпадает с биржей
+  • Кэш kline на 60 с — экономия запросов
   • Параллельный fetch цен (asyncio.gather)
   • WAL-режим SQLite + пул соединений (thread-safe)
   • Таблица price_stats (24h high/low/vol) — новый сигнал по объёму
   • MACD-индикатор — дополнительный фильтр к RSI
-  • Inline-кнопки вместо reply-keyboard (чище, не занимают экран)
   • /set_percent X — произвольный порог без кнопок
   • /set_window X  — произвольный период (в минутах)
   • /top5 — топ-5 монет по силе последнего сигнала
@@ -373,6 +373,67 @@ def normalize_symbol(sym: str) -> str:
 
 
 # ================================================================
+#  MEXC KLINE CACHE  (для точного RSI как на бирже)
+# ================================================================
+
+# {symbol: {"ts": float, "closes": list[float]}}
+_kline_cache: dict[str, dict] = {}
+KLINE_CACHE_TTL = 60   # секунд — обновляем не чаще раза в минуту
+KLINE_LIMIT     = 100  # свечей (RSI-14 + запас)
+
+
+async def _fetch_mexc_klines(symbol: str, interval: str = "Min1") -> list[float]:
+    """
+    Возвращает список цен закрытия (close) последних KLINE_LIMIT свечей с MEXC.
+    interval: Min1 / Min5 / Min15 / Min30 / Min60 / Hour4 / Day1 и т.д.
+    Документация: https://mexcdevelop.github.io/apidocs/contract_v1_en/#k-line-data
+    """
+    try:
+        async with _session.get(
+            "https://contract.mexc.com/api/v1/contract/kline",
+            params={"symbol": symbol, "interval": interval, "limit": KLINE_LIMIT},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as r:
+            data = await r.json()
+        if data.get("success") and data.get("data"):
+            closes = [float(c) for c in data["data"]["close"]]
+            return closes
+    except Exception as e:
+        log.debug("MEXC kline %s: %s", symbol, e)
+    return []
+
+
+async def get_mexc_closes(symbol: str, interval: str = "Min1") -> list[float]:
+    """
+    Возвращает закрытия из кэша (обновляет раз в KLINE_CACHE_TTL секунд).
+    symbol — в формате MEXC: BTC_USDT
+    """
+    now    = time.time()
+    cached = _kline_cache.get(symbol)
+    if cached and now - cached["ts"] < KLINE_CACHE_TTL:
+        return cached["closes"]
+    closes = await _fetch_mexc_klines(symbol, interval)
+    if closes:
+        _kline_cache[symbol] = {"ts": now, "closes": closes}
+    return closes
+
+
+def _to_mexc_symbol(sym: str) -> str:
+    """
+    Конвертирует BTCUSDT → BTC_USDT для MEXC kline API.
+    Работает для большинства USDT-пар.
+    """
+    if sym.endswith("USDT"):
+        return sym[:-4] + "_USDT"
+    if sym.endswith("PERP"):
+        # BTCUSDT_PERP → BTC_USDT (бессрочный фьючерс)
+        base = sym[:-4]
+        if base.endswith("USDT"):
+            return base[:-4] + "_USDT"
+    return sym
+
+
+# ================================================================
 #  INDICATORS
 # ================================================================
 
@@ -380,7 +441,7 @@ def normalize_symbol(sym: str) -> str:
 MIN_SAMPLES = 10
 
 
-def calculate_rsi(prices: list[float], window: int = 5) -> Optional[float]:
+def calculate_rsi(prices: list[float], window: int = 14) -> Optional[float]:
     try:
         if len(prices) < window + 1:
             return None
@@ -392,7 +453,27 @@ def calculate_rsi(prices: list[float], window: int = 5) -> Optional[float]:
         return None
 
 
-def calculate_rsi_trend(prices: list[float], window: int = 5) -> Optional[str]:
+async def get_rsi_from_mexc(symbol: str, window: int = 14) -> Optional[float]:
+    """
+    RSI по реальным 1-минутным свечам MEXC — совпадает с индикатором на бирже.
+    """
+    mexc_sym = _to_mexc_symbol(symbol)
+    closes   = await get_mexc_closes(mexc_sym, interval="Min1")
+    if not closes:
+        return None
+    return calculate_rsi(closes, window=window)
+
+
+async def get_rsi_trend_from_mexc(symbol: str, window: int = 14) -> Optional[str]:
+    """Направление RSI по свечам MEXC: растёт ▲ / падает ▼ / боковик —"""
+    mexc_sym = _to_mexc_symbol(symbol)
+    closes   = await get_mexc_closes(mexc_sym, interval="Min1")
+    if len(closes) < window + 3:
+        return None
+    return calculate_rsi_trend(closes, window=window)
+
+
+def calculate_rsi_trend(prices: list[float], window: int = 14) -> Optional[str]:
     """Направление RSI: растёт ▲ / падает ▼ / боковик —"""
     try:
         if len(prices) < window + 3:
@@ -701,26 +782,6 @@ async def _fetch_mexc(norm: dict) -> tuple[dict, dict]:
     return prices, sources
 
 
-async def _fetch_binance(norm: dict) -> tuple[dict, dict]:
-    prices, sources = {}, {}
-    try:
-        async with _session.get(
-            "https://fapi.binance.com/fapi/v1/ticker/price",
-            timeout=aiohttp.ClientTimeout(total=5),
-        ) as r:
-            data = await r.json()
-        for item in data:
-            sym   = normalize_symbol(item["symbol"])
-            price = float(item["price"])
-            if price > 0 and sym in norm:
-                real = norm[sym]
-                prices[real]  = price
-                sources[real] = "Binance"
-    except Exception as e:
-        log.error("Binance: %s", e)
-    return prices, sources
-
-
 _norm_cache: dict[str, str] = {}
 _norm_symbols_key: frozenset = frozenset()
 
@@ -737,13 +798,12 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
     msrc:   dict = {}
 
     results = await asyncio.gather(
-        _fetch_okx(norm),
         _fetch_mexc(norm),
-        _fetch_binance(norm),
+        _fetch_okx(norm),
         return_exceptions=True,
     )
 
-    # OKX имеет приоритет, Binance заполняет пробелы
+    # MEXC — приоритет, OKX заполняет пробелы
     for res in results:
         if isinstance(res, Exception):
             log.error("Fetch error: %s", res)
@@ -825,9 +885,12 @@ async def monitor():
                         _cache_clear_level(sym)
                     continue
 
-                # ── Фильтр RSI по направлению ─────────────────────────────────
-                vals = [p for _, p in price_history[sym][-100:]]
-                rsi  = calculate_rsi(vals)
+                # ── RSI по реальным свечам MEXC ──────────────────────────────
+                rsi = await get_rsi_from_mexc(sym)
+                # Фallback на локальные тики если MEXC kline недоступен
+                if rsi is None:
+                    vals = [p for _, p in price_history[sym][-100:]]
+                    rsi  = calculate_rsi(vals)
                 if rsi is not None:
                     if direction == 1 and rsi < 50:
                         # Рост, но RSI ниже 50 — сигнал против тренда, пропускаем
@@ -856,8 +919,9 @@ async def monitor():
                     # смена направления → новый алерт
 
                 # ── Вычисляем дополнительный контекст ────────────────────────
+                vals      = [p for _, p in price_history[sym][-100:]]
                 macd      = calculate_macd(vals)
-                rsi_trend = calculate_rsi_trend(vals)
+                rsi_trend = await get_rsi_trend_from_mexc(sym)
                 accel     = calculate_acceleration(recent)
                 duration  = calculate_growth_duration(recent)
                 breakout  = check_24h_breakout(sym, price)
