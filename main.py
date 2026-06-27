@@ -944,7 +944,7 @@ async def main():
         monitor_task = asyncio.create_task(monitor())
 
         tasks = [
-            asyncio.create_task(asyncio.shield(monitor_task)),
+            monitor_task,  # уже Task; watchdog управляет им сам
             asyncio.create_task(telegram_loop()),
             asyncio.create_task(heartbeat()),
             asyncio.create_task(save_state_loop()),
@@ -957,7 +957,8 @@ async def main():
         # Graceful shutdown
         log.info("Завершение задач...")
         for t in pending:
-            t.cancel()
+            if not t.done():
+                t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
 
     log.info("Бот остановлен")
