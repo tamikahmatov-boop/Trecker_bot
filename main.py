@@ -709,6 +709,7 @@ def detect_short_reversal(
     recent:    list[tuple[float, float]],  # тики за текущее окно
     growth:    float,         # текущий рост в % за окно
     rsi:       Optional[float],
+    min_score: int = 3,
 ) -> dict:
     """
     Многофакторный детектор разворота на шорт.
@@ -819,7 +820,7 @@ def detect_short_reversal(
     return {
         "score":       score,
         "factors":     factors,
-        "triggered":   score >= REVERSAL_MIN_SCORE,
+        "triggered":   score >= min_score,
         "rsi":         rsi,
         "stoch_rsi":   stoch_rsi_val,
         "bb_pct":      bb_pct,
@@ -1258,7 +1259,7 @@ async def monitor():
                 if growth >= current_percent * 0.5:  # был хоть какой-то рост
                     last_rev = _reversal_cooldown.get(sym, 0)
                     if now - last_rev >= REVERSAL_COOLDOWN_SEC:
-                        rev = detect_short_reversal(sym, price, closes, recent, growth, rsi)
+                        rev = detect_short_reversal(sym, price, closes, recent, growth, rsi, REVERSAL_MIN_SCORE)
                         if rev["triggered"]:
                             duration  = calculate_growth_duration(recent)
                             day_ctx   = get_24h_context(sym, price)
@@ -1365,7 +1366,7 @@ async def monitor():
 # ================================================================
 
 async def handle_message(msg: dict):
-    global current_percent, current_window, monitor_paused
+    global current_percent, current_window, monitor_paused, REVERSAL_MIN_SCORE
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
