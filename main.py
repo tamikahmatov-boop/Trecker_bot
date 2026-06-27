@@ -335,6 +335,38 @@ _session: aiohttp.ClientSession | None = None
 _alert_cooldown: dict[str, float] = {}
 ALERT_COOLDOWN_SEC: int = getattr(config, "ALERT_COOLDOWN_SEC", 60)
 
+# Кэш уровней в памяти — избегаем SQLite на каждой монете в цикле
+# {symbol: {"alert_price": float, "direction": int}}
+_levels_cache: dict[str, dict] = {}
+
+
+def _cache_load_levels():
+    """Загружает alert_levels из БД в память при старте."""
+    global _levels_cache
+    with db_connect() as conn:
+        rows = conn.execute("SELECT symbol, alert_price, direction FROM alert_levels").fetchall()
+    _levels_cache = {r["symbol"]: {"alert_price": r["alert_price"], "direction": r["direction"]} for r in rows}
+    log.info("Загружено уровней в кэш: %d", len(_levels_cache))
+
+
+def _cache_get_level(symbol: str) -> dict | None:
+    return _levels_cache.get(symbol)
+
+
+def _cache_set_level(symbol: str, alert_price: float, direction: int):
+    _levels_cache[symbol] = {"alert_price": alert_price, "direction": direction}
+    db_set_alert_level(symbol, alert_price, direction)
+
+
+def _cache_clear_level(symbol: str):
+    _levels_cache.pop(symbol, None)
+    db_clear_alert_level(symbol)
+
+
+def _cache_clear_all():
+    _levels_cache.clear()
+    db_clear_alert_levels()
+
 
 def normalize_symbol(sym: str) -> str:
     return sym.upper().replace("-", "").replace("_", "").replace("/", "")
@@ -633,7 +665,7 @@ async def _fetch_okx(norm: dict) -> tuple[dict, dict]:
     try:
         async with _session.get(
             "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
-            timeout=aiohttp.ClientTimeout(total=20),
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as r:
             data = await r.json()
         for item in data.get("data", []):
@@ -653,7 +685,7 @@ async def _fetch_mexc(norm: dict) -> tuple[dict, dict]:
     try:
         async with _session.get(
             "https://contract.mexc.com/api/v1/contract/ticker",
-            timeout=aiohttp.ClientTimeout(total=20),
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as r:
             data = await r.json()
         if data.get("success"):
@@ -674,7 +706,7 @@ async def _fetch_binance(norm: dict) -> tuple[dict, dict]:
     try:
         async with _session.get(
             "https://fapi.binance.com/fapi/v1/ticker/price",
-            timeout=aiohttp.ClientTimeout(total=20),
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as r:
             data = await r.json()
         for item in data:
@@ -689,8 +721,18 @@ async def _fetch_binance(norm: dict) -> tuple[dict, dict]:
     return prices, sources
 
 
+_norm_cache: dict[str, str] = {}
+_norm_symbols_key: frozenset = frozenset()
+
+
 async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
-    norm   = {normalize_symbol(s): s for s in symbols}
+    global _norm_cache, _norm_symbols_key
+    # Пересоздаём norm только если список монет изменился
+    sym_key = frozenset(symbols)
+    if sym_key != _norm_symbols_key:
+        _norm_cache      = {normalize_symbol(s): s for s in symbols}
+        _norm_symbols_key = sym_key
+    norm   = _norm_cache
     merged: dict = {}
     msrc:   dict = {}
 
@@ -724,6 +766,7 @@ async def monitor():
 
     symbols           = await get_symbols()
     last_symbols_upd  = time.time()
+    _cache_load_levels()
 
     await broadcast("✅ <b>Бот запущен</b>")
 
@@ -777,9 +820,9 @@ async def monitor():
                 direction = 1 if growth > 0 else -1
 
                 if abs(growth) < current_percent:
-                    level = db_get_alert_level(sym)
+                    level = _cache_get_level(sym)
                     if level and level["direction"] != direction:
-                        db_clear_alert_level(sym)
+                        _cache_clear_level(sym)
                     continue
 
                 # ── Фильтр RSI по направлению ─────────────────────────────────
@@ -802,7 +845,7 @@ async def monitor():
                     continue
 
                 # ── Проверка уровня (повторный алерт) ────────────────────────
-                level = db_get_alert_level(sym)
+                level = _cache_get_level(sym)
                 if level:
                     prev_price = level["alert_price"]
                     prev_dir   = level["direction"]
@@ -830,7 +873,7 @@ async def monitor():
                     day_context=day_ctx,
                 )
                 # Записываем уровень и кулдаун ДО await — защита от race condition
-                db_set_alert_level(sym, price, direction)
+                _cache_set_level(sym, price, direction)
                 _alert_cooldown[sym] = now
                 db_save_alert(sym, price, growth, rsi, macd, source)
 
@@ -964,7 +1007,7 @@ async def handle_message(msg: dict):
 
     # ── Сброс кулдаунов ───────────────────────────────────────────────────────
     if text in ("🗑 Кулдауны", "/clear_cooldowns"):
-        db_clear_alert_levels()
+        _cache_clear_all()
         await send_message("🗑 Уровни алертов сброшены", chat_id)
         return
 
