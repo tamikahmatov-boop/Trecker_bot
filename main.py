@@ -97,9 +97,11 @@ def db_init():
             CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol);
             CREATE INDEX IF NOT EXISTS idx_alerts_ts     ON alerts(ts);
 
-            CREATE TABLE IF NOT EXISTS cooldowns (
-                symbol TEXT PRIMARY KEY,
-                ts     REAL NOT NULL
+            CREATE TABLE IF NOT EXISTS alert_levels (
+                symbol       TEXT    PRIMARY KEY,
+                alert_price  REAL    NOT NULL,
+                direction    INTEGER NOT NULL,
+                ts           REAL    NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS price_stats (
@@ -130,25 +132,34 @@ def db_save_alert(symbol: str, price: float, growth: float,
         )
 
 
-def db_get_cooldown(symbol: str) -> float:
+def db_get_alert_level(symbol: str) -> Optional[dict]:
+    """Возвращает запись последнего алерта: alert_price, direction."""
     with db_connect() as conn:
         row = conn.execute(
-            "SELECT ts FROM cooldowns WHERE symbol=?", (symbol,)
+            "SELECT alert_price, direction, ts FROM alert_levels WHERE symbol=?", (symbol,)
         ).fetchone()
-    return row["ts"] if row else 0.0
+    return dict(row) if row else None
 
 
-def db_set_cooldown(symbol: str):
+def db_set_alert_level(symbol: str, alert_price: float, direction: int):
+    """Сохраняет цену и направление последнего алерта."""
     with db_connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO cooldowns (symbol, ts) VALUES (?, ?)",
-            (symbol, time.time()),
+            "INSERT OR REPLACE INTO alert_levels (symbol, alert_price, direction, ts) "
+            "VALUES (?, ?, ?, ?)",
+            (symbol, alert_price, direction, time.time()),
         )
 
 
-def db_clear_cooldowns():
+def db_clear_alert_levels():
     with db_connect() as conn:
-        conn.execute("DELETE FROM cooldowns")
+        conn.execute("DELETE FROM alert_levels")
+
+
+def db_clear_alert_level(symbol: str):
+    """Сброс уровня для одной монеты (при смене направления)."""
+    with db_connect() as conn:
+        conn.execute("DELETE FROM alert_levels WHERE symbol=?", (symbol,))
 
 
 def db_recent_alerts(limit: int = 10) -> list[dict]:
@@ -574,14 +585,30 @@ async def monitor():
                 if old_price <= 0:
                     continue
 
-                growth = (price - old_price) / old_price * 100
+                growth    = (price - old_price) / old_price * 100
+                direction = 1 if growth > 0 else -1
 
                 if abs(growth) < current_percent:
+                    # Цена вернулась в нейтральную зону — сбрасываем уровень,
+                    # чтобы следующий выход за порог снова сработал
+                    level = db_get_alert_level(sym)
+                    if level and level["direction"] != direction:
+                        db_clear_alert_level(sym)
                     continue
 
-                # антиспам
-                if now - db_get_cooldown(sym) < config.COOLDOWN:
-                    continue
+                # ── Проверка: нужен ли новый алерт? ──────────────────────────
+                level = db_get_alert_level(sym)
+                if level:
+                    prev_price = level["alert_price"]
+                    prev_dir   = level["direction"]
+
+                    if prev_dir == direction:
+                        # То же направление: алерт только если цена пробила
+                        # следующий порог относительно цены предыдущего алерта
+                        step = abs(price - prev_price) / prev_price * 100
+                        if step < current_percent:
+                            continue   # монета не доросла до следующего уровня
+                    # Смена направления → сбрасываем и даём новый алерт
 
                 vals   = [p for _, p in price_history[sym][-100:]]
                 rsi    = calculate_rsi(vals)
@@ -592,7 +619,7 @@ async def monitor():
                 await broadcast(text)
 
                 db_save_alert(sym, price, growth, rsi, macd, source)
-                db_set_cooldown(sym)
+                db_set_alert_level(sym, price, direction)
                 signals_count += 1
 
                 if PROM_AVAILABLE:
@@ -722,8 +749,8 @@ async def handle_message(msg: dict):
 
     # ── Сброс кулдаунов ───────────────────────────────────────────────────────
     if text in ("🗑 Кулдауны", "/clear_cooldowns"):
-        db_clear_cooldowns()
-        await send_message("🗑 Кулдауны сброшены", chat_id)
+        db_clear_alert_levels()
+        await send_message("🗑 Уровни алертов сброшены", chat_id)
         return
 
     # ── Произвольный порог: /set_percent 2.5 ─────────────────────────────────
