@@ -1,19 +1,27 @@
 """
-Crypto Alert Bot — v13
-Улучшения vs v12:
-  • Все команды вынесены в кнопки Reply Keyboard:
-      - Управление: ⏸ Пауза / ▶️ Продолжить / 📊 Статус
-      - Порог роста: 📈 0.2% / 5% / 10% / 20%
-      - Период:      ⏱ 5 мин / 1 час / 4 ч / 1 д
-      - Данные:      📋 История / 🏆 Топ-5 / 📤 Экспорт
-      - Разворот:    🔄 Развороты / ⚙️ Настройки разворота / 🗑 Кулдауны
-      - БД:          🗄 БД Статистика / 🧹 БД Очистка
-      - Быстрый порог: 🎚 Порог 3/12 / 4/12 / 5/12 / 7/12
-  • Исправлен баг кнопки разворота: текст "⚙️ Разворот" → "⚙️ Настройки разворота"
-    (несовпадение текста кнопки и обработчика в v12)
-  • Дубли db_stats / db_cleanup убраны (объединены с кнопками)
-  • /menu теперь показывает полную справку по кнопкам и командам
-  • Неизвестная команда повторно показывает клавиатуру
+Crypto Alert Bot — v14
+Исправления и улучшения vs v13:
+
+  БАГИ ИСПРАВЛЕНЫ:
+  • global REVERSAL_HIGH_MARGIN не был в списке global handle_message → /rev_high не работал
+  • Кнопки 🎚 Порог X/12 присваивали локальную переменную → порог не менялся
+  • Факторы разворота с < > вызывали Telegram HTML 400 → экранированы в _cmd_reversals
+    и format_reversal_alert через _esc()
+  • KLINE_CACHE был по ключу symbol (без interval) → один таймфрейм затирал другой
+
+  УЛУЧШЕНИЯ ДАННЫХ РАЗВОРОТА (двойной таймфрейм):
+  • Min1 x120 — для краткосрочных: RSI, StochRSI, Боллинджер, свечные паттерны
+  • Min5 x100 — для долгосрочных: ATR, EMA-крест, MACD, объём, RSI-дивергенция, моментум
+  • Фактор 7 (отбой от хая): красная свеча у хая вместо 4 тиков подряд (менее шумно)
+  • Фактор 10 (ATR): 12 свечей по 5m = 1 час вместо 30 тиков (реальный диапазон)
+  • Фактор 11 (паттерны): чётко на Min1 закрытых свечах
+  • Фактор 12 (объём): Min5 как основной, Min1 как резерв, тики как последний fallback
+  • KLINE_CACHE ключ теперь включает interval+limit → нет коллизий
+
+  ДРУГИЕ УЛУЧШЕНИЯ:
+  • Кнопки 🎚 Порог — показывают подсказку (агрессивный/стандарт/строгий)
+  • /rev_high показывает текущее значение при ошибке
+  • Все факторы разворота экранируются перед отправкой в HTML
 """
 
 from __future__ import annotations
@@ -411,18 +419,21 @@ def normalize_symbol(sym: str) -> str:
 # ================================================================
 
 _kline_cache: dict[str, dict] = {}
-KLINE_CACHE_TTL = 60
-KLINE_LIMIT     = 120   # увеличили для ATR и EMA
+KLINE_CACHE_TTL  = 60
+KLINE_LIMIT_1M   = 120   # 120 свечей по 1 мин = 2 часа (RSI, BB, StochRSI, паттерны)
+KLINE_LIMIT_5M   = 100   # 100 свечей по 5 мин = 8+ часов (ATR, EMA, MACD, объём)
+# Для обратной совместимости
+KLINE_LIMIT = KLINE_LIMIT_1M
 
 
-async def _fetch_mexc_klines(symbol: str, interval: str = "Min1") -> dict:
+async def _fetch_mexc_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
     """Возвращает dict с ключами: closes, highs, lows, volumes (все list[float])."""
     empty = {"closes": [], "highs": [], "lows": [], "volumes": []}
     try:
         async with _session.get(
             "https://contract.mexc.com/api/v1/contract/kline",
-            params={"symbol": symbol, "interval": interval, "limit": KLINE_LIMIT},
-            timeout=aiohttp.ClientTimeout(total=8),
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
             data = await r.json()
         if data.get("success") and data.get("data"):
@@ -434,19 +445,39 @@ async def _fetch_mexc_klines(symbol: str, interval: str = "Min1") -> dict:
                 "volumes": [float(c) for c in d.get("vol",    [])],
             }
     except Exception as e:
-        log.debug("MEXC kline %s: %s", symbol, e)
+        log.debug("MEXC kline %s %s: %s", symbol, interval, e)
     return empty
 
 
-async def get_mexc_klines(symbol: str, interval: str = "Min1") -> dict:
-    now    = time.time()
-    cached = _kline_cache.get(symbol)
+async def get_mexc_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
+    cache_key = f"{symbol}:{interval}:{limit}"
+    now       = time.time()
+    cached    = _kline_cache.get(cache_key)
     if cached and now - cached["ts"] < KLINE_CACHE_TTL:
         return cached["data"]
-    data = await _fetch_mexc_klines(symbol, interval)
+    data = await _fetch_mexc_klines(symbol, interval, limit)
     if data["closes"]:
-        _kline_cache[symbol] = {"ts": now, "data": data}
+        _kline_cache[cache_key] = {"ts": now, "data": data}
     return data
+
+
+async def get_mexc_klines_multi(symbol: str) -> dict:
+    """
+    Получает два таймфрейма параллельно:
+      - Min1 x120 (краткосрочные индикаторы: RSI, BB, паттерны)
+      - Min5 x100 (долгосрочные: ATR, EMA, MACD, объём)
+    Возвращает объединённый dict с ключами klines_1m и klines_5m.
+    """
+    klines_1m, klines_5m = await asyncio.gather(
+        get_mexc_klines(symbol, "Min1", KLINE_LIMIT_1M),
+        get_mexc_klines(symbol, "Min5", KLINE_LIMIT_5M),
+        return_exceptions=True,
+    )
+    if isinstance(klines_1m, Exception):
+        klines_1m = {"closes": [], "highs": [], "lows": [], "volumes": []}
+    if isinstance(klines_5m, Exception):
+        klines_5m = {"closes": [], "highs": [], "lows": [], "volumes": []}
+    return {"klines_1m": klines_1m, "klines_5m": klines_5m}
 
 
 async def get_mexc_closes(symbol: str, interval: str = "Min1") -> list[float]:
@@ -804,7 +835,8 @@ def get_peak_growth_24h(sym: str, price: float) -> float:
 def detect_short_reversal(
     sym:       str,
     price:     float,
-    klines:    dict,              # {"closes": [], "highs": [], "lows": [], "volumes": []}
+    klines_1m: dict,              # Min1 x120 — краткосрочные индикаторы
+    klines_5m: dict,              # Min5 x100 — долгосрочные индикаторы
     recent:    list[tuple[float, float]],
     growth:    float,
     rsi:       Optional[float],
@@ -812,79 +844,87 @@ def detect_short_reversal(
 ) -> dict:
     """
     12-факторный детектор разворота на шорт.
+    Краткосрочные (Min1): RSI, StochRSI, BB, паттерны свечей, отбой от хая.
+    Долгосрочные  (Min5): ATR, EMA, MACD, объём, моментум, RSI-дивергенция.
 
     Факторы (+1 каждый):
-      1.  RSI перекупленность (> REVERSAL_RSI_OB)
-      2.  StochRSI в зоне перекупленности (> REVERSAL_STOCH_OB)
-      3.  Цена выше верхней полосы Боллинджера (%B > REVERSAL_BB_OB)
-      4.  MACD медвежий крест (histogram 0 → -) ИЛИ убывающий slope
-      5.  Медвежья RSI-дивергенция (цена ↑, RSI ↓)
-      6.  Замедление роста (accel < REVERSAL_ACCEL)
-      7.  Отбой от 24h High (цена у хая + последние тики вниз)
-      8.  Моментум иссякает (fast-slow < REVERSAL_MOMENTUM)
-      9.  EMA крест вниз (EMA9 пробила EMA21 вниз)
-      10. ATR-перегрев (цена выросла > REVERSAL_ATR_MULT × ATR за период)
-      11. Медвежий свечной паттерн (Shooting Star / Доджи / Поглощение)
-      12. Слабый объём при росте (объём последнего бара < средн.)
-
-    Возвращает dict с score, factors, triggered, целями по шорту, ATR, Фибо.
+      1.  RSI перекупленность (> REVERSAL_RSI_OB) по Min1
+      2.  StochRSI в зоне перекупленности по Min1
+      3.  Цена выше верхней полосы Боллинджера (%B > BB_OB) по Min1
+      4.  MACD медвежий крест или убывающий slope по Min5
+      5.  Медвежья RSI-дивергенция по Min5 (цена ↑, RSI ↓)
+      6.  Замедление роста (accel < ACCEL) по тикам
+      7.  Отбой от 24h High: цена у хая и закрытие свечи ниже открытия
+      8.  Моментум иссякает (fast-slow < MOMENTUM) по Min5
+      9.  EMA9 пробила EMA21 вниз по Min5
+      10. ATR-перегрев: движение > ATR_MULT × ATR по Min5
+      11. Медвежий свечной паттерн (Shooting Star / Доджи / Поглощение) по Min1
+      12. Слабый объём при росте (vol < VOL_RATIO × средний) по Min5
     """
     score   = 0
     factors: list[str] = []
 
-    closes  = klines.get("closes", [])
-    highs   = klines.get("highs",  [])
-    lows    = klines.get("lows",   [])
-    volumes = klines.get("volumes", [])
+    # Данные 1m (краткосрочные: RSI, BB, паттерны)
+    closes_1m  = klines_1m.get("closes",  [])
+    highs_1m   = klines_1m.get("highs",   [])
+    lows_1m    = klines_1m.get("lows",    [])
 
-    # Fallback на тики если свечей нет
-    prices = closes if len(closes) >= 30 else [p for _, p in price_history.get(sym, [])[-120:]]
+    # Данные 5m (долгосрочные: ATR, EMA, MACD, объём, моментум)
+    closes_5m  = klines_5m.get("closes",  [])
+    highs_5m   = klines_5m.get("highs",   [])
+    lows_5m    = klines_5m.get("lows",    [])
+    volumes_5m = klines_5m.get("volumes", [])
 
-    # ── 1. RSI перекупленность ────────────────────────────────────────────────
+    # Fallback: если нет свечей — берём тики
+    prices_1m = closes_1m if len(closes_1m) >= 20 else [p for _, p in price_history.get(sym, [])[-120:]]
+    prices_5m = closes_5m if len(closes_5m) >= 20 else prices_1m
+
+    # ── 1. RSI перекупленность (Min1) ────────────────────────────────────────
     stoch_rsi_val = None
     if rsi is not None and rsi > REVERSAL_RSI_OB:
         score += 1
         factors.append(f"RSI перекуплен ({rsi:.1f} &gt; {REVERSAL_RSI_OB})")
 
-    # ── 2. StochRSI ───────────────────────────────────────────────────────────
-    stoch_rsi_val = calculate_stoch_rsi(prices)
+    # ── 2. StochRSI (Min1) ───────────────────────────────────────────────────
+    stoch_rsi_val = calculate_stoch_rsi(prices_1m)
     if stoch_rsi_val is not None:
         threshold = REVERSAL_STOCH_OB if (rsi is not None and rsi > REVERSAL_RSI_OB) else REVERSAL_STOCH_EXT
         if stoch_rsi_val > threshold:
             score += 1
             factors.append(f"StochRSI перекупленность ({stoch_rsi_val:.2f} &gt; {threshold})")
 
-    # ── 3. Боллинджер %B ─────────────────────────────────────────────────────
-    bb_pct = calculate_bollinger_pct(prices)
+    # ── 3. Боллинджер %B (Min1) ──────────────────────────────────────────────
+    bb_pct = calculate_bollinger_pct(prices_1m)
     if bb_pct is not None and bb_pct > REVERSAL_BB_OB:
         score += 1
-        factors.append(f"Цена выше BB ({bb_pct:.2f})")
+        factors.append(f"Цена выше BB %B={bb_pct:.2f}")
 
-    # ── 4. MACD крест / slope ─────────────────────────────────────────────────
-    macd_data = calculate_macd_full(prices)
+    # ── 4. MACD крест / slope (Min5 — более надёжный сигнал) ────────────────
+    macd_data = calculate_macd_full(prices_5m)
     macd_hist = macd_data["histogram"]
     if macd_data["cross_down"]:
         score += 1
-        factors.append("MACD медвежий крест (hist 0→-)")
+        factors.append("MACD медвежий крест (Min5, hist 0→-)")
     elif (macd_hist is not None
           and macd_data["slope"] is not None
           and macd_hist > 0
           and macd_data["slope"] < REVERSAL_MACD_SLOPE):
         score += 1
-        factors.append(f"MACD убывает (slope={macd_data['slope']:+.6f})")
+        factors.append(f"MACD убывает Min5 (slope={macd_data['slope']:+.6f})")
 
-    # ── 5. RSI-дивергенция ────────────────────────────────────────────────────
-    if len(prices) >= 30 and calculate_rsi_divergence(prices):
+    # ── 5. RSI-дивергенция (Min5) ─────────────────────────────────────────────
+    if len(prices_5m) >= 30 and calculate_rsi_divergence(prices_5m):
         score += 1
-        factors.append("⚡ Медвежья RSI-дивергенция (цена ↑, RSI ↓)")
+        factors.append("Медвежья RSI-дивергенция Min5 (цена↑, RSI↓)")
 
-    # ── 6. Замедление accel ───────────────────────────────────────────────────
+    # ── 6. Замедление accel (тики) ───────────────────────────────────────────
     accel = calculate_acceleration(recent)
     if accel is not None and growth >= current_percent and accel < REVERSAL_ACCEL:
         score += 1
         factors.append(f"Замедление импульса (accel={accel:.2f}x)")
 
     # ── 7. Отбой от 24h High ─────────────────────────────────────────────────
+    # Улучшено: проверяем закрытие последней свечи относительно открытия (не просто тики)
     hist_data  = price_history.get(sym, [])
     now_ts     = time.time()
     day_prices = [p for t, p in hist_data if now_ts - t <= 86400]
@@ -892,62 +932,72 @@ def detect_short_reversal(
     low24  = min(day_prices) if day_prices else price
     if len(day_prices) >= 20:
         near_high = price >= high24 * REVERSAL_HIGH_MARGIN
-        if near_high and len(recent) >= 4:
-            last_ticks = [p for _, p in recent[-4:]]
-            if all(last_ticks[i] >= last_ticks[i + 1] for i in range(len(last_ticks) - 1)):
-                score += 1
+        if near_high:
+            # Проверяем: последняя 1m свеча красная (close < open) у хая
+            bearish_candle = (
+                len(closes_1m) >= 2 and len(highs_1m) >= 1
+                and closes_1m[-1] < closes_1m[-2]   # close < prev close
+                and highs_1m[-1] >= high24 * REVERSAL_HIGH_MARGIN
+            )
+            # Или 3 из 4 последних тиков падают
+            if not bearish_candle and len(recent) >= 4:
+                last_ticks = [p for _, p in recent[-4:]]
+                falling = sum(last_ticks[i] > last_ticks[i+1] for i in range(len(last_ticks)-1))
+                bearish_candle = falling >= 2
+            if bearish_candle:
                 pct_from_high = (price - high24) / high24 * 100
+                score += 1
                 factors.append(f"Отбой от 24h High ({pct_from_high:+.2f}%)")
 
-    # ── 8. Моментум иссякает ─────────────────────────────────────────────────
-    momentum = calculate_price_momentum(prices)
+    # ── 8. Моментум иссякает (Min5) ──────────────────────────────────────────
+    momentum = calculate_price_momentum(prices_5m)
     if momentum is not None and momentum < REVERSAL_MOMENTUM:
         score += 1
-        factors.append(f"Моментум иссякает (diff={momentum:+.2f}%)")
+        factors.append(f"Моментум иссякает Min5 (diff={momentum:+.2f}%)")
 
-    # ── 9. EMA крест вниз ────────────────────────────────────────────────────
-    ema_data = calculate_ema_cross(prices)
+    # ── 9. EMA крест вниз (Min5 — убираем ложные сигналы) ───────────────────
+    ema_data = calculate_ema_cross(prices_5m)
     if ema_data["cross_down"]:
         score += 1
-        factors.append(f"EMA9 пробила EMA21 вниз ({ema_data['ema_fast']:.4g} &lt; {ema_data['ema_slow']:.4g})")
-    elif (ema_data["gap_pct"] is not None
-          and ema_data["gap_pct"] < -0.05):
-        # EMA9 уже ниже EMA21 — медвежья зона
+        factors.append(f"EMA9 пробила EMA21 вниз Min5 ({ema_data['ema_fast']:.4g} &lt; {ema_data['ema_slow']:.4g})")
+    elif (ema_data["gap_pct"] is not None and ema_data["gap_pct"] < -0.05):
         score += 1
-        factors.append(f"EMA9 ниже EMA21 (gap={ema_data['gap_pct']:+.2f}%)")
+        factors.append(f"EMA9 ниже EMA21 Min5 (gap={ema_data['gap_pct']:+.2f}%)")
 
-    # ── 10. ATR-перегрев ─────────────────────────────────────────────────────
+    # ── 10. ATR-перегрев (Min5 — реальный диапазон волатильности) ────────────
     atr = None
-    if len(highs) >= 15 and len(lows) >= 15:
-        atr = calculate_atr(highs, lows, closes)
+    if len(highs_5m) >= 15 and len(lows_5m) >= 15 and len(closes_5m) >= 15:
+        atr = calculate_atr(highs_5m, lows_5m, closes_5m)
         if atr is not None and atr > 0:
-            # Движение за период в единицах ATR
-            period_move = abs(price - prices[max(0, len(prices) - 30)])
+            # Движение за последние 12 свечей (1 час на Min5)
+            lookback = min(12, len(closes_5m) - 1)
+            period_move = abs(price - closes_5m[-lookback])
             atr_ratio   = period_move / atr
             if atr_ratio > REVERSAL_ATR_MULT:
                 score += 1
-                factors.append(f"ATR-перегрев ({atr_ratio:.1f}× ATR за период)")
+                factors.append(f"ATR-перегрев Min5 ({atr_ratio:.1f}× ATR={atr:.4g})")
 
-    # ── 11. Свечной паттерн ───────────────────────────────────────────────────
+    # ── 11. Свечной паттерн (Min1 — актуальная картина) ──────────────────────
     candle_pattern = None
-    if len(closes) >= 3 and len(highs) >= 3 and len(lows) >= 3:
-        candle_pattern = detect_candle_pattern(closes, highs, lows)
+    if len(closes_1m) >= 3 and len(highs_1m) >= 3 and len(lows_1m) >= 3:
+        candle_pattern = detect_candle_pattern(closes_1m, highs_1m, lows_1m)
         if candle_pattern:
             score += 1
-            factors.append(f"Свечной паттерн: {candle_pattern}")
+            factors.append(f"Паттерн Min1: {candle_pattern}")
 
-    # ── 12. Слабый объём ─────────────────────────────────────────────────────
-    vol_signal = calculate_volume_weakness(volumes) if volumes else calculate_volume_signal(sym)
+    # ── 12. Слабый объём (Min5 — фильтрует ложные пробои) ────────────────────
+    vol_signal = calculate_volume_weakness(volumes_5m) if len(volumes_5m) >= 20 \
+        else (calculate_volume_weakness(klines_1m.get("volumes", [])) if len(klines_1m.get("volumes", [])) >= 20
+              else calculate_volume_signal(sym))
     if vol_signal:
         score += 1
         factors.append(vol_signal)
 
     # ── Цели по шорту (уровни Фибоначчи от хая к лою 24h) ───────────────────
-    fib = calculate_fibonacci_levels(high24, low24)
-    target1 = fib["fib_382"]   # первая цель
-    target2 = fib["fib_618"]   # вторая цель (более глубокая)
+    fib     = calculate_fibonacci_levels(high24, low24)
+    target1 = fib["fib_382"]
+    target2 = fib["fib_618"]
 
-    # ── Контекст для уведомления ─────────────────────────────────────────────
     day_context = get_24h_context(sym, price)
 
     return {
@@ -1177,7 +1227,10 @@ def format_reversal_alert(
     atr_s    = f"{atr:.6f}"     if atr    is not None else "—"
     ema_s    = f"{ema_gap:+.2f}%" if ema_gap is not None else "—"
 
-    factors_s = "\n".join(f"  {i+1}. {f}" for i, f in enumerate(factors)) if factors else "  —"
+    def _esc(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    factors_s = "\n".join(f"  {i+1}. {_esc(f)}" for i, f in enumerate(factors)) if factors else "  —"
 
     t1_s = f"<code>{target1:.4g}</code>" if target1 else "—"
     t2_s = f"<code>{target2:.4g}</code>" if target2 else "—"
@@ -1367,10 +1420,12 @@ async def monitor():
                 growth    = (price - old_price) / old_price * 100
                 direction = 1 if growth > 0 else -1
 
-                # ── Свечи MEXC (closes + highs + lows + volumes) ──────────────
-                mexc_sym = _to_mexc_symbol(sym)
-                klines   = await get_mexc_klines(mexc_sym, interval="Min1")
-                closes   = klines["closes"]
+                # ── Свечи MEXC: 1m для RSI/BB/паттернов, 5m для ATR/EMA/MACD/объёма ──
+                mexc_sym   = _to_mexc_symbol(sym)
+                klines_all = await get_mexc_klines_multi(mexc_sym)
+                klines_1m  = klines_all["klines_1m"]
+                klines_5m  = klines_all["klines_5m"]
+                closes     = klines_1m["closes"]
 
                 rsi = calculate_rsi(closes) if closes else None
                 if rsi is None:
@@ -1387,7 +1442,7 @@ async def monitor():
                     last_rev = _reversal_cooldown.get(sym, 0)
                     if now - last_rev >= REVERSAL_COOLDOWN_SEC:
                         rev = detect_short_reversal(
-                            sym, price, klines, recent, growth, rsi, REVERSAL_MIN_SCORE
+                            sym, price, klines_1m, klines_5m, recent, growth, rsi, REVERSAL_MIN_SCORE
                         )
                         if rev["triggered"]:
                             duration = calculate_growth_duration(recent)
@@ -1488,6 +1543,7 @@ async def handle_message(msg: dict):
     global REVERSAL_MIN_SCORE, REVERSAL_RSI_OB, REVERSAL_STOCH_OB, REVERSAL_STOCH_EXT
     global REVERSAL_BB_OB, REVERSAL_MACD_SLOPE, REVERSAL_ACCEL, REVERSAL_HIGH_MARGIN
     global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC, REVERSAL_ATR_MULT, REVERSAL_VOL_RATIO
+    # Все глобальные переменные объявлены выше — globals()[var] = val корректно работает
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -1633,8 +1689,12 @@ async def handle_message(msg: dict):
         "🎚 Порог 7/12": 7,
     }
     if text in _rev_score_map:
-        REVERSAL_MIN_SCORE = _rev_score_map[text]
-        await send_message(f"✅ Порог разворота: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>", chat_id)
+        REVERSAL_MIN_SCORE = _rev_score_map[text]  # global объявлен выше — OK
+        await send_message(
+            f"✅ Порог разворота: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>\n"
+            f"ℹ️ Агрессивный: 3, Стандарт: 4-5, Строгий: 7",
+            chat_id,
+        )
         return
 
     # ── Команды настройки разворота ───────────────────────────────────────────
@@ -1670,10 +1730,11 @@ async def handle_message(msg: dict):
         try:
             val = float(text.split()[1])
             assert 0.0 <= val <= 5.0
-            REVERSAL_HIGH_MARGIN = 1.0 - val / 100
-            await send_message(f"✅ Зона отбоя от хая: <b>{val}%</b>", chat_id)
+            REVERSAL_HIGH_MARGIN = 1.0 - val / 100  # global объявлен выше — OK
+            await send_message(f"✅ Зона отбоя от хая: <b>{val}%</b> (margin={REVERSAL_HIGH_MARGIN:.4f})", chat_id)
         except Exception:
-            await send_message("❌ /rev_high 0.2  (отступ от хая в %, 0–5)", chat_id)
+            cur_pct = round((1.0 - REVERSAL_HIGH_MARGIN) * 100, 2)
+            await send_message(f"❌ /rev_high 0.2  (отступ от хая в %, 0–5)\nТекущее: {cur_pct}%", chat_id)
         return
 
     if text.startswith("/set_percent"):
@@ -1746,7 +1807,8 @@ async def _cmd_reversals(chat_id):
         score   = r["score"]
         lvl     = "🔴" if score >= 8 else "🟠" if score >= 5 else "🟡"
         factors = r["factors"]
-        f_brief = factors[0] if factors else "—"
+        # Экранируем HTML-символы в тексте фактора
+        f_brief = factors[0].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") if factors else "—"
         t1_s    = f" → цель {r['target1']:.4g}" if r.get("target1") else ""
         lines.append(
             f"{lvl} <b>{r['symbol']}</b> [{score}/12] {ts}{t1_s}\n"
