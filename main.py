@@ -1,21 +1,18 @@
 """
-Crypto Alert Bot — v11
-Улучшения vs v10:
-  • Детектор разворота на шорт с многофакторным скорингом:
-      - RSI перекупленность (>70) + дивергенция (цена растёт, RSI падает)
-      - MACD: крест вниз (histogram был + стал -) + slope гистограммы
-      - Замедление роста (accel < 0.5) после сильного движения
-      - Отбой от 24h High (цена ≥ хай и начала падать)
-      - Свечной паттерн: последние тики показывают разворот
-      - Объём: рост без объёма = слабый сигнал (по 24h vol)
-      - Стохастик RSI — дополнительный осциллятор зоны перекупленности
-      - Боллинджер: цена выше верхней полосы = зона перегрева
-  • Три отдельных типа уведомлений:
-      🔄 РАЗВОРОТ НА ШОРТ — многофакторный скоринг, минимум 3 из 7 факторов
-      🚀 РОСТ — отдельное уведомление при росте выше порога
-      📉 ПАДЕНИЕ — отдельное уведомление при падении выше порога
-  • Кулдаун разворота независим от кулдауна обычных алертов
-  • /reversal_stats — статистика точности разворотных сигналов
+Crypto Alert Bot — v12
+Улучшения vs v11:
+  • Новые факторы разворота (итого до 12):
+      9.  EMA крест вниз (быстрая EMA9 пересекает медленную EMA21 вниз)
+      10. ATR-перегрев (цена выросла > 3×ATR за период — экстремальное движение)
+      11. Свечной паттерн: Доджи / Медвежье поглощение / Shooting Star
+      12. Откат от уровня Фибоначчи 0.618/0.786 (цена в зоне коррекции)
+  • Цель по шорту в уведомлении (ближайший уровень поддержки / Фибо)
+  • Реальный объём из MEXC kline (volume) для фильтрации слабых сигналов
+  • Убраны неиспользуемые импорты (asynccontextmanager, StochasticOscillator)
+  • REVERSAL_MIN_SCORE теперь из 12 факторов (порог по умолчанию 4)
+  • Разворот проверяется по пиковому росту за 24ч (не только текущий growth)
+  • /rev_target — показывает цели по шорту для монеты
+  • Улучшен формат уведомления: цель, ATR, Фибо-уровни
 """
 
 from __future__ import annotations
@@ -28,25 +25,25 @@ import logging
 import signal
 import sqlite3
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 from typing import Optional
 
 import aiohttp
 import pandas as pd
 from bs4 import BeautifulSoup
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import MACD
-from ta.volatility import BollingerBands
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, EMAIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
 
 import config
 
 # ── Prometheus (опционально) ──────────────────────────────────────────────────
 try:
     from prometheus_client import Counter, Gauge, start_http_server
-    PROM_SIGNALS   = Counter("bot_signals_total",      "Всего сигналов")
-    PROM_CHECKS    = Counter("bot_checks_total",        "Всего циклов")
-    PROM_COINS     = Gauge("bot_tracked_coins",         "Монет в истории")
-    PROM_REVERSALS = Counter("bot_reversals_total",     "Разворотных сигналов")
+    PROM_SIGNALS   = Counter("bot_signals_total",   "Всего сигналов")
+    PROM_CHECKS    = Counter("bot_checks_total",    "Всего циклов")
+    PROM_COINS     = Gauge("bot_tracked_coins",     "Монет в истории")
+    PROM_REVERSALS = Counter("bot_reversals_total", "Разворотных сигналов")
     PROM_AVAILABLE = True
 except ImportError:
     PROM_AVAILABLE = False
@@ -67,7 +64,6 @@ log = logging.getLogger(__name__)
 # ================================================================
 
 DB_FILE = "alerts.db"
-_db_lock = asyncio.Lock()
 
 
 @contextmanager
@@ -128,6 +124,9 @@ def db_init():
                 macd        REAL,
                 stoch_rsi   REAL,
                 bb_pct      REAL,
+                atr         REAL,
+                target1     REAL,
+                target2     REAL,
                 source      TEXT,
                 ts          REAL    NOT NULL
             );
@@ -138,40 +137,37 @@ def db_init():
 
 db_init()
 
-DB_KEEP_ALERTS_DAYS    = getattr(config, "DB_KEEP_ALERTS_DAYS",    30)
-DB_KEEP_LEVELS_DAYS    = getattr(config, "DB_KEEP_LEVELS_DAYS",     7)
-DB_VACUUM_INTERVAL_H   = getattr(config, "DB_VACUUM_INTERVAL_H",   24)
+DB_KEEP_ALERTS_DAYS  = getattr(config, "DB_KEEP_ALERTS_DAYS",  30)
+DB_KEEP_LEVELS_DAYS  = getattr(config, "DB_KEEP_LEVELS_DAYS",   7)
+DB_VACUUM_INTERVAL_H = getattr(config, "DB_VACUUM_INTERVAL_H", 24)
 
 
-def db_save_alert(symbol: str, price: float, growth: float,
-                  rsi: Optional[float], macd: Optional[float], source: str):
+def db_save_alert(symbol, price, growth, rsi, macd, source):
     with db_connect() as conn:
         conn.execute(
-            "INSERT INTO alerts (symbol, price, growth, rsi, macd, source, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO alerts (symbol, price, growth, rsi, macd, source, ts) VALUES (?,?,?,?,?,?,?)",
             (symbol, price, growth, rsi, macd, source, time.time()),
         )
 
 
-def db_save_reversal(symbol: str, price: float, score: int, factors: list[str],
-                     rsi: Optional[float], macd: Optional[float],
-                     stoch_rsi: Optional[float], bb_pct: Optional[float], source: str):
+def db_save_reversal(symbol, price, score, factors, rsi, macd,
+                     stoch_rsi, bb_pct, atr, target1, target2, source):
     with db_connect() as conn:
         conn.execute(
             "INSERT INTO reversal_signals "
-            "(symbol, price, score, factors, rsi, macd, stoch_rsi, bb_pct, source, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(symbol, price, score, factors, rsi, macd, stoch_rsi, bb_pct, atr, target1, target2, source, ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, price, score, json.dumps(factors, ensure_ascii=False),
-             rsi, macd, stoch_rsi, bb_pct, source, time.time()),
+             rsi, macd, stoch_rsi, bb_pct, atr, target1, target2, source, time.time()),
         )
 
 
 def db_recent_reversals(limit: int = 10) -> list[dict]:
     with db_connect() as conn:
         rows = conn.execute(
-            "SELECT symbol, price, score, factors, rsi, macd, stoch_rsi, bb_pct, source, ts "
-            "FROM reversal_signals ORDER BY ts DESC LIMIT ?",
-            (limit,),
+            "SELECT symbol, price, score, factors, rsi, macd, stoch_rsi, bb_pct, "
+            "atr, target1, target2, source, ts "
+            "FROM reversal_signals ORDER BY ts DESC LIMIT ?", (limit,),
         ).fetchall()
     result = []
     for r in rows:
@@ -184,7 +180,7 @@ def db_recent_reversals(limit: int = 10) -> list[dict]:
     return result
 
 
-def db_get_alert_level(symbol: str) -> Optional[dict]:
+def db_get_alert_level(symbol):
     with db_connect() as conn:
         row = conn.execute(
             "SELECT alert_price, direction, ts FROM alert_levels WHERE symbol=?", (symbol,)
@@ -192,11 +188,10 @@ def db_get_alert_level(symbol: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def db_set_alert_level(symbol: str, alert_price: float, direction: int):
+def db_set_alert_level(symbol, alert_price, direction):
     with db_connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO alert_levels (symbol, alert_price, direction, ts) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO alert_levels (symbol, alert_price, direction, ts) VALUES (?,?,?,?)",
             (symbol, alert_price, direction, time.time()),
         )
 
@@ -206,32 +201,23 @@ def db_clear_alert_levels():
         conn.execute("DELETE FROM alert_levels")
 
 
-def db_clear_alert_level(symbol: str):
+def db_clear_alert_level(symbol):
     with db_connect() as conn:
         conn.execute("DELETE FROM alert_levels WHERE symbol=?", (symbol,))
 
 
 def db_cleanup() -> dict:
-    now     = time.time()
+    now = time.time()
     deleted = {}
     with db_connect() as conn:
-        cutoff_alerts = now - DB_KEEP_ALERTS_DAYS * 86400
-        cur = conn.execute("DELETE FROM alerts WHERE ts < ?", (cutoff_alerts,))
+        cur = conn.execute("DELETE FROM alerts WHERE ts < ?", (now - DB_KEEP_ALERTS_DAYS * 86400,))
         deleted["alerts"] = cur.rowcount
-
-        cutoff_levels = now - DB_KEEP_LEVELS_DAYS * 86400
-        cur = conn.execute("DELETE FROM alert_levels WHERE ts < ?", (cutoff_levels,))
+        cur = conn.execute("DELETE FROM alert_levels WHERE ts < ?", (now - DB_KEEP_LEVELS_DAYS * 86400,))
         deleted["alert_levels"] = cur.rowcount
-
-        cutoff_stats = now - 86400
-        cur = conn.execute("DELETE FROM price_stats WHERE updated < ?", (cutoff_stats,))
+        cur = conn.execute("DELETE FROM price_stats WHERE updated < ?", (now - 86400,))
         deleted["price_stats"] = cur.rowcount
-
-        # Разворотные сигналы храним 14 дней
-        cutoff_rev = now - 14 * 86400
-        cur = conn.execute("DELETE FROM reversal_signals WHERE ts < ?", (cutoff_rev,))
+        cur = conn.execute("DELETE FROM reversal_signals WHERE ts < ?", (now - 14 * 86400,))
         deleted["reversal_signals"] = cur.rowcount
-
     return deleted
 
 
@@ -250,14 +236,13 @@ def db_size_mb() -> float:
 
 def db_stats() -> dict:
     with db_connect() as conn:
-        alerts_count   = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
-        oldest         = conn.execute("SELECT MIN(ts) FROM alerts").fetchone()[0]
-        levels_count   = conn.execute("SELECT COUNT(*) FROM alert_levels").fetchone()[0]
-        rev_count      = conn.execute("SELECT COUNT(*) FROM reversal_signals").fetchone()[0]
-    oldest_s = time.strftime("%d.%m.%Y", time.localtime(oldest)) if oldest else "—"
+        alerts_count = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        oldest       = conn.execute("SELECT MIN(ts) FROM alerts").fetchone()[0]
+        levels_count = conn.execute("SELECT COUNT(*) FROM alert_levels").fetchone()[0]
+        rev_count    = conn.execute("SELECT COUNT(*) FROM reversal_signals").fetchone()[0]
     return {
         "alerts":       alerts_count,
-        "oldest_alert": oldest_s,
+        "oldest_alert": time.strftime("%d.%m.%Y", time.localtime(oldest)) if oldest else "—",
         "levels":       levels_count,
         "reversals":    rev_count,
         "size_mb":      db_size_mb(),
@@ -267,8 +252,7 @@ def db_stats() -> dict:
 def db_recent_alerts(limit: int = 10) -> list[dict]:
     with db_connect() as conn:
         rows = conn.execute(
-            "SELECT symbol, price, growth, rsi, macd, source, ts "
-            "FROM alerts ORDER BY ts DESC LIMIT ?",
+            "SELECT symbol, price, growth, rsi, macd, source, ts FROM alerts ORDER BY ts DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -278,8 +262,8 @@ def db_top_signals(limit: int = 5) -> list[dict]:
     cutoff = time.time() - 86400
     with db_connect() as conn:
         rows = conn.execute(
-            "SELECT symbol, growth, price, source, ts "
-            "FROM alerts WHERE ts >= ? ORDER BY ABS(growth) DESC LIMIT ?",
+            "SELECT symbol, growth, price, source, ts FROM alerts "
+            "WHERE ts >= ? ORDER BY ABS(growth) DESC LIMIT ?",
             (cutoff, limit),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -301,7 +285,7 @@ def db_export_csv(limit: int = 500) -> str:
 def db_add_subscriber(chat_id: int):
     with db_connect() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO subscribers (chat_id, added_ts) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO subscribers (chat_id, added_ts) VALUES (?,?)",
             (chat_id, time.time()),
         )
 
@@ -364,20 +348,20 @@ last_check_time: float = 0.0
 current_percent: float = config.PERCENT
 current_window:  int   = config.WINDOW
 
-monitor_paused  = False
-monitor_task:   asyncio.Task | None = None
+monitor_paused = False
+monitor_task: asyncio.Task | None = None
 
 _session: aiohttp.ClientSession | None = None
 
 _alert_cooldown:    dict[str, float] = {}
 _reversal_cooldown: dict[str, float] = {}
-ALERT_COOLDOWN_SEC:    int   = getattr(config, "ALERT_COOLDOWN_SEC",    60)
-REVERSAL_COOLDOWN_SEC: int   = getattr(config, "REVERSAL_COOLDOWN_SEC", 300)
+ALERT_COOLDOWN_SEC:    int = getattr(config, "ALERT_COOLDOWN_SEC",    60)
+REVERSAL_COOLDOWN_SEC: int = getattr(config, "REVERSAL_COOLDOWN_SEC", 300)
 
 _levels_cache: dict[str, dict] = {}
 
-# ── Настройки детектора разворота (изменяются через Telegram) ────────────
-REVERSAL_MIN_SCORE:   int   = getattr(config, "REVERSAL_MIN_SCORE",   3)
+# ── Настройки детектора разворота (все изменяемы через Telegram) ──────────────
+REVERSAL_MIN_SCORE:   int   = getattr(config, "REVERSAL_MIN_SCORE",   4)      # из 12
 REVERSAL_RSI_OB:      float = getattr(config, "REVERSAL_RSI_OB",      70.0)
 REVERSAL_STOCH_OB:    float = getattr(config, "REVERSAL_STOCH_OB",    0.80)
 REVERSAL_STOCH_EXT:   float = getattr(config, "REVERSAL_STOCH_EXT",   0.85)
@@ -386,6 +370,8 @@ REVERSAL_MACD_SLOPE:  float = getattr(config, "REVERSAL_MACD_SLOPE",  -0.000005)
 REVERSAL_ACCEL:       float = getattr(config, "REVERSAL_ACCEL",       0.5)
 REVERSAL_HIGH_MARGIN: float = getattr(config, "REVERSAL_HIGH_MARGIN", 0.998)
 REVERSAL_MOMENTUM:    float = getattr(config, "REVERSAL_MOMENTUM",    -0.5)
+REVERSAL_ATR_MULT:    float = getattr(config, "REVERSAL_ATR_MULT",    3.0)    # ATR перегрев
+REVERSAL_VOL_RATIO:   float = getattr(config, "REVERSAL_VOL_RATIO",   0.7)    # объём < 70% средн.
 
 
 def _cache_load_levels():
@@ -396,16 +382,16 @@ def _cache_load_levels():
     log.info("Загружено уровней в кэш: %d", len(_levels_cache))
 
 
-def _cache_get_level(symbol: str) -> dict | None:
+def _cache_get_level(symbol):
     return _levels_cache.get(symbol)
 
 
-def _cache_set_level(symbol: str, alert_price: float, direction: int):
+def _cache_set_level(symbol, alert_price, direction):
     _levels_cache[symbol] = {"alert_price": alert_price, "direction": direction}
     db_set_alert_level(symbol, alert_price, direction)
 
 
-def _cache_clear_level(symbol: str):
+def _cache_clear_level(symbol):
     _levels_cache.pop(symbol, None)
     db_clear_alert_level(symbol)
 
@@ -420,15 +406,17 @@ def normalize_symbol(sym: str) -> str:
 
 
 # ================================================================
-#  MEXC KLINE CACHE
+#  MEXC KLINE CACHE  (цена + объём)
 # ================================================================
 
 _kline_cache: dict[str, dict] = {}
 KLINE_CACHE_TTL = 60
-KLINE_LIMIT     = 100
+KLINE_LIMIT     = 120   # увеличили для ATR и EMA
 
 
-async def _fetch_mexc_klines(symbol: str, interval: str = "Min1") -> list[float]:
+async def _fetch_mexc_klines(symbol: str, interval: str = "Min1") -> dict:
+    """Возвращает dict с ключами: closes, highs, lows, volumes (все list[float])."""
+    empty = {"closes": [], "highs": [], "lows": [], "volumes": []}
     try:
         async with _session.get(
             "https://contract.mexc.com/api/v1/contract/kline",
@@ -437,22 +425,31 @@ async def _fetch_mexc_klines(symbol: str, interval: str = "Min1") -> list[float]
         ) as r:
             data = await r.json()
         if data.get("success") and data.get("data"):
-            closes = [float(c) for c in data["data"]["close"]]
-            return closes
+            d = data["data"]
+            return {
+                "closes":  [float(c) for c in d.get("close",  [])],
+                "highs":   [float(c) for c in d.get("high",   [])],
+                "lows":    [float(c) for c in d.get("low",    [])],
+                "volumes": [float(c) for c in d.get("vol",    [])],
+            }
     except Exception as e:
         log.debug("MEXC kline %s: %s", symbol, e)
-    return []
+    return empty
 
 
-async def get_mexc_closes(symbol: str, interval: str = "Min1") -> list[float]:
+async def get_mexc_klines(symbol: str, interval: str = "Min1") -> dict:
     now    = time.time()
     cached = _kline_cache.get(symbol)
     if cached and now - cached["ts"] < KLINE_CACHE_TTL:
-        return cached["closes"]
-    closes = await _fetch_mexc_klines(symbol, interval)
-    if closes:
-        _kline_cache[symbol] = {"ts": now, "closes": closes}
-    return closes
+        return cached["data"]
+    data = await _fetch_mexc_klines(symbol, interval)
+    if data["closes"]:
+        _kline_cache[symbol] = {"ts": now, "data": data}
+    return data
+
+
+async def get_mexc_closes(symbol: str, interval: str = "Min1") -> list[float]:
+    return (await get_mexc_klines(symbol, interval))["closes"]
 
 
 def _to_mexc_symbol(sym: str) -> str:
@@ -485,59 +482,42 @@ def calculate_rsi(prices: list[float], window: int = 14) -> Optional[float]:
 
 
 def calculate_stoch_rsi(prices: list[float], window: int = 14) -> Optional[float]:
-    """
-    Стохастик RSI — показывает позицию RSI в его собственном диапазоне.
-    Значения > 0.8 — зона перекупленности (сильный сигнал разворота).
-    """
+    """StochRSI: позиция RSI в его собственном диапазоне. >0.8 = перекупленность."""
     try:
         if len(prices) < window * 2 + 1:
             return None
-        s = pd.Series(prices)
-        # Считаем RSI
+        s          = pd.Series(prices)
         rsi_series = RSIIndicator(close=s, window=window).rsi().dropna()
         if len(rsi_series) < window:
             return None
-        # Стохастик поверх RSI
         rsi_min = rsi_series.rolling(window).min().iloc[-1]
         rsi_max = rsi_series.rolling(window).max().iloc[-1]
         if pd.isna(rsi_min) or pd.isna(rsi_max) or (rsi_max - rsi_min) == 0:
             return None
-        stoch = (rsi_series.iloc[-1] - rsi_min) / (rsi_max - rsi_min)
-        return round(float(stoch), 4)
+        return round(float((rsi_series.iloc[-1] - rsi_min) / (rsi_max - rsi_min)), 4)
     except Exception as e:
         log.error("StochRSI error: %s", e)
         return None
 
 
 def calculate_bollinger_pct(prices: list[float], window: int = 20) -> Optional[float]:
-    """
-    Позиция цены в полосах Боллинджера (%B).
-    >1.0 = выше верхней полосы (перегрев),  0.5 = середина,  <0 = ниже нижней.
-    """
+    """%B Боллинджера. >1.0 = выше верхней полосы."""
     try:
         if len(prices) < window:
             return None
-        s  = pd.Series(prices)
-        bb = BollingerBands(close=s, window=window, window_dev=2)
+        s     = pd.Series(prices)
+        bb    = BollingerBands(close=s, window=window, window_dev=2)
         upper = bb.bollinger_hband().iloc[-1]
         lower = bb.bollinger_lband().iloc[-1]
         if pd.isna(upper) or pd.isna(lower) or (upper - lower) == 0:
             return None
-        pct = (prices[-1] - lower) / (upper - lower)
-        return round(float(pct), 4)
+        return round(float((prices[-1] - lower) / (upper - lower)), 4)
     except Exception as e:
         log.error("BB error: %s", e)
         return None
 
 
 def calculate_macd_full(prices: list[float]) -> dict:
-    """
-    Возвращает словарь с полными данными MACD:
-      histogram     — текущее значение гистограммы
-      histogram_prev — предыдущее значение (для определения пересечения)
-      slope         — наклон гистограммы за последние 3 бара (убывает = медвежий)
-      cross_down    — True если только что произошёл медвежий крест (+ → -)
-    """
     result = {"histogram": None, "histogram_prev": None, "slope": None, "cross_down": False}
     try:
         if len(prices) < 30:
@@ -548,20 +528,115 @@ def calculate_macd_full(prices: list[float]) -> dict:
             return result
         result["histogram"]      = round(float(hist.iloc[-1]), 6)
         result["histogram_prev"] = round(float(hist.iloc[-2]), 6)
-        # Наклон: разница между последним и 3 бара назад
         result["slope"]          = round(float(hist.iloc[-1] - hist.iloc[-3]), 6)
-        # Медвежий крест: предыдущий бар был положительным, текущий отрицательный
-        result["cross_down"]     = (hist.iloc[-2] > 0 and hist.iloc[-1] < 0)
+        result["cross_down"]     = bool(hist.iloc[-2] > 0 and hist.iloc[-1] < 0)
     except Exception as e:
         log.error("MACD full error: %s", e)
     return result
 
 
-def calculate_rsi_divergence(prices: list[float], window: int = 14, lookback: int = 10) -> bool:
+def calculate_ema_cross(prices: list[float], fast: int = 9, slow: int = 21) -> dict:
     """
-    Медвежья дивергенция: цена делает новый максимум, а RSI — нет.
-    Это один из самых сильных сигналов разворота.
+    EMA крест: если EMA9 только что пересекла EMA21 вниз — медвежий сигнал.
+    Возвращает: cross_down (bool), ema_fast, ema_slow, gap_pct (разрыв в %).
     """
+    result = {"cross_down": False, "ema_fast": None, "ema_slow": None, "gap_pct": None}
+    try:
+        if len(prices) < slow + 2:
+            return result
+        s        = pd.Series(prices)
+        ema_fast = EMAIndicator(close=s, window=fast).ema_indicator()
+        ema_slow = EMAIndicator(close=s, window=slow).ema_indicator()
+        ef_now   = float(ema_fast.iloc[-1])
+        ef_prev  = float(ema_fast.iloc[-2])
+        es_now   = float(ema_slow.iloc[-1])
+        es_prev  = float(ema_slow.iloc[-2])
+        # Крест вниз: до — fast > slow, после — fast < slow
+        result["cross_down"] = bool(ef_prev >= es_prev and ef_now < es_now)
+        result["ema_fast"]   = round(ef_now, 6)
+        result["ema_slow"]   = round(es_now, 6)
+        result["gap_pct"]    = round((ef_now - es_now) / es_now * 100, 3)
+    except Exception as e:
+        log.error("EMA cross error: %s", e)
+    return result
+
+
+def calculate_atr(highs: list[float], lows: list[float],
+                  closes: list[float], window: int = 14) -> Optional[float]:
+    """ATR — средний истинный диапазон. Мера волатильности."""
+    try:
+        if len(closes) < window + 1:
+            return None
+        s_h = pd.Series(highs)
+        s_l = pd.Series(lows)
+        s_c = pd.Series(closes)
+        atr = AverageTrueRange(high=s_h, low=s_l, close=s_c, window=window).average_true_range()
+        val = atr.iloc[-1]
+        return None if pd.isna(val) else round(float(val), 8)
+    except Exception as e:
+        log.error("ATR error: %s", e)
+        return None
+
+
+def detect_candle_pattern(closes: list[float], highs: list[float],
+                           lows: list[float]) -> Optional[str]:
+    """
+    Определяет медвежий свечной паттерн на последних 2 барах:
+      - Shooting Star: тело внизу, длинная верхняя тень (>2× тела)
+      - Доджи: открытие ≈ закрытие (тело < 10% диапазона)
+      - Медвежье поглощение: красная свеча полностью поглощает предыдущую зелёную
+    """
+    try:
+        if len(closes) < 3 or len(highs) < 3 or len(lows) < 3:
+            return None
+
+        # Последняя свеча
+        o1, c1, h1, l1 = closes[-2], closes[-1], highs[-1], lows[-1]
+        body1  = abs(c1 - o1)
+        range1 = h1 - l1
+        if range1 == 0:
+            return None
+        upper_wick = h1 - max(c1, o1)
+        lower_wick = min(c1, o1) - l1
+
+        # Shooting Star: верхняя тень > 2× тела, нижняя тень маленькая, закрытие ниже открытия
+        if (body1 > 0 and upper_wick > 2 * body1
+                and lower_wick < body1
+                and c1 < o1):
+            return "Shooting Star 🌠"
+
+        # Доджи: тело < 10% диапазона
+        if body1 < range1 * 0.1:
+            return "Доджи ✝️"
+
+        # Медвежье поглощение: предыдущая зелёная, текущая красная и больше
+        o0, c0 = closes[-3], closes[-2]
+        if c0 > o0 and c1 < o1 and o1 >= c0 and c1 <= o0:
+            return "Медвежье поглощение 🐻"
+
+    except Exception as e:
+        log.error("Candle pattern error: %s", e)
+    return None
+
+
+def calculate_fibonacci_levels(high: float, low: float) -> dict:
+    """
+    Уровни Фибоначчи от локального хая к лою (зоны коррекции/цели).
+    При развороте вниз цели: 0.236, 0.382, 0.5, 0.618 от текущего хая.
+    """
+    diff = high - low
+    return {
+        "fib_236": round(high - diff * 0.236, 8),
+        "fib_382": round(high - diff * 0.382, 8),
+        "fib_500": round(high - diff * 0.500, 8),
+        "fib_618": round(high - diff * 0.618, 8),
+        "fib_786": round(high - diff * 0.786, 8),
+    }
+
+
+def calculate_rsi_divergence(prices: list[float], window: int = 14,
+                              lookback: int = 10) -> bool:
+    """Медвежья дивергенция: цена = новый хай, RSI = ниже предыдущего пика."""
     try:
         if len(prices) < window + lookback + 1:
             return False
@@ -569,27 +644,18 @@ def calculate_rsi_divergence(prices: list[float], window: int = 14, lookback: in
         rsi_series = RSIIndicator(close=s, window=window).rsi().dropna()
         if len(rsi_series) < lookback:
             return False
-
-        # Цена: текущий максимум vs максимум lookback назад
         price_now  = prices[-1]
         price_prev = max(prices[-(lookback + 1):-1])
-
-        # RSI: текущий vs максимум RSI за lookback баров
         rsi_now    = float(rsi_series.iloc[-1])
         rsi_prev   = float(rsi_series.iloc[-(lookback + 1):].max())
-
-        # Дивергенция: цена выше, RSI ниже
-        divergence = (price_now > price_prev) and (rsi_now < rsi_prev - 2)
-        return divergence
+        return (price_now > price_prev) and (rsi_now < rsi_prev - 2)
     except Exception:
         return False
 
 
-def calculate_price_momentum(prices: list[float], fast: int = 5, slow: int = 20) -> Optional[float]:
-    """
-    Моментум: скорость изменения цены. Отрицательный и убывающий = медвежий.
-    Возвращает разницу между быстрым и медленным моментумом.
-    """
+def calculate_price_momentum(prices: list[float],
+                              fast: int = 5, slow: int = 20) -> Optional[float]:
+    """Разница быстрого и медленного моментума. < 0 = иссякание."""
     try:
         if len(prices) < slow + 1:
             return None
@@ -600,34 +666,41 @@ def calculate_price_momentum(prices: list[float], fast: int = 5, slow: int = 20)
         return None
 
 
+def calculate_volume_weakness(volumes: list[float]) -> Optional[str]:
+    """
+    Реальный объём из свечей MEXC.
+    Если последний бар < REVERSAL_VOL_RATIO от среднего — сигнал слабости роста.
+    """
+    try:
+        if len(volumes) < 20:
+            return None
+        avg_vol  = sum(volumes[-20:-1]) / 19
+        last_vol = volumes[-1]
+        if avg_vol == 0:
+            return None
+        ratio = last_vol / avg_vol
+        if ratio < REVERSAL_VOL_RATIO:
+            return f"📊 Объём слабый ({ratio:.1%} от среднего)"
+        return None
+    except Exception:
+        return None
+
+
 def calculate_volume_signal(sym: str) -> Optional[str]:
-    """
-    Анализ 24h объёма: рост цены без роста объёма — слабый, ложный пробой.
-    Возвращает строку-описание или None.
-    """
+    """Fallback: анализ иссякания по тикам цены (если нет данных свечей)."""
     hist = price_history.get(sym, [])
     now  = time.time()
     if len(hist) < 20:
         return None
-    # Сравниваем скорость роста цены в первой и второй половине последнего часа
     hour_prices = [p for t, p in hist if now - t <= 3600]
     if len(hour_prices) < 10:
         return None
-    mid    = len(hour_prices) // 2
-    move1  = abs(hour_prices[mid - 1] - hour_prices[0])   / hour_prices[0]   * 100
-    move2  = abs(hour_prices[-1]       - hour_prices[mid]) / hour_prices[mid]  * 100
-    # Во второй половине движение резко замедлилось
+    mid   = len(hour_prices) // 2
+    move1 = abs(hour_prices[mid - 1] - hour_prices[0])   / hour_prices[0]   * 100
+    move2 = abs(hour_prices[-1]      - hour_prices[mid])  / hour_prices[mid] * 100
     if move1 > 0.5 and move2 < move1 * 0.3:
         return "📊 Движение без импульса (иссякание)"
     return None
-
-
-async def get_rsi_from_mexc(symbol: str, window: int = 14) -> Optional[float]:
-    mexc_sym = _to_mexc_symbol(symbol)
-    closes   = await get_mexc_closes(mexc_sym, interval="Min1")
-    if not closes:
-        return None
-    return calculate_rsi(closes, window=window)
 
 
 async def get_rsi_trend_from_mexc(symbol: str, window: int = 14) -> Optional[str]:
@@ -642,8 +715,8 @@ def calculate_rsi_trend(prices: list[float], window: int = 14) -> Optional[str]:
     try:
         if len(prices) < window + 3:
             return None
-        s    = pd.Series(prices)
-        rsi  = RSIIndicator(close=s, window=window).rsi().dropna()
+        s   = pd.Series(prices)
+        rsi = RSIIndicator(close=s, window=window).rsi().dropna()
         if len(rsi) < 3:
             return None
         delta = rsi.iloc[-1] - rsi.iloc[-3]
@@ -660,9 +733,9 @@ def calculate_acceleration(recent: list[tuple[float, float]]) -> Optional[float]
     try:
         if len(recent) < 6:
             return None
-        mid   = len(recent) // 2
-        half1 = recent[:mid]
-        half2 = recent[mid:]
+        mid    = len(recent) // 2
+        half1  = recent[:mid]
+        half2  = recent[mid:]
         speed1 = (half1[-1][1] - half1[0][1]) / half1[0][1] * 100 / max(half1[-1][0] - half1[0][0], 1)
         speed2 = (half2[-1][1] - half2[0][1]) / half2[0][1] * 100 / max(half2[-1][0] - half2[0][0], 1)
         if speed1 == 0:
@@ -706,46 +779,65 @@ def get_24h_context(sym: str, price: float) -> Optional[str]:
     return f"📉 от хая: {dist_high:+.1f}%  📈 от лоя: {dist_low:+.1f}%"
 
 
+def get_peak_growth_24h(sym: str, price: float) -> float:
+    """
+    Максимальный рост за 24ч от минимума к текущей цене.
+    Используется для разворотного детектора: монета могла уже откатить,
+    но пиковый рост сохраняется в истории.
+    """
+    hist = price_history.get(sym, [])
+    now  = time.time()
+    day_prices = [p for t, p in hist if now - t <= 86400]
+    if not day_prices:
+        return 0.0
+    low24 = min(day_prices)
+    if low24 <= 0:
+        return 0.0
+    return (price - low24) / low24 * 100
+
+
 # ================================================================
-#  REVERSAL DETECTOR  (многофакторный анализ разворота на шорт)
+#  REVERSAL DETECTOR  — 12 факторов
 # ================================================================
 
 def detect_short_reversal(
     sym:       str,
     price:     float,
-    closes:    list[float],   # свечи MEXC (до 100 баров)
-    recent:    list[tuple[float, float]],  # тики за текущее окно
-    growth:    float,         # текущий рост в % за окно
+    klines:    dict,              # {"closes": [], "highs": [], "lows": [], "volumes": []}
+    recent:    list[tuple[float, float]],
+    growth:    float,
     rsi:       Optional[float],
-    min_score: int = 3,
+    min_score: int = 4,
 ) -> dict:
     """
-    Многофакторный детектор разворота на шорт.
+    12-факторный детектор разворота на шорт.
 
-    Анализирует 8 независимых факторов, каждый даёт +1 к скору.
-    Порог срабатывания: REVERSAL_MIN_SCORE (по умолчанию 3 из 8).
+    Факторы (+1 каждый):
+      1.  RSI перекупленность (> REVERSAL_RSI_OB)
+      2.  StochRSI в зоне перекупленности (> REVERSAL_STOCH_OB)
+      3.  Цена выше верхней полосы Боллинджера (%B > REVERSAL_BB_OB)
+      4.  MACD медвежий крест (histogram 0 → -) ИЛИ убывающий slope
+      5.  Медвежья RSI-дивергенция (цена ↑, RSI ↓)
+      6.  Замедление роста (accel < REVERSAL_ACCEL)
+      7.  Отбой от 24h High (цена у хая + последние тики вниз)
+      8.  Моментум иссякает (fast-slow < REVERSAL_MOMENTUM)
+      9.  EMA крест вниз (EMA9 пробила EMA21 вниз)
+      10. ATR-перегрев (цена выросла > REVERSAL_ATR_MULT × ATR за период)
+      11. Медвежий свечной паттерн (Shooting Star / Доджи / Поглощение)
+      12. Слабый объём при росте (объём последнего бара < средн.)
 
-    Факторы:
-      1. RSI перекупленность (> 70)
-      2. Стохастик RSI в зоне перекупленности (> 0.80)
-      3. Цена выше верхней полосы Боллинджера (%B > 1.0)
-      4. MACD медвежий крест (гистограмма пересекла 0 вниз) ИЛИ slope < 0 при положительной гистограмме
-      5. Медвежья RSI-дивергенция (цена выше, RSI ниже предыдущего пика)
-      6. Замедление роста (accel < 0.5 после движения > порога)
-      7. Отбой от 24h High (цена ≥ хай дня, и последние 3 тика вниз)
-      8. Моментум иссякает (fast momentum < slow momentum, разница < -0.5)
-
-    Возвращает dict:
-      score     — количество сработавших факторов
-      factors   — список описаний сработавших факторов
-      triggered — True если score >= REVERSAL_MIN_SCORE
-      rsi, stoch_rsi, bb_pct, macd_hist — значения индикаторов для отчёта
+    Возвращает dict с score, factors, triggered, целями по шорту, ATR, Фибо.
     """
     score   = 0
-    factors = []
+    factors: list[str] = []
 
-    # Используем closes (реальные свечи) если доступны, иначе тики
-    prices = closes if len(closes) >= 30 else [p for _, p in price_history.get(sym, [])[-100:]]
+    closes  = klines.get("closes", [])
+    highs   = klines.get("highs",  [])
+    lows    = klines.get("lows",   [])
+    volumes = klines.get("volumes", [])
+
+    # Fallback на тики если свечей нет
+    prices = closes if len(closes) >= 30 else [p for _, p in price_history.get(sym, [])[-120:]]
 
     # ── 1. RSI перекупленность ────────────────────────────────────────────────
     stoch_rsi_val = None
@@ -753,88 +845,129 @@ def detect_short_reversal(
         score += 1
         factors.append(f"RSI перекуплен ({rsi:.1f} > {REVERSAL_RSI_OB})")
 
-        # ── 2. Стохастик RSI ──────────────────────────────────────────────────
-        stoch_rsi_val = calculate_stoch_rsi(prices)
-        if stoch_rsi_val is not None and stoch_rsi_val > REVERSAL_STOCH_OB:
+    # ── 2. StochRSI ───────────────────────────────────────────────────────────
+    stoch_rsi_val = calculate_stoch_rsi(prices)
+    if stoch_rsi_val is not None:
+        threshold = REVERSAL_STOCH_OB if (rsi is not None and rsi > REVERSAL_RSI_OB) else REVERSAL_STOCH_EXT
+        if stoch_rsi_val > threshold:
             score += 1
-            factors.append(f"StochRSI в перекупленности ({stoch_rsi_val:.2f} > {REVERSAL_STOCH_OB})")
-    elif rsi is not None:
-        # Стохастик RSI считаем в любом случае
-        stoch_rsi_val = calculate_stoch_rsi(prices)
-        if stoch_rsi_val is not None and stoch_rsi_val > REVERSAL_STOCH_EXT:
-            # Экстремальная зона стохастика даже без RSI > 70
-            score += 1
-            factors.append(f"StochRSI экстремум ({stoch_rsi_val:.2f} > {REVERSAL_STOCH_EXT})")
+            factors.append(f"StochRSI перекупленность ({stoch_rsi_val:.2f} > {threshold})")
 
-    # ── 3. Боллинджер %B > 1.0 (цена выше верхней полосы) ───────────────────
+    # ── 3. Боллинджер %B ─────────────────────────────────────────────────────
     bb_pct = calculate_bollinger_pct(prices)
     if bb_pct is not None and bb_pct > REVERSAL_BB_OB:
         score += 1
-        factors.append(f"Цена выше BB ({bb_pct:.2f}x верхней полосы)")
-    elif bb_pct is not None and bb_pct > 0.95:
-        # Близко к верхней полосе — слабый сигнал, не считаем
-        pass
+        factors.append(f"Цена выше BB ({bb_pct:.2f})")
 
-    # ── 4. MACD медвежий крест или нарастающий нисходящий slope ─────────────
+    # ── 4. MACD крест / slope ─────────────────────────────────────────────────
     macd_data = calculate_macd_full(prices)
     macd_hist = macd_data["histogram"]
     if macd_data["cross_down"]:
         score += 1
-        factors.append("MACD медвежий крест (гистограмма пробила 0 вниз)")
-    elif (macd_data["histogram"] is not None
+        factors.append("MACD медвежий крест (hist 0→-)")
+    elif (macd_hist is not None
           and macd_data["slope"] is not None
-          and macd_data["histogram"] > 0
+          and macd_hist > 0
           and macd_data["slope"] < REVERSAL_MACD_SLOPE):
         score += 1
-        factors.append(f"MACD гистограмма убывает (slope={macd_data['slope']:+.6f})")
+        factors.append(f"MACD убывает (slope={macd_data['slope']:+.6f})")
 
-    # ── 5. Медвежья RSI-дивергенция ──────────────────────────────────────────
-    if len(prices) >= 30:
-        divergence = calculate_rsi_divergence(prices)
-        if divergence:
-            score += 1
-            factors.append("⚡ Медвежья RSI-дивергенция (цена ↑, RSI ↓)")
+    # ── 5. RSI-дивергенция ────────────────────────────────────────────────────
+    if len(prices) >= 30 and calculate_rsi_divergence(prices):
+        score += 1
+        factors.append("⚡ Медвежья RSI-дивергенция (цена ↑, RSI ↓)")
 
-    # ── 6. Замедление роста (accel) ───────────────────────────────────────────
+    # ── 6. Замедление accel ───────────────────────────────────────────────────
     accel = calculate_acceleration(recent)
     if accel is not None and growth >= current_percent and accel < REVERSAL_ACCEL:
         score += 1
-        factors.append(f"Замедление импульса (accel={accel:.2f}x < {REVERSAL_ACCEL})")
+        factors.append(f"Замедление импульса (accel={accel:.2f}x)")
 
     # ── 7. Отбой от 24h High ─────────────────────────────────────────────────
-    hist      = price_history.get(sym, [])
-    now_ts    = time.time()
-    day_prices = [p for t, p in hist if now_ts - t <= 86400]
+    hist_data  = price_history.get(sym, [])
+    now_ts     = time.time()
+    day_prices = [p for t, p in hist_data if now_ts - t <= 86400]
+    high24 = max(day_prices) if day_prices else price
+    low24  = min(day_prices) if day_prices else price
     if len(day_prices) >= 20:
-        high24 = max(day_prices)
         near_high = price >= high24 * REVERSAL_HIGH_MARGIN
         if near_high and len(recent) >= 4:
             last_ticks = [p for _, p in recent[-4:]]
-            turning_down = all(last_ticks[i] >= last_ticks[i + 1] for i in range(len(last_ticks) - 1))
-            if turning_down:
+            if all(last_ticks[i] >= last_ticks[i + 1] for i in range(len(last_ticks) - 1)):
                 score += 1
                 pct_from_high = (price - high24) / high24 * 100
-                factors.append(f"Отбой от 24h High ({pct_from_high:+.2f}% от хая)")
+                factors.append(f"Отбой от 24h High ({pct_from_high:+.2f}%)")
 
     # ── 8. Моментум иссякает ─────────────────────────────────────────────────
     momentum = calculate_price_momentum(prices)
     if momentum is not None and momentum < REVERSAL_MOMENTUM:
         score += 1
-        factors.append(f"Моментум иссякает (fast-slow={momentum:+.2f}% < {REVERSAL_MOMENTUM})")
+        factors.append(f"Моментум иссякает (diff={momentum:+.2f}%)")
 
-    # ── Дополнительный контекст иссякания объёма (не влияет на скор) ─────────
-    vol_signal = calculate_volume_signal(sym)
+    # ── 9. EMA крест вниз ────────────────────────────────────────────────────
+    ema_data = calculate_ema_cross(prices)
+    if ema_data["cross_down"]:
+        score += 1
+        factors.append(f"EMA9 пробила EMA21 вниз ({ema_data['ema_fast']:.4g} < {ema_data['ema_slow']:.4g})")
+    elif (ema_data["gap_pct"] is not None
+          and ema_data["gap_pct"] < -0.05):
+        # EMA9 уже ниже EMA21 — медвежья зона
+        score += 1
+        factors.append(f"EMA9 ниже EMA21 (gap={ema_data['gap_pct']:+.2f}%)")
+
+    # ── 10. ATR-перегрев ─────────────────────────────────────────────────────
+    atr = None
+    if len(highs) >= 15 and len(lows) >= 15:
+        atr = calculate_atr(highs, lows, closes)
+        if atr is not None and atr > 0:
+            # Движение за период в единицах ATR
+            period_move = abs(price - prices[max(0, len(prices) - 30)])
+            atr_ratio   = period_move / atr
+            if atr_ratio > REVERSAL_ATR_MULT:
+                score += 1
+                factors.append(f"ATR-перегрев ({atr_ratio:.1f}× ATR за период)")
+
+    # ── 11. Свечной паттерн ───────────────────────────────────────────────────
+    candle_pattern = None
+    if len(closes) >= 3 and len(highs) >= 3 and len(lows) >= 3:
+        candle_pattern = detect_candle_pattern(closes, highs, lows)
+        if candle_pattern:
+            score += 1
+            factors.append(f"Свечной паттерн: {candle_pattern}")
+
+    # ── 12. Слабый объём ─────────────────────────────────────────────────────
+    vol_signal = calculate_volume_weakness(volumes) if volumes else calculate_volume_signal(sym)
+    if vol_signal:
+        score += 1
+        factors.append(vol_signal)
+
+    # ── Цели по шорту (уровни Фибоначчи от хая к лою 24h) ───────────────────
+    fib = calculate_fibonacci_levels(high24, low24)
+    target1 = fib["fib_382"]   # первая цель
+    target2 = fib["fib_618"]   # вторая цель (более глубокая)
+
+    # ── Контекст для уведомления ─────────────────────────────────────────────
+    day_context = get_24h_context(sym, price)
 
     return {
-        "score":       score,
-        "factors":     factors,
-        "triggered":   score >= min_score,
-        "rsi":         rsi,
-        "stoch_rsi":   stoch_rsi_val,
-        "bb_pct":      bb_pct,
-        "macd_hist":   macd_hist,
-        "accel":       accel,
-        "vol_signal":  vol_signal,
+        "score":          score,
+        "factors":        factors,
+        "triggered":      score >= min_score,
+        "rsi":            rsi,
+        "stoch_rsi":      stoch_rsi_val,
+        "bb_pct":         bb_pct,
+        "macd_hist":      macd_hist,
+        "accel":          accel,
+        "atr":            atr,
+        "target1":        target1,
+        "target2":        target2,
+        "fib":            fib,
+        "high24":         high24,
+        "low24":          low24,
+        "candle_pattern": candle_pattern,
+        "ema_gap":        ema_data.get("gap_pct"),
+        "vol_signal":     vol_signal,
+        "day_context":    day_context,
     }
 
 
@@ -843,9 +976,10 @@ def detect_short_reversal(
 # ================================================================
 
 async def _tg_post(method: str, payload: dict) -> Optional[dict]:
-    global _session
     try:
-        async with _session.post(f"{TG}/{method}", json=payload, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        async with _session.post(
+            f"{TG}/{method}", json=payload, timeout=aiohttp.ClientTimeout(total=20)
+        ) as resp:
             data = await resp.json()
             if not data.get("ok"):
                 log.warning("Telegram %s error: %s", method, data)
@@ -868,7 +1002,8 @@ async def send_document(chat_id, filename: str, content: str, caption: str = "")
         form.add_field("chat_id", str(chat_id))
         form.add_field("caption", caption)
         form.add_field("document", content.encode(), filename=filename, content_type="text/csv")
-        async with _session.post(f"{TG}/sendDocument", data=form, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        async with _session.post(f"{TG}/sendDocument", data=form,
+                                  timeout=aiohttp.ClientTimeout(total=30)) as resp:
             return await resp.json()
     except Exception as e:
         log.error("sendDocument: %s", e)
@@ -882,26 +1017,29 @@ async def broadcast(text: str, reply_markup=None):
 def reply_keyboard():
     return {
         "keyboard": [
-            ["📈 0.2%",    "📈 5%",       "📈 10%"            ],
-            ["📈 15%",     "📈 20%"                            ],
-            ["⏱ 5 мин",   "⏱ 1 час",    "⏱ 4 ч",  "⏱ 1 д" ],
-            ["📊 Статус",  "📋 История",  "🏆 Топ-5"           ],
-            ["⏸ Пауза",   "▶️ Продолжить"                     ],
-            ["🔄 Развороты", "⚙️ Разворот", "🗑 Кулдауны"     ],
-            ["📤 Экспорт"                                      ],
+            ["📈 0.2%",  "📈 5%",   "📈 10%",  "📈 20%"   ],
+            ["⏱ 5 мин", "⏱ 1 час", "⏱ 4 ч",  "⏱ 1 д"   ],
+            ["📊 Статус", "📋 История", "🏆 Топ-5"          ],
+            ["⏸ Пауза",  "▶️ Продолжить"                   ],
+            ["🔄 Развороты", "⚙️ Разворот", "🗑 Кулдауны"  ],
+            ["📤 Экспорт"                                   ],
         ],
         "resize_keyboard": True,
-        "persistent":       True,
+        "persistent":      True,
     }
-
-
-async def send_main_menu(chat_id):
-    await send_message("⚙️ <b>Панель управления</b>", chat_id, reply_markup=reply_keyboard())
 
 
 # ================================================================
 #  ALERT FORMATTING
 # ================================================================
+
+def _fmt_dur(sec: int) -> str:
+    if sec >= 3600:
+        return f"{sec // 3600}ч {(sec % 3600) // 60}м"
+    if sec >= 60:
+        return f"{sec // 60}м"
+    return f"{sec}с"
+
 
 def alert_emoji(growth: float) -> str:
     a = abs(growth)
@@ -916,26 +1054,21 @@ def format_growth_alert(
     sym: str, price: float, growth: float,
     rsi: Optional[float], macd: Optional[float], source: str,
     rsi_trend: Optional[str] = None,
-    accel: Optional[float] = None,
-    duration_sec: int = 0,
-    breakout: Optional[str] = None,
+    accel: Optional[float]   = None,
+    duration_sec: int        = 0,
+    breakout: Optional[str]  = None,
     day_context: Optional[str] = None,
 ) -> str:
-    """Уведомление о росте цены."""
     emoji = alert_emoji(growth)
-    label = "Рост" if growth > 0 else "Падение"
     sign  = "+" if growth > 0 else ""
+    label = "Рост" if growth > 0 else "Падение"
 
     rsi_s    = f"{rsi:.1f}" if rsi is not None else "—"
-    rsi_hint = ""
-    if rsi is not None:
-        if rsi >= 70:
-            rsi_hint = " ⚠️ перекуплен"
-        elif rsi <= 30:
-            rsi_hint = " ⚠️ перепродан"
-    rsi_trend_s = f" {rsi_trend}" if rsi_trend else ""
-
-    macd_s = f"{macd:+.6f}" if macd is not None else "—"
+    rsi_hint = (" ⚠️ перекуплен" if rsi is not None and rsi >= 70
+                else " ⚠️ перепродан" if rsi is not None and rsi <= 30
+                else "")
+    rsi_t    = f" {rsi_trend}" if rsi_trend else ""
+    macd_s   = f"{macd:+.6f}" if macd is not None else "—"
 
     accel_s = ""
     if accel is not None:
@@ -946,46 +1079,62 @@ def format_growth_alert(
         elif accel < 0.7:
             accel_s = f"\n🐢 Замедление: ×{accel:.1f}"
 
-    if duration_sec >= 3600:
-        dur_s = f"{duration_sec // 3600}ч {(duration_sec % 3600) // 60}м"
-    elif duration_sec >= 60:
-        dur_s = f"{duration_sec // 60}м"
-    else:
-        dur_s = f"{duration_sec}с"
-
-    breakout_s    = f"\n{breakout}"    if breakout    else ""
-    day_context_s = f"\n{day_context}" if day_context else ""
-
     return (
-        f"{emoji} <b>СИГНАЛ</b>\n\n"
+        f"{emoji} <b>СИГНАЛ — {label.upper()}</b>\n\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
-        f"📈 {label}: <b>{sign}{growth:.2f}%</b> за {dur_s}\n"
-        f"📊 RSI: <code>{rsi_s}</code>{rsi_trend_s}{rsi_hint}\n"
+        f"📈 {label}: <b>{sign}{growth:.2f}%</b> за {_fmt_dur(duration_sec)}\n"
+        f"📊 RSI: <code>{rsi_s}</code>{rsi_t}{rsi_hint}\n"
         f"〽️ MACD: <code>{macd_s}</code>"
         f"{accel_s}"
-        f"{breakout_s}"
-        f"{day_context_s}"
+        f"{chr(10) + breakout if breakout else ''}"
+        f"{chr(10) + day_context if day_context else ''}"
         f"\n\n📋 <code>{sym}</code>"
     )
 
 
-# Псевдоним для обратной совместимости
-format_alert = format_growth_alert
+format_alert = format_growth_alert  # обратная совместимость
+
+
+def format_drop_alert(
+    sym: str, price: float, growth: float,
+    rsi: Optional[float], macd: Optional[float], source: str,
+    rsi_trend: Optional[str] = None,
+    duration_sec: int        = 0,
+    breakout: Optional[str]  = None,
+    day_context: Optional[str] = None,
+) -> str:
+    a     = abs(growth)
+    emoji = "💥" if a >= 20 else "🔥" if a >= 10 else "📉"
+    rsi_s = f"{rsi:.1f}" if rsi is not None else "—"
+    hint  = " ⚠️ перепродан" if (rsi is not None and rsi <= 30) else ""
+    rsi_t = f" {rsi_trend}" if rsi_trend else ""
+    macd_s = f"{macd:+.6f}" if macd is not None else "—"
+
+    return (
+        f"{emoji} <b>ПАДЕНИЕ</b>\n\n"
+        f"🪙 <b>{sym}</b>  [{source}]\n"
+        f"💵 Цена: <code>{price}</code>\n"
+        f"📉 Падение: <b>{growth:.2f}%</b> за {_fmt_dur(duration_sec)}\n"
+        f"📊 RSI: <code>{rsi_s}</code>{rsi_t}{hint}\n"
+        f"〽️ MACD: <code>{macd_s}</code>"
+        f"{chr(10) + breakout if breakout else ''}"
+        f"{chr(10) + day_context if day_context else ''}"
+        f"\n\n📋 <code>{sym}</code> #падение"
+    )
 
 
 def format_reversal_alert(
-    sym:       str,
-    price:     float,
-    growth:    float,
-    source:    str,
-    rev:       dict,           # результат detect_short_reversal
+    sym:          str,
+    price:        float,
+    growth:       float,
+    source:       str,
+    rev:          dict,
     duration_sec: int = 0,
-    day_context: Optional[str] = None,
 ) -> str:
     """
-    Уведомление о развороте на шорт — отдельный тип, отдельное форматирование.
-    Показывает скор, все сработавшие факторы и значения индикаторов.
+    Уведомление о развороте на шорт.
+    Включает: скор, факторы, индикаторы, ATR, свечной паттерн, цели по Фибо.
     """
     score   = rev["score"]
     factors = rev["factors"]
@@ -993,96 +1142,60 @@ def format_reversal_alert(
     stoch   = rev.get("stoch_rsi")
     bb_pct  = rev.get("bb_pct")
     macd_h  = rev.get("macd_hist")
+    atr     = rev.get("atr")
+    target1 = rev.get("target1")
+    target2 = rev.get("target2")
+    candle  = rev.get("candle_pattern")
+    ema_gap = rev.get("ema_gap")
     vol_sig = rev.get("vol_signal", "")
+    day_ctx = rev.get("day_context", "")
 
-    # Уровень уверенности по скору
-    if score >= 6:
+    # Уровень уверенности
+    if score >= 8:
         confidence = "🔴 ВЫСОКАЯ"
-        hdr_emoji  = "🚨"
-    elif score >= 4:
+        hdr        = "🚨"
+    elif score >= 5:
         confidence = "🟠 СРЕДНЯЯ"
-        hdr_emoji  = "⚠️"
+        hdr        = "⚠️"
     else:
         confidence = "🟡 СЛАБАЯ"
-        hdr_emoji  = "🔄"
+        hdr        = "🔄"
 
-    if duration_sec >= 3600:
-        dur_s = f"{duration_sec // 3600}ч {(duration_sec % 3600) // 60}м"
-    elif duration_sec >= 60:
-        dur_s = f"{duration_sec // 60}м"
-    else:
-        dur_s = f"{duration_sec}с"
+    rsi_s    = f"{rsi:.1f}"     if rsi    is not None else "—"
+    stoch_s  = f"{stoch:.2f}"   if stoch  is not None else "—"
+    bb_s     = f"{bb_pct:.2f}"  if bb_pct is not None else "—"
+    macd_s   = f"{macd_h:+.6f}" if macd_h is not None else "—"
+    atr_s    = f"{atr:.6f}"     if atr    is not None else "—"
+    ema_s    = f"{ema_gap:+.2f}%" if ema_gap is not None else "—"
 
-    rsi_s   = f"{rsi:.1f}"   if rsi    is not None else "—"
-    stoch_s = f"{stoch:.2f}" if stoch  is not None else "—"
-    bb_s    = f"{bb_pct:.2f}" if bb_pct is not None else "—"
-    macd_s  = f"{macd_h:+.6f}" if macd_h is not None else "—"
+    factors_s = "\n".join(f"  {i+1}. {f}" for i, f in enumerate(factors)) if factors else "  —"
 
-    factors_s = "\n".join(f"  • {f}" for f in factors) if factors else "  —"
+    t1_s = f"<code>{target1:.4g}</code>" if target1 else "—"
+    t2_s = f"<code>{target2:.4g}</code>" if target2 else "—"
 
-    vol_s       = f"\n{vol_sig}" if vol_sig else ""
-    day_ctx_s   = f"\n{day_context}" if day_context else ""
+    candle_s  = f"\n🕯 Паттерн: <b>{candle}</b>"   if candle  else ""
+    vol_s     = f"\n{vol_sig}"                       if vol_sig else ""
+    day_ctx_s = f"\n{day_ctx}"                       if day_ctx else ""
 
     return (
-        f"{hdr_emoji} <b>РАЗВОРОТ НА ШОРТ</b>\n"
+        f"{hdr} <b>РАЗВОРОТ НА ШОРТ</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
-        f"📈 Рост до разворота: <b>+{growth:.2f}%</b> за {dur_s}\n\n"
-        f"🎯 Уверенность: {confidence}  [{score}/8]\n\n"
-        f"<b>Сработавшие факторы:</b>\n"
-        f"{factors_s}\n\n"
+        f"📈 Рост до разворота: <b>+{growth:.2f}%</b> за {_fmt_dur(duration_sec)}\n\n"
+        f"🎯 Уверенность: {confidence}  [{score}/12]\n\n"
+        f"<b>Сработавшие факторы:</b>\n{factors_s}\n\n"
         f"<b>Индикаторы:</b>\n"
         f"  RSI: <code>{rsi_s}</code>  │  StochRSI: <code>{stoch_s}</code>\n"
-        f"  BB%: <code>{bb_s}</code>  │  MACD hist: <code>{macd_s}</code>"
+        f"  BB%: <code>{bb_s}</code>   │  MACD hist: <code>{macd_s}</code>\n"
+        f"  ATR: <code>{atr_s}</code>  │  EMA gap: <code>{ema_s}</code>"
+        f"{candle_s}"
         f"{vol_s}"
-        f"{day_ctx_s}"
-        f"\n\n📋 <code>{sym}</code> #шорт"
-    )
-
-
-def format_drop_alert(
-    sym: str, price: float, growth: float,
-    rsi: Optional[float], macd: Optional[float], source: str,
-    rsi_trend: Optional[str] = None,
-    duration_sec: int = 0,
-    breakout: Optional[str] = None,
-    day_context: Optional[str] = None,
-) -> str:
-    """Отдельное уведомление о падении цены."""
-    a = abs(growth)
-    if a >= 20:
-        emoji = "💥"
-    elif a >= 10:
-        emoji = "🔥"
-    else:
-        emoji = "📉"
-
-    rsi_s    = f"{rsi:.1f}" if rsi is not None else "—"
-    rsi_hint = " ⚠️ перепродан" if (rsi is not None and rsi <= 30) else ""
-    rsi_trend_s = f" {rsi_trend}" if rsi_trend else ""
-    macd_s   = f"{macd:+.6f}" if macd is not None else "—"
-
-    if duration_sec >= 3600:
-        dur_s = f"{duration_sec // 3600}ч {(duration_sec % 3600) // 60}м"
-    elif duration_sec >= 60:
-        dur_s = f"{duration_sec // 60}м"
-    else:
-        dur_s = f"{duration_sec}с"
-
-    breakout_s    = f"\n{breakout}"    if breakout    else ""
-    day_context_s = f"\n{day_context}" if day_context else ""
-
-    return (
-        f"{emoji} <b>ПАДЕНИЕ</b>\n\n"
-        f"🪙 <b>{sym}</b>  [{source}]\n"
-        f"💵 Цена: <code>{price}</code>\n"
-        f"📉 Падение: <b>{growth:.2f}%</b> за {dur_s}\n"
-        f"📊 RSI: <code>{rsi_s}</code>{rsi_trend_s}{rsi_hint}\n"
-        f"〽️ MACD: <code>{macd_s}</code>"
-        f"{breakout_s}"
-        f"{day_context_s}"
-        f"\n\n📋 <code>{sym}</code> #падение"
+        f"{day_ctx_s}\n\n"
+        f"<b>🎯 Цели шорта (Фибо):</b>\n"
+        f"  Цель 1 (38.2%): {t1_s}\n"
+        f"  Цель 2 (61.8%): {t2_s}\n\n"
+        f"📋 <code>{sym}</code> #шорт"
     )
 
 
@@ -1098,7 +1211,7 @@ async def get_symbols() -> set[str]:
     ]:
         try:
             async with _session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-                html  = await r.text()
+                html = await r.text()
             soup  = BeautifulSoup(html, "html.parser")
             count = 0
             for a in soup.find_all("a"):
@@ -1168,16 +1281,11 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
     if sym_key != _norm_symbols_key:
         _norm_cache       = {normalize_symbol(s): s for s in symbols}
         _norm_symbols_key = sym_key
-    norm   = _norm_cache
+    norm = _norm_cache
+
     merged: dict = {}
     msrc:   dict = {}
-
-    results = await asyncio.gather(
-        _fetch_mexc(norm),
-        _fetch_okx(norm),
-        return_exceptions=True,
-    )
-
+    results = await asyncio.gather(_fetch_mexc(norm), _fetch_okx(norm), return_exceptions=True)
     for res in results:
         if isinstance(res, Exception):
             log.error("Fetch error: %s", res)
@@ -1187,7 +1295,6 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
             if sym not in merged:
                 merged[sym] = price
                 msrc[sym]   = s[sym]
-
     return merged, msrc
 
 
@@ -1202,7 +1309,7 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    await broadcast("✅ <b>Бот запущен</b> (v11 — разворот на шорт активен)")
+    await broadcast("✅ <b>Бот запущен</b> (v12 — 12-факторный разворот)")
 
     while True:
         if monitor_paused:
@@ -1235,12 +1342,11 @@ async def monitor():
 
                 hist = price_history.setdefault(sym, [])
                 hist.append((now, price))
-
                 cutoff = max(current_window * 2, 86400)
                 price_history[sym] = [(t, p) for t, p in hist if now - t <= cutoff]
 
-                recent    = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
-                source    = sources.get(sym, "UNKNOWN")
+                recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
+                source = sources.get(sym, "UNKNOWN")
 
                 if len(recent) < MIN_SAMPLES:
                     continue
@@ -1252,44 +1358,47 @@ async def monitor():
                 growth    = (price - old_price) / old_price * 100
                 direction = 1 if growth > 0 else -1
 
-                # ── RSI по реальным свечам MEXC ──────────────────────────────
+                # ── Свечи MEXC (closes + highs + lows + volumes) ──────────────
                 mexc_sym = _to_mexc_symbol(sym)
-                closes   = await get_mexc_closes(mexc_sym, interval="Min1")
+                klines   = await get_mexc_klines(mexc_sym, interval="Min1")
+                closes   = klines["closes"]
+
                 rsi = calculate_rsi(closes) if closes else None
                 if rsi is None:
-                    vals = [p for _, p in price_history[sym][-100:]]
+                    vals = [p for _, p in price_history[sym][-120:]]
                     rsi  = calculate_rsi(vals)
 
                 # ════════════════════════════════════════════════════════════
                 #  БЛОК 1: РАЗВОРОТ НА ШОРТ
-                #  Проверяем независимо от порога роста — монета могла уже
-                #  вырасти ранее и сейчас даёт сигнал разворота.
+                #  Условие: пиковый рост за 24ч >= 50% от порога
+                #  (монета могла уже откатить, но разворот ещё актуален)
                 # ════════════════════════════════════════════════════════════
-                if growth >= current_percent * 0.5:  # был хоть какой-то рост
+                peak_growth = get_peak_growth_24h(sym, price)
+                if peak_growth >= current_percent * 0.5 or growth >= current_percent * 0.5:
                     last_rev = _reversal_cooldown.get(sym, 0)
                     if now - last_rev >= REVERSAL_COOLDOWN_SEC:
-                        rev = detect_short_reversal(sym, price, closes, recent, growth, rsi, REVERSAL_MIN_SCORE)
+                        rev = detect_short_reversal(
+                            sym, price, klines, recent, growth, rsi, REVERSAL_MIN_SCORE
+                        )
                         if rev["triggered"]:
-                            duration  = calculate_growth_duration(recent)
-                            day_ctx   = get_24h_context(sym, price)
-                            rev_text  = format_reversal_alert(
-                                sym, price, growth, source, rev,
+                            duration = calculate_growth_duration(recent)
+                            rev_text = format_reversal_alert(
+                                sym, price, max(growth, peak_growth), source, rev,
                                 duration_sec=duration,
-                                day_context=day_ctx,
                             )
                             _reversal_cooldown[sym] = now
                             db_save_reversal(
                                 sym, price, rev["score"], rev["factors"],
                                 rev["rsi"], rev["macd_hist"],
-                                rev["stoch_rsi"], rev["bb_pct"], source,
+                                rev["stoch_rsi"], rev["bb_pct"],
+                                rev["atr"], rev["target1"], rev["target2"], source,
                             )
                             await broadcast(rev_text)
                             reversal_count += 1
                             if PROM_AVAILABLE:
                                 PROM_REVERSALS.inc()
-                            log.info("REVERSAL %s score=%d factors=%s", sym, rev["score"], rev["factors"])
-                            # После разворотного сигнала пропускаем обычный алерт роста
-                            continue
+                            log.info("REVERSAL %s score=%d/%d", sym, rev["score"], 12)
+                            continue  # не дублируем обычным алертом
 
                 # ════════════════════════════════════════════════════════════
                 #  БЛОК 2: ОБЫЧНЫЕ АЛЕРТЫ (РОСТ / ПАДЕНИЕ)
@@ -1303,30 +1412,23 @@ async def monitor():
                 # RSI-фильтр направления
                 if rsi is not None:
                     if direction == 1 and rsi < 50:
-                        log.debug("Skip %s: growth but RSI=%.1f < 50", sym, rsi)
                         continue
                     if direction == -1 and rsi > 50:
-                        log.debug("Skip %s: drop but RSI=%.1f > 50", sym, rsi)
                         continue
 
-                # Кулдаун обычных алертов
                 last_sent = _alert_cooldown.get(sym, 0)
                 if now - last_sent < ALERT_COOLDOWN_SEC:
-                    log.debug("Cooldown skip %s (%.0f с назад)", sym, now - last_sent)
                     continue
 
-                # Проверка уровня (повторный алерт)
                 level = _cache_get_level(sym)
                 if level:
                     prev_price = level["alert_price"]
                     prev_dir   = level["direction"]
                     if prev_dir == direction:
-                        step = abs(price - prev_price) / prev_price * 100
-                        if step < current_percent:
+                        if abs(price - prev_price) / prev_price * 100 < current_percent:
                             continue
 
-                # Вычисляем контекст
-                vals      = [p for _, p in price_history[sym][-100:]]
+                vals      = [p for _, p in price_history[sym][-120:]]
                 macd_data = calculate_macd_full(vals)
                 macd      = macd_data["histogram"]
                 rsi_trend = await get_rsi_trend_from_mexc(sym)
@@ -1335,7 +1437,6 @@ async def monitor():
                 breakout  = check_24h_breakout(sym, price)
                 day_ctx   = get_24h_context(sym, price)
 
-                # Отдельное форматирование для роста и падения
                 if direction == 1:
                     text = format_growth_alert(
                         sym, price, growth, rsi, macd, source,
@@ -1352,7 +1453,6 @@ async def monitor():
                 _cache_set_level(sym, price, direction)
                 _alert_cooldown[sym] = now
                 db_save_alert(sym, price, growth, rsi, macd, source)
-
                 await broadcast(text)
                 signals_count += 1
 
@@ -1371,14 +1471,14 @@ async def monitor():
 
 
 # ================================================================
-#  COMMAND / CALLBACK HANDLERS
+#  COMMAND HANDLERS
 # ================================================================
 
 async def handle_message(msg: dict):
     global current_percent, current_window, monitor_paused
     global REVERSAL_MIN_SCORE, REVERSAL_RSI_OB, REVERSAL_STOCH_OB, REVERSAL_STOCH_EXT
     global REVERSAL_BB_OB, REVERSAL_MACD_SLOPE, REVERSAL_ACCEL, REVERSAL_HIGH_MARGIN
-    global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC
+    global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC, REVERSAL_ATR_MULT, REVERSAL_VOL_RATIO
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -1396,10 +1496,10 @@ async def handle_message(msg: dict):
 
     if text in ("/start", "/menu"):
         await send_message(
-            f"🚀 <b>Бот запущен</b>\n\n"
+            f"🚀 <b>Бот v12</b>\n\n"
             f"📈 Порог: <b>{current_percent}%</b>\n"
             f"⏱ Период: <b>{current_window // 60} мин</b>\n"
-            f"🔄 Разворот: минимум {REVERSAL_MIN_SCORE}/8 факторов\n"
+            f"🔄 Разворот: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг идёт'}",
             chat_id,
             reply_markup=reply_keyboard(),
@@ -1407,8 +1507,7 @@ async def handle_message(msg: dict):
         return
 
     _pct_map = {
-        "📈 0.2%": 0.2, "📈 5%": 5.0, "📈 10%": 10.0,
-        "📈 15%": 15.0, "📈 20%": 20.0,
+        "📈 0.2%": 0.2, "📈 5%": 5.0, "📈 10%": 10.0, "📈 20%": 20.0,
     }
     if text in _pct_map:
         current_percent = _pct_map[text]
@@ -1427,39 +1526,31 @@ async def handle_message(msg: dict):
         return
 
     if text == "⏸ Пауза":
-        if monitor_paused:
-            await send_message("⏸ Мониторинг уже на паузе", chat_id)
-        else:
-            monitor_paused = True
-            await send_message("⏸ Мониторинг приостановлен", chat_id)
+        monitor_paused = True
+        await send_message("⏸ Мониторинг приостановлен", chat_id)
         return
 
     if text == "▶️ Продолжить":
-        if not monitor_paused:
-            await send_message("▶️ Мониторинг уже активен", chat_id)
-        else:
-            monitor_paused = False
-            await send_message("▶️ Мониторинг возобновлён", chat_id)
+        monitor_paused = False
+        await send_message("▶️ Мониторинг возобновлён", chat_id)
         return
 
     if text in ("📊 Статус", "/status"):
         uptime = int(time.time() - start_time)
-        d, rem = divmod(uptime, 86400)
-        h, rem = divmod(rem, 3600)
-        m      = rem // 60
+        d, r   = divmod(uptime, 86400)
+        h, r   = divmod(r, 3600)
+        m      = r // 60
         await send_message(
             f"📊 <b>СТАТУС</b>\n\n"
             f"🟢 Аптайм: {d}д {h}ч {m}м\n"
             f"🪙 Монет в истории: {len(price_history)}\n"
-            f"🔔 Сигналов роста/падения: {signals_count}\n"
-            f"🔄 Разворотных сигналов: {reversal_count}\n"
-            f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/8 факторов\n"
+            f"🔔 Сигналов: {signals_count}\n"
+            f"🔄 Разворотов: {reversal_count}\n"
+            f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/12\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
-            f"🔄 Циклов: {checks_count}\n"
-            f"📈 Порог: <b>{current_percent}%</b>\n"
-            f"⏱ Период: <b>{current_window // 60} мин</b>\n"
+            f"📈 Порог роста: {current_percent}%\n"
+            f"⏱ Период: {current_window // 60} мин\n"
             f"⚡ Интервал: {config.INTERVAL} сек\n"
-            f"🕒 Кулдаун алертов: {ALERT_COOLDOWN_SEC // 60} мин\n"
             f"👥 Подписчиков: {len(db_get_subscribers())}\n"
             f"{'⏸ Пауза' if monitor_paused else '▶️ Активен'}",
             chat_id,
@@ -1475,153 +1566,60 @@ async def handle_message(msg: dict):
         return
 
     if text in ("📤 Экспорт", "/export"):
-        await send_message("📤 Генерирую CSV...", chat_id)
         asyncio.create_task(_cmd_export(chat_id))
         return
 
     if text in ("🗑 Кулдауны", "/clear_cooldowns"):
         _cache_clear_all()
         _reversal_cooldown.clear()
-        await send_message("🗑 Уровни алертов и кулдауны разворота сброшены", chat_id)
+        await send_message("🗑 Кулдауны и уровни сброшены", chat_id)
         return
 
-    # ── Последние разворотные сигналы ────────────────────────────────────────
     if text in ("🔄 Развороты", "/reversals"):
         asyncio.create_task(_cmd_reversals(chat_id))
         return
 
-    # ── Настройка порога разворота: /set_reversal_score 3 ────────────────────
-    # ── Меню настроек разворота ─────────────────────────────────────────────
     if text in ("⚙️ Разворот", "/reversal_settings"):
         await _cmd_reversal_settings(chat_id)
         return
 
-    # ── /rev_score 3  — минимум факторов ─────────────────────────────────────
-    if text.startswith("/rev_score"):
-        try:
-            val = int(text.split()[1])
-            assert 1 <= val <= 8
-            REVERSAL_MIN_SCORE = val
-            await send_message(f"✅ Порог разворота: <b>{val}/8 факторов</b>", chat_id)
-        except Exception:
-            await send_message("❌ /rev_score 3  (1–8)", chat_id)
-        return
+    # ── Команды настройки разворота ───────────────────────────────────────────
+    _rev_cmds = {
+        "/rev_score":    ("REVERSAL_MIN_SCORE",   int,   1,    12,    "Порог факторов",           "/12"),
+        "/rev_rsi":      ("REVERSAL_RSI_OB",      float, 50,   90,    "RSI перекупленность",      ""),
+        "/rev_stoch":    ("REVERSAL_STOCH_OB",    float, 0.5,  1.0,   "StochRSI порог",           ""),
+        "/rev_bb":       ("REVERSAL_BB_OB",       float, 0.8,  1.5,   "Боллинджер %B порог",      ""),
+        "/rev_accel":    ("REVERSAL_ACCEL",       float, 0.1,  1.0,   "Порог замедления",         ""),
+        "/rev_momentum": ("REVERSAL_MOMENTUM",    float, -5.0, 0,     "Порог моментума",          "%"),
+        "/rev_cooldown": ("REVERSAL_COOLDOWN_SEC",int,   1,    1440,  "Кулдаун разворота (мин)",  " мин"),
+        "/rev_atr":      ("REVERSAL_ATR_MULT",    float, 1.0,  10.0,  "ATR-перегрев множитель",   "x"),
+        "/rev_vol":      ("REVERSAL_VOL_RATIO",   float, 0.1,  1.0,   "Порог слабого объёма",     ""),
+    }
+    for cmd, (var, typ, vmin, vmax, label, sfx) in _rev_cmds.items():
+        if text.startswith(cmd):
+            try:
+                raw = text.split()[1]
+                val = typ(raw)
+                assert vmin <= val <= vmax
+                # Для кулдауна храним в секундах
+                stored = val * 60 if var == "REVERSAL_COOLDOWN_SEC" else val
+                globals()[var] = stored
+                display = val if var != "REVERSAL_COOLDOWN_SEC" else val
+                await send_message(f"✅ {label}: <b>{display}{sfx}</b>", chat_id)
+            except Exception:
+                await send_message(
+                    f"❌ {cmd} {vmin}…{vmax}  (текущее: {globals()[var]})", chat_id
+                )
+            return
 
-    # ── /rev_rsi 70  — порог RSI перекупленности ─────────────────────────────
-    if text.startswith("/rev_rsi"):
-        try:
-            val = float(text.split()[1])
-            assert 50 <= val <= 90
-            REVERSAL_RSI_OB = val
-            await send_message(f"✅ RSI перекупленность: <b>> {val}</b>", chat_id)
-        except Exception:
-            await send_message("❌ /rev_rsi 70  (50–90)", chat_id)
-        return
-
-    # ── /rev_stoch 0.80  — порог StochRSI ───────────────────────────────────
-    if text.startswith("/rev_stoch"):
-        try:
-            val = float(text.split()[1])
-            assert 0.5 <= val <= 1.0
-            REVERSAL_STOCH_OB = val
-            await send_message(f"✅ StochRSI порог: <b>> {val}</b>", chat_id)
-        except Exception:
-            await send_message("❌ /rev_stoch 0.80  (0.5–1.0)", chat_id)
-        return
-
-    # ── /rev_bb 1.0  — порог Боллинджер %B ──────────────────────────────────
-    if text.startswith("/rev_bb"):
-        try:
-            val = float(text.split()[1])
-            assert 0.8 <= val <= 1.5
-            REVERSAL_BB_OB = val
-            await send_message(f"✅ Боллинджер %B порог: <b>> {val}</b>", chat_id)
-        except Exception:
-            await send_message("❌ /rev_bb 1.0  (0.8–1.5)", chat_id)
-        return
-
-    # ── /rev_accel 0.5  — порог замедления ──────────────────────────────────
-    if text.startswith("/rev_accel"):
-        try:
-            val = float(text.split()[1])
-            assert 0.1 <= val <= 1.0
-            REVERSAL_ACCEL = val
-            await send_message(f"✅ Порог замедления accel: <b>< {val}</b>", chat_id)
-        except Exception:
-            await send_message("❌ /rev_accel 0.5  (0.1–1.0)", chat_id)
-        return
-
-    # ── /rev_momentum -0.5  — порог моментума ────────────────────────────────
-    if text.startswith("/rev_momentum"):
-        try:
-            val = float(text.split()[1])
-            assert -5.0 <= val <= 0
-            REVERSAL_MOMENTUM = val
-            await send_message(f"✅ Порог моментума: <b>< {val}%</b>", chat_id)
-        except Exception:
-            await send_message("❌ /rev_momentum -0.5  (от -5.0 до 0)", chat_id)
-        return
-
-    # ── /rev_cooldown 5  — кулдаун разворота в минутах ───────────────────────
-    if text.startswith("/rev_cooldown"):
-        try:
-            val = int(text.split()[1])
-            assert 1 <= val <= 1440
-            REVERSAL_COOLDOWN_SEC = val * 60
-            await send_message(f"✅ Кулдаун разворота: <b>{val} мин</b>", chat_id)
-        except Exception:
-            await send_message("❌ /rev_cooldown 5  (1–1440 мин)", chat_id)
-        return
-
-    # ── /rev_high 0.2  — отступ от 24h High в % ──────────────────────────────
     if text.startswith("/rev_high"):
         try:
             val = float(text.split()[1])
             assert 0.0 <= val <= 5.0
             REVERSAL_HIGH_MARGIN = 1.0 - val / 100
-            await send_message(f"✅ Зона отбоя от 24h High: <b>{val}%</b>", chat_id)
+            await send_message(f"✅ Зона отбоя от хая: <b>{val}%</b>", chat_id)
         except Exception:
             await send_message("❌ /rev_high 0.2  (отступ от хая в %, 0–5)", chat_id)
-        return
-
-    if text.startswith("/set_reversal_score"):
-        try:
-            val = int(text.split()[1])
-            assert 1 <= val <= 8
-            REVERSAL_MIN_SCORE = val
-            await send_message(f"✅ Порог разворота: <b>{val}/8 факторов</b>", chat_id)
-        except Exception:
-            await send_message("❌ Использование: /set_reversal_score 3  (от 1 до 8)", chat_id)
-        return
-
-    if text == "/db_stats":
-        s = db_stats()
-        await send_message(
-            f"🗄 <b>База данных</b>\n\n"
-            f"📋 Алертов: <b>{s['alerts']}</b>\n"
-            f"📅 Старейший: <b>{s['oldest_alert']}</b>\n"
-            f"🪙 Уровней монет: <b>{s['levels']}</b>\n"
-            f"🔄 Разворотных сигналов: <b>{s['reversals']}</b>\n"
-            f"💾 Размер файла: <b>{s['size_mb']:.2f} МБ</b>\n\n"
-            f"⚙️ Хранение алертов: <b>{DB_KEEP_ALERTS_DAYS} дн.</b>\n"
-            f"⚙️ Хранение уровней: <b>{DB_KEEP_LEVELS_DAYS} дн.</b>",
-            chat_id,
-        )
-        return
-
-    if text == "/db_cleanup":
-        deleted = db_cleanup()
-        total   = sum(deleted.values())
-        await send_message(
-            f"🧹 <b>Очистка выполнена</b>\n\n"
-            f"Удалено строк: <b>{total}</b>\n"
-            f"  alerts: {deleted['alerts']}\n"
-            f"  levels: {deleted['alert_levels']}\n"
-            f"  stats:  {deleted['price_stats']}\n"
-            f"  reversals: {deleted['reversal_signals']}\n\n"
-            f"💾 Размер БД: <b>{db_size_mb():.2f} МБ</b>",
-            chat_id,
-        )
         return
 
     if text.startswith("/set_percent"):
@@ -1631,7 +1629,7 @@ async def handle_message(msg: dict):
             current_percent = val
             await send_message(f"✅ Новый порог: <b>{val}%</b>", chat_id)
         except Exception:
-            await send_message("❌ Использование: /set_percent 2.5", chat_id)
+            await send_message("❌ /set_percent 2.5", chat_id)
         return
 
     if text.startswith("/set_window"):
@@ -1641,12 +1639,34 @@ async def handle_message(msg: dict):
             current_window = val * 60
             await send_message(f"✅ Новый период: <b>{val} мин</b>", chat_id)
         except Exception:
-            await send_message("❌ Использование: /set_window 60  (в минутах)", chat_id)
+            await send_message("❌ /set_window 60  (в минутах)", chat_id)
+        return
+
+    if text == "/db_stats":
+        s = db_stats()
+        await send_message(
+            f"🗄 <b>База данных</b>\n\n"
+            f"📋 Алертов: {s['alerts']}\n"
+            f"📅 Старейший: {s['oldest_alert']}\n"
+            f"🪙 Уровней: {s['levels']}\n"
+            f"🔄 Разворотов: {s['reversals']}\n"
+            f"💾 Размер: {s['size_mb']:.2f} МБ",
+            chat_id,
+        )
+        return
+
+    if text == "/db_cleanup":
+        deleted = db_cleanup()
+        await send_message(
+            f"🧹 Удалено: {sum(deleted.values())} строк\n{deleted}\n"
+            f"💾 Размер: {db_size_mb():.2f} МБ",
+            chat_id,
+        )
         return
 
     if text == "/subscribe":
         db_add_subscriber(chat_id)
-        await send_message("✅ Вы уже в списке получателей", chat_id)
+        await send_message("✅ Вы в списке получателей", chat_id)
         return
 
     await send_message("❓ Неизвестная команда. /menu — открыть панель", chat_id)
@@ -1669,9 +1689,9 @@ async def _cmd_history(chat_id):
 async def _cmd_top5(chat_id):
     rows = db_top_signals(5)
     if not rows:
-        await send_message("🏆 Нет данных за последние 24 ч", chat_id)
+        await send_message("🏆 Нет данных за 24ч", chat_id)
         return
-    lines = ["🏆 <b>Топ-5 сигналов за 24 ч:</b>\n"]
+    lines = ["🏆 <b>Топ-5 сигналов за 24ч:</b>\n"]
     for i, r in enumerate(rows, 1):
         ts   = time.strftime("%H:%M", time.localtime(r["ts"]))
         sign = "🚀" if r["growth"] > 0 else "📉"
@@ -1679,61 +1699,53 @@ async def _cmd_top5(chat_id):
     await send_message("\n".join(lines), chat_id)
 
 
-async def _cmd_reversal_settings(chat_id):
-    """Показывает текущие настройки детектора разворота и справку по командам."""
-    high_pct = round((1.0 - REVERSAL_HIGH_MARGIN) * 100, 2)
-    await send_message(
-        f"⚙️ <b>Настройки детектора разворота на шорт</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>Скоринг:</b>\n"
-        f"  Минимум факторов:  <code>{REVERSAL_MIN_SCORE}/8</code>  → /rev_score 3\n\n"
-        f"<b>Пороги факторов:</b>\n"
-        f"  RSI перекупл.:    <code>> {REVERSAL_RSI_OB}</code>       → /rev_rsi 70\n"
-        f"  StochRSI:         <code>> {REVERSAL_STOCH_OB}</code>     → /rev_stoch 0.80\n"
-        f"  Боллинджер %%B:   <code>> {REVERSAL_BB_OB}</code>       → /rev_bb 1.0\n"
-        f"  Замедление accel: <code>< {REVERSAL_ACCEL}</code>       → /rev_accel 0.5\n"
-        f"  Моментум:         <code>< {REVERSAL_MOMENTUM}%%</code>  → /rev_momentum -0.5\n"
-        f"  Зона хая 24h:     <code>{high_pct}%%</code>             → /rev_high 0.2\n\n"
-        f"<b>Кулдаун:</b>\n"
-        f"  Между сигналами:  <code>{REVERSAL_COOLDOWN_SEC // 60} мин</code>  → /rev_cooldown 5\n\n"
-        f"<b>Пример — агрессивный режим (больше сигналов):</b>\n"
-        f"  /rev_score 2\n"
-        f"  /rev_rsi 65\n"
-        f"  /rev_cooldown 2\n\n"
-        f"<b>Пример — строгий режим (только чёткие сигналы):</b>\n"
-        f"  /rev_score 5\n"
-        f"  /rev_rsi 75\n"
-        f"  /rev_cooldown 15",
-        chat_id,
-    )
-
-
 async def _cmd_reversals(chat_id):
     rows = db_recent_reversals(8)
     if not rows:
         await send_message("🔄 Разворотных сигналов пока нет", chat_id)
         return
-    lines = ["🔄 <b>Последние 8 разворотов на шорт:</b>\n"]
+    lines = ["🔄 <b>Последние 8 разворотов:</b>\n"]
     for r in rows:
         ts      = time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))
         score   = r["score"]
+        lvl     = "🔴" if score >= 8 else "🟠" if score >= 5 else "🟡"
         factors = r["factors"]
-        # Уровень по скору
-        if score >= 6:
-            lvl = "🔴"
-        elif score >= 4:
-            lvl = "🟠"
-        else:
-            lvl = "🟡"
-        factor_brief = factors[0] if factors else "—"
+        f_brief = factors[0] if factors else "—"
+        t1_s    = f" → цель {r['target1']:.4g}" if r.get("target1") else ""
         lines.append(
-            f"{lvl} <b>{r['symbol']}</b>  [{score}/8]  {ts}\n"
-            f"   <i>{factor_brief}</i>"
+            f"{lvl} <b>{r['symbol']}</b> [{score}/12] {ts}{t1_s}\n"
+            f"   <i>{f_brief}</i>"
         )
     await send_message("\n".join(lines), chat_id)
 
 
+async def _cmd_reversal_settings(chat_id):
+    high_pct = round((1.0 - REVERSAL_HIGH_MARGIN) * 100, 2)
+    await send_message(
+        f"⚙️ <b>Настройки детектора разворота (12 факторов)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>Скоринг:</b>\n"
+        f"  Порог:         <code>{REVERSAL_MIN_SCORE}/12</code>    → /rev_score 4\n\n"
+        f"<b>Пороги факторов:</b>\n"
+        f"  RSI OB:        <code>> {REVERSAL_RSI_OB}</code>       → /rev_rsi 70\n"
+        f"  StochRSI:      <code>> {REVERSAL_STOCH_OB}</code>    → /rev_stoch 0.80\n"
+        f"  Боллинджер:    <code>> {REVERSAL_BB_OB}</code>       → /rev_bb 1.0\n"
+        f"  Замедление:    <code>< {REVERSAL_ACCEL}</code>       → /rev_accel 0.5\n"
+        f"  Моментум:      <code>< {REVERSAL_MOMENTUM}%</code>  → /rev_momentum -0.5\n"
+        f"  ATR-перегрев:  <code>> {REVERSAL_ATR_MULT}×</code>  → /rev_atr 3.0\n"
+        f"  Объём слабый:  <code>< {REVERSAL_VOL_RATIO:.0%}</code>   → /rev_vol 0.7\n"
+        f"  Зона хая 24h:  <code>{high_pct}%</code>             → /rev_high 0.2\n\n"
+        f"<b>Кулдаун:</b>\n"
+        f"  Между сигналами: <code>{REVERSAL_COOLDOWN_SEC // 60} мин</code>  → /rev_cooldown 5\n\n"
+        f"<b>Пресеты:</b>\n"
+        f"  Агрессивный: /rev_score 3  /rev_rsi 65  /rev_cooldown 2\n"
+        f"  Строгий:     /rev_score 7  /rev_rsi 75  /rev_cooldown 15",
+        chat_id,
+    )
+
+
 async def _cmd_export(chat_id):
+    await send_message("📤 Генерирую CSV...", chat_id)
     csv_data = db_export_csv(500)
     fname    = f"alerts_{time.strftime('%Y%m%d_%H%M%S')}.csv"
     await send_document(chat_id, fname, csv_data, caption="📤 Последние 500 алертов")
@@ -1778,9 +1790,8 @@ async def telegram_loop():
 
 async def heartbeat():
     while True:
-        status = "PAUSED" if monitor_paused else "running"
-        log.info("♥ alive | %s | signals=%d | reversals=%d | coins=%d",
-                 status, signals_count, reversal_count, len(price_history))
+        log.info("♥ alive | signals=%d | reversals=%d | coins=%d",
+                 signals_count, reversal_count, len(price_history))
         await asyncio.sleep(300)
 
 
@@ -1801,18 +1812,16 @@ async def db_cleanup_loop():
             deleted = db_cleanup()
             total   = sum(deleted.values())
             stats   = db_stats()
-            log.info(
-                "DB cleanup: удалено %d строк %s | размер %.2f МБ | алертов всего %d",
-                total, deleted, stats["size_mb"], stats["alerts"],
-            )
+            log.info("DB cleanup: удалено %d | %.2f МБ | алертов %d",
+                     total, stats["size_mb"], stats["alerts"])
             now = time.time()
             if total > 0 and now - last_vacuum >= DB_VACUUM_INTERVAL_H * 3600:
-                log.info("DB VACUUM начат...")
+                log.info("DB VACUUM...")
                 await asyncio.get_event_loop().run_in_executor(None, db_vacuum)
                 last_vacuum = now
-                log.info("DB VACUUM завершён | размер %.2f МБ", db_size_mb())
+                log.info("VACUUM done | %.2f МБ", db_size_mb())
         except Exception as e:
-            log.exception("db_cleanup_loop error: %s", e)
+            log.exception("db_cleanup_loop: %s", e)
 
 
 # ================================================================
@@ -1830,8 +1839,8 @@ async def watchdog():
             if not monitor_paused:
                 stall = (time.time() - last_check_time) if last_check_time else 0
                 if stall > WATCHDOG_TIMEOUT:
-                    log.warning("Watchdog: monitor завис (%.0f с) — перезапуск", stall)
-                    await broadcast(f"⚠️ Watchdog: monitor завис ({stall:.0f} с). Перезапуск...")
+                    log.warning("Watchdog: завис %.0f с — перезапуск", stall)
+                    await broadcast(f"⚠️ Watchdog: завис {stall:.0f}с. Перезапуск...")
                     if monitor_task and not monitor_task.done():
                         monitor_task.cancel()
                         try:
@@ -1847,14 +1856,14 @@ async def watchdog():
 
 
 # ================================================================
-#  GRACEFUL SHUTDOWN
+#  SHUTDOWN
 # ================================================================
 
 _shutdown_event: asyncio.Event | None = None
 
 
 def _handle_signal(sig):
-    log.info("Signal %s получен — завершение...", sig)
+    log.info("Signal %s — завершение", sig)
     save_state()
     if _shutdown_event:
         _shutdown_event.set()
@@ -1876,7 +1885,6 @@ async def main():
     global monitor_task, _session, _shutdown_event
 
     _shutdown_event = asyncio.Event()
-
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_async_exception)
 
@@ -1887,9 +1895,9 @@ async def main():
         prom_port = getattr(config, "PROM_PORT", 8000)
         try:
             start_http_server(prom_port)
-            log.info("Prometheus metrics on :%d", prom_port)
+            log.info("Prometheus on :%d", prom_port)
         except Exception as e:
-            log.warning("Prometheus start failed: %s", e)
+            log.warning("Prometheus failed: %s", e)
 
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -1907,8 +1915,7 @@ async def main():
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-        log.info("Завершение задач...")
+        log.info("Завершение...")
         for t in pending:
             if not t.done():
                 t.cancel()
