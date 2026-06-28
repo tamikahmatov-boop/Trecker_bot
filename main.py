@@ -844,7 +844,7 @@ def detect_short_reversal(
     stoch_rsi_val = None
     if rsi is not None and rsi > REVERSAL_RSI_OB:
         score += 1
-        factors.append(f"RSI перекуплен ({rsi:.1f} > {REVERSAL_RSI_OB})")
+        factors.append(f"RSI перекуплен ({rsi:.1f} &gt; {REVERSAL_RSI_OB})")
 
     # ── 2. StochRSI ───────────────────────────────────────────────────────────
     stoch_rsi_val = calculate_stoch_rsi(prices)
@@ -852,7 +852,7 @@ def detect_short_reversal(
         threshold = REVERSAL_STOCH_OB if (rsi is not None and rsi > REVERSAL_RSI_OB) else REVERSAL_STOCH_EXT
         if stoch_rsi_val > threshold:
             score += 1
-            factors.append(f"StochRSI перекупленность ({stoch_rsi_val:.2f} > {threshold})")
+            factors.append(f"StochRSI перекупленность ({stoch_rsi_val:.2f} &gt; {threshold})")
 
     # ── 3. Боллинджер %B ─────────────────────────────────────────────────────
     bb_pct = calculate_bollinger_pct(prices)
@@ -909,7 +909,7 @@ def detect_short_reversal(
     ema_data = calculate_ema_cross(prices)
     if ema_data["cross_down"]:
         score += 1
-        factors.append(f"EMA9 пробила EMA21 вниз ({ema_data['ema_fast']:.4g} < {ema_data['ema_slow']:.4g})")
+        factors.append(f"EMA9 пробила EMA21 вниз ({ema_data['ema_fast']:.4g} &lt; {ema_data['ema_slow']:.4g})")
     elif (ema_data["gap_pct"] is not None
           and ema_data["gap_pct"] < -0.05):
         # EMA9 уже ниже EMA21 — медвежья зона
@@ -1763,13 +1763,13 @@ async def _cmd_reversal_settings(chat_id):
         f"<b>Скоринг:</b>\n"
         f"  Порог:         <code>{REVERSAL_MIN_SCORE}/12</code>    → /rev_score 4\n\n"
         f"<b>Пороги факторов:</b>\n"
-        f"  RSI OB:        <code>> {REVERSAL_RSI_OB}</code>       → /rev_rsi 70\n"
-        f"  StochRSI:      <code>> {REVERSAL_STOCH_OB}</code>    → /rev_stoch 0.80\n"
-        f"  Боллинджер:    <code>> {REVERSAL_BB_OB}</code>       → /rev_bb 1.0\n"
-        f"  Замедление:    <code>< {REVERSAL_ACCEL}</code>       → /rev_accel 0.5\n"
-        f"  Моментум:      <code>< {REVERSAL_MOMENTUM}%</code>  → /rev_momentum -0.5\n"
-        f"  ATR-перегрев:  <code>> {REVERSAL_ATR_MULT}×</code>  → /rev_atr 3.0\n"
-        f"  Объём слабый:  <code>< {REVERSAL_VOL_RATIO:.0%}</code>   → /rev_vol 0.7\n"
+        f"  RSI OB:        <code>&gt; {REVERSAL_RSI_OB}</code>       → /rev_rsi 70\n"
+        f"  StochRSI:      <code>&gt; {REVERSAL_STOCH_OB}</code>    → /rev_stoch 0.80\n"
+        f"  Боллинджер:    <code>&gt; {REVERSAL_BB_OB}</code>       → /rev_bb 1.0\n"
+        f"  Замедление:    <code>&lt; {REVERSAL_ACCEL}</code>       → /rev_accel 0.5\n"
+        f"  Моментум:      <code>&lt; {REVERSAL_MOMENTUM}%</code>  → /rev_momentum -0.5\n"
+        f"  ATR-перегрев:  <code>&gt; {REVERSAL_ATR_MULT}×</code>  → /rev_atr 3.0\n"
+        f"  Объём слабый:  <code>&lt; {REVERSAL_VOL_RATIO:.0%}</code>   → /rev_vol 0.7\n"
         f"  Зона хая 24h:  <code>{high_pct}%</code>             → /rev_high 0.2\n\n"
         f"<b>Кулдаун:</b>\n"
         f"  Между сигналами: <code>{REVERSAL_COOLDOWN_SEC // 60} мин</code>  → /rev_cooldown 5\n\n"
