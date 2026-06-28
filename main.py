@@ -1,27 +1,28 @@
 """
-Crypto Alert Bot — v14
-Исправления и улучшения vs v13:
+Crypto Alert Bot — v15
+Изменения vs v14:
 
-  БАГИ ИСПРАВЛЕНЫ:
-  • global REVERSAL_HIGH_MARGIN не был в списке global handle_message → /rev_high не работал
-  • Кнопки 🎚 Порог X/12 присваивали локальную переменную → порог не менялся
-  • Факторы разворота с < > вызывали Telegram HTML 400 → экранированы в _cmd_reversals
-    и format_reversal_alert через _esc()
-  • KLINE_CACHE был по ключу symbol (без interval) → один таймфрейм затирал другой
+  НОВЫЕ КНОПКИ:
+  • 📉 Разворот 1/5/10/15/25% — порог роста для разворотных сигналов в шорт
+    (ранее было привязано к current_percent; теперь отдельная переменная REVERSAL_GROWTH_MIN_PCT)
+  • 🔔 Уведомить 15% — включает уведомления о крупном движении ≥15% (рост или падение)
+  • Команды: /rev_growth N, /notify_pct N
 
-  УЛУЧШЕНИЯ ДАННЫХ РАЗВОРОТА (двойной таймфрейм):
-  • Min1 x120 — для краткосрочных: RSI, StochRSI, Боллинджер, свечные паттерны
-  • Min5 x100 — для долгосрочных: ATR, EMA-крест, MACD, объём, RSI-дивергенция, моментум
-  • Фактор 7 (отбой от хая): красная свеча у хая вместо 4 тиков подряд (менее шумно)
-  • Фактор 10 (ATR): 12 свечей по 5m = 1 час вместо 30 тиков (реальный диапазон)
-  • Фактор 11 (паттерны): чётко на Min1 закрытых свечах
-  • Фактор 12 (объём): Min5 как основной, Min1 как резерв, тики как последний fallback
-  • KLINE_CACHE ключ теперь включает interval+limit → нет коллизий
+  УДАЛЕНЫ:
+  • Кнопки 🗄 БД Статистика и 🧹 БД Очистка убраны из клавиатуры
+    (команды /db_stats и /db_cleanup по-прежнему работают)
 
-  ДРУГИЕ УЛУЧШЕНИЯ:
-  • Кнопки 🎚 Порог — показывают подсказку (агрессивный/стандарт/строгий)
-  • /rev_high показывает текущее значение при ошибке
-  • Все факторы разворота экранируются перед отправкой в HTML
+  ИСПРАВЛЕНИЯ:
+  • global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT добавлены в handle_message
+  • RSI форматирование в f-строке уведомления исправлено (убран conditional .1f в f-string)
+  • monitor() корректно использует REVERSAL_GROWTH_MIN_PCT вместо current_percent * 0.5
+  • Все данные индикаторов — MEXC contract API; список монет — Bybit public listing
+
+  ПРЕДЫДУЩИЕ ИСПРАВЛЕНИЯ (v14):
+  • global REVERSAL_HIGH_MARGIN добавлен в handle_message
+  • Кнопки 🎚 Порог теперь корректно меняют глобал
+  • Факторы разворота с < > экранируются в HTML
+  • KLINE_CACHE ключ включает interval+limit → нет коллизий
 """
 
 from __future__ import annotations
@@ -381,6 +382,14 @@ REVERSAL_HIGH_MARGIN: float = getattr(config, "REVERSAL_HIGH_MARGIN", 0.998)
 REVERSAL_MOMENTUM:    float = getattr(config, "REVERSAL_MOMENTUM",    -0.5)
 REVERSAL_ATR_MULT:    float = getattr(config, "REVERSAL_ATR_MULT",    3.0)    # ATR перегрев
 REVERSAL_VOL_RATIO:   float = getattr(config, "REVERSAL_VOL_RATIO",   0.7)    # объём < 70% средн.
+
+# Минимальный % роста за 24ч для проверки разворота на шорт (кнопки 1/5/10/15/25%)
+REVERSAL_GROWTH_MIN_PCT: float = getattr(config, "REVERSAL_GROWTH_MIN_PCT", 5.0)
+
+# Порог уведомлений о росте/падении (кнопка 🔔 Уведомить 15%)
+NOTIFY_BIG_MOVE_PCT: float = getattr(config, "NOTIFY_BIG_MOVE_PCT", 15.0)
+_notify_cooldown: dict[str, float] = {}   # {sym: last_sent_ts}
+NOTIFY_BIG_MOVE_COOLDOWN_SEC: int = 3600  # не чаще 1 раза в час
 
 
 def _cache_load_levels():
@@ -1070,18 +1079,20 @@ def reply_keyboard():
         "keyboard": [
             # Строка 1 — Управление мониторингом
             ["⏸ Пауза", "▶️ Продолжить", "📊 Статус"],
-            # Строка 2 — Порог роста
+            # Строка 2 — Порог роста (алерты роста/падения)
             ["📈 0.2%", "📈 5%", "📈 10%", "📈 20%"],
             # Строка 3 — Временное окно
             ["⏱ 5 мин", "⏱ 1 час", "⏱ 4 ч", "⏱ 1 д"],
             # Строка 4 — Сигналы и история
             ["📋 История", "🏆 Топ-5", "📤 Экспорт"],
-            # Строка 5 — Разворот
+            # Строка 5 — Разворот + кулдауны + уведомление 15%
             ["🔄 Развороты", "⚙️ Настройки разворота", "🗑 Кулдауны"],
-            # Строка 6 — База данных
-            ["🗄 БД Статистика", "🧹 БД Очистка"],
+            # Строка 6 — Уведомление о росте/падении 15%
+            ["🔔 Уведомить 15%"],
             # Строка 7 — Порог разворота (быстрая настройка)
             ["🎚 Порог 3/12", "🎚 Порог 4/12", "🎚 Порог 5/12", "🎚 Порог 7/12"],
+            # Строка 8 — Процент роста для разворотных сигналов в шорт
+            ["📉 Разворот 1%", "📉 Разворот 5%", "📉 Разворот 10%", "📉 Разворот 15%", "📉 Разворот 25%"],
         ],
         "resize_keyboard": True,
         "persistent":      True,
@@ -1366,6 +1377,7 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
 
 async def monitor():
     global current_percent, current_window, signals_count, reversal_count, checks_count, last_check_time
+    global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT
 
     symbols          = await get_symbols()
     last_symbols_upd = time.time()
@@ -1434,11 +1446,10 @@ async def monitor():
 
                 # ════════════════════════════════════════════════════════════
                 #  БЛОК 1: РАЗВОРОТ НА ШОРТ
-                #  Условие: пиковый рост за 24ч >= 50% от порога
-                #  (монета могла уже откатить, но разворот ещё актуален)
+                #  Условие: пиковый рост за 24ч >= REVERSAL_GROWTH_MIN_PCT
                 # ════════════════════════════════════════════════════════════
                 peak_growth = get_peak_growth_24h(sym, price)
-                if peak_growth >= current_percent * 0.5 or growth >= current_percent * 0.5:
+                if peak_growth >= REVERSAL_GROWTH_MIN_PCT or growth >= REVERSAL_GROWTH_MIN_PCT:
                     last_rev = _reversal_cooldown.get(sym, 0)
                     if now - last_rev >= REVERSAL_COOLDOWN_SEC:
                         rev = detect_short_reversal(
@@ -1463,6 +1474,29 @@ async def monitor():
                                 PROM_REVERSALS.inc()
                             log.info("REVERSAL %s score=%d/%d", sym, rev["score"], 12)
                             continue  # не дублируем обычным алертом
+
+                # ════════════════════════════════════════════════════════════
+                #  БЛОК 1.5: УВЕДОМЛЕНИЕ О БОЛЬШОМ РОСТЕ / ПАДЕНИИ (15% и т.п.)
+                # ════════════════════════════════════════════════════════════
+                if NOTIFY_BIG_MOVE_PCT > 0 and abs(growth) >= NOTIFY_BIG_MOVE_PCT:
+                    last_notif = _notify_cooldown.get(sym, 0)
+                    if now - last_notif >= NOTIFY_BIG_MOVE_COOLDOWN_SEC:
+                        direction_emoji = "🚀" if growth > 0 else "📉"
+                        move_label = "РОСТ" if growth > 0 else "ПАДЕНИЕ"
+                        rsi_str = f"{rsi:.1f}" if rsi is not None else "—"
+                        dur_str = _fmt_dur(calculate_growth_duration(recent))
+                        notif_text = (
+                            f"🔔 <b>КРУПНОЕ ДВИЖЕНИЕ — {move_label}</b>\n\n"
+                            f"🪙 <b>{sym}</b>  [{source}]\n"
+                            f"💵 Цена: <code>{price}</code>\n"
+                            f"{direction_emoji} {move_label}: <b>{growth:+.2f}%</b> "
+                            f"за {dur_str}\n"
+                            f"📊 RSI: <code>{rsi_str}</code>\n\n"
+                            f"📋 <code>{sym}</code> #большое_движение"
+                        )
+                        _notify_cooldown[sym] = now
+                        await broadcast(notif_text)
+                        log.info("BigMove notify: %s %+.2f%%", sym, growth)
 
                 # ════════════════════════════════════════════════════════════
                 #  БЛОК 2: ОБЫЧНЫЕ АЛЕРТЫ (РОСТ / ПАДЕНИЕ)
@@ -1543,7 +1577,7 @@ async def handle_message(msg: dict):
     global REVERSAL_MIN_SCORE, REVERSAL_RSI_OB, REVERSAL_STOCH_OB, REVERSAL_STOCH_EXT
     global REVERSAL_BB_OB, REVERSAL_MACD_SLOPE, REVERSAL_ACCEL, REVERSAL_HIGH_MARGIN
     global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC, REVERSAL_ATR_MULT, REVERSAL_VOL_RATIO
-    # Все глобальные переменные объявлены выше — globals()[var] = val корректно работает
+    global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -1561,21 +1595,26 @@ async def handle_message(msg: dict):
 
     if text in ("/start", "/menu"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v12</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v15</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>\n"
+            f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b>\n"
+            f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
             f"<b>Кнопки управления:</b>\n"
-            f"  📈 0.2% / 5% / 10% / 20% — порог роста\n"
-            f"  ⏱ 5 мин / 1 час / 4 ч / 1 д — период окна\n"
+            f"  📈 0.2%/5%/10%/20% — порог роста/падения алертов\n"
+            f"  📉 Разворот 1-25% — порог роста для шорт-разворота\n"
+            f"  🔔 Уведомить 15% — большие движения ≥15%\n"
+            f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна\n"
             f"  🎚 Порог 3-7/12 — чувствительность разворота\n"
-            f"  ⚙️ Настройки разворота — все параметры\n"
-            f"  🗄 БД Статистика / 🧹 БД Очистка — база\n\n"
+            f"  ⚙️ Настройки разворота — все параметры\n\n"
             f"<b>Команды:</b>\n"
             f"  /set_percent 2.5 — произвольный порог (%)\n"
             f"  /set_window 60 — произвольный период (мин)\n"
             f"  /rev_score 4 — порог факторов разворота\n"
+            f"  /rev_growth 5 — порог роста для разворота (%)\n"
+            f"  /notify_pct 15 — порог уведомлений движения (%)\n"
             f"  /rev_cooldown 5 — кулдаун разворота (мин)",
             chat_id,
             reply_markup=reply_keyboard(),
@@ -1623,6 +1662,8 @@ async def handle_message(msg: dict):
             f"🔔 Сигналов: {signals_count}\n"
             f"🔄 Разворотов: {reversal_count}\n"
             f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/12\n"
+            f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}%\n"
+            f"🔔 Уведомление движения: {NOTIFY_BIG_MOVE_PCT}%\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
             f"📈 Порог роста: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n"
@@ -1679,6 +1720,63 @@ async def handle_message(msg: dict):
             f"💾 Размер: {db_size_mb():.2f} МБ",
             chat_id,
         )
+        return
+
+    # Кнопки % роста для разворотных сигналов в шорт
+    _rev_growth_map = {
+        "📉 Разворот 1%":  1.0,
+        "📉 Разворот 5%":  5.0,
+        "📉 Разворот 10%": 10.0,
+        "📉 Разворот 15%": 15.0,
+        "📉 Разворот 25%": 25.0,
+    }
+    if text in _rev_growth_map:
+        REVERSAL_GROWTH_MIN_PCT = _rev_growth_map[text]
+        await send_message(
+            f"✅ Порог роста для разворота в шорт: <b>{REVERSAL_GROWTH_MIN_PCT}%</b>\n"
+            f"ℹ️ Разворотный детектор сработает если рост ≥ {REVERSAL_GROWTH_MIN_PCT}%",
+            chat_id,
+        )
+        return
+
+    # Кнопка уведомления о росте/падении 15%
+    if text == "🔔 Уведомить 15%":
+        NOTIFY_BIG_MOVE_PCT = 15.0
+        _notify_cooldown.clear()
+        await send_message(
+            f"🔔 Уведомления о движении ≥ <b>15%</b> включены\n"
+            f"Вы получите сигнал при росте или падении монеты на 15% и более.",
+            chat_id,
+        )
+        return
+
+    if text.startswith("/notify_pct"):
+        try:
+            val = float(text.split()[1])
+            assert 1.0 <= val <= 100.0
+            NOTIFY_BIG_MOVE_PCT = val
+            _notify_cooldown.clear()
+            await send_message(f"✅ Уведомление о движении: <b>≥ {val}%</b>", chat_id)
+        except Exception:
+            await send_message(
+                f"❌ /notify_pct 15   (текущее: {NOTIFY_BIG_MOVE_PCT}%)\n"
+                f"Диапазон: 1–100", chat_id
+            )
+        return
+
+    if text.startswith("/rev_growth"):
+        try:
+            val = float(text.split()[1])
+            assert 0.1 <= val <= 100.0
+            REVERSAL_GROWTH_MIN_PCT = val
+            await send_message(
+                f"✅ Порог роста для разворота: <b>{val}%</b>", chat_id
+            )
+        except Exception:
+            await send_message(
+                f"❌ /rev_growth 5   (текущее: {REVERSAL_GROWTH_MIN_PCT}%)\n"
+                f"Диапазон: 0.1–100", chat_id
+            )
         return
 
     # Быстрая настройка порога разворота через кнопки
