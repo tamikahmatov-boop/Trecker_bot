@@ -383,8 +383,11 @@ REVERSAL_MOMENTUM:    float = getattr(config, "REVERSAL_MOMENTUM",    -0.5)
 REVERSAL_ATR_MULT:    float = getattr(config, "REVERSAL_ATR_MULT",    3.0)    # ATR перегрев
 REVERSAL_VOL_RATIO:   float = getattr(config, "REVERSAL_VOL_RATIO",   0.7)    # объём < 70% средн.
 
-# Минимальный % роста за 24ч для проверки разворота на шорт (кнопки 1/5/10/15/25%)
+# Минимальный % роста за период для проверки разворота на шорт (кнопки 1/5/10/15/25%)
 REVERSAL_GROWTH_MIN_PCT: float = getattr(config, "REVERSAL_GROWTH_MIN_PCT", 5.0)
+
+# Период для расчёта пикового роста разворота (кнопки 5м/30м/1ч/4ч/1д)
+REVERSAL_WINDOW_SEC: int = getattr(config, "REVERSAL_WINDOW_SEC", 3600)  # по умолчанию 1 час
 
 # Порог уведомлений о росте/падении (задаётся через /notify_pct или автоматически = current_percent)
 NOTIFY_BIG_MOVE_PCT: float = getattr(config, "NOTIFY_BIG_MOVE_PCT", 15.0)
@@ -820,21 +823,26 @@ def get_24h_context(sym: str, price: float) -> Optional[str]:
     return f"📉 от хая: {dist_high:+.1f}%  📈 от лоя: {dist_low:+.1f}%"
 
 
-def get_peak_growth_24h(sym: str, price: float) -> float:
+def get_peak_growth(sym: str, price: float, window_sec: int = 3600) -> float:
     """
-    Максимальный рост за 24ч от минимума к текущей цене.
+    Максимальный рост за window_sec от минимума к текущей цене.
     Используется для разворотного детектора: монета могла уже откатить,
     но пиковый рост сохраняется в истории.
     """
     hist = price_history.get(sym, [])
     now  = time.time()
-    day_prices = [p for t, p in hist if now - t <= 86400]
-    if not day_prices:
+    window_prices = [p for t, p in hist if now - t <= window_sec]
+    if not window_prices:
         return 0.0
-    low24 = min(day_prices)
-    if low24 <= 0:
+    low = min(window_prices)
+    if low <= 0:
         return 0.0
-    return (price - low24) / low24 * 100
+    return (price - low) / low * 100
+
+
+# Обратная совместимость
+def get_peak_growth_24h(sym: str, price: float) -> float:
+    return get_peak_growth(sym, price, window_sec=86400)
 
 
 # ================================================================
@@ -1091,6 +1099,8 @@ def reply_keyboard():
             ["🎚 Порог 3/12", "🎚 Порог 4/12", "🎚 Порог 5/12", "🎚 Порог 7/12"],
             # Строка 7 — Процент роста для разворотных сигналов в шорт
             ["📉 Разворот 1%", "📉 Разворот 5%", "📉 Разворот 10%", "📉 Разворот 15%", "📉 Разворот 25%"],
+            # Строка 8 — Период окна для расчёта роста разворота
+            ["🕐 Разворот 5м", "🕐 Разворот 30м", "🕐 Разворот 1ч", "🕐 Разворот 4ч", "🕐 Разворот 1д"],
         ],
         "resize_keyboard": True,
         "persistent":      True,
@@ -1199,6 +1209,7 @@ def format_reversal_alert(
     source:       str,
     rev:          dict,
     duration_sec: int = 0,
+    window_sec:   int = 3600,
 ) -> str:
     """
     Уведомление о развороте на шорт.
@@ -1253,7 +1264,7 @@ def format_reversal_alert(
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
-        f"📈 Рост до разворота: <b>+{growth:.2f}%</b> за {_fmt_dur(duration_sec)}\n\n"
+        f"📈 Рост до разворота: <b>+{growth:.2f}%</b> за {_fmt_dur(window_sec)}\n\n"
         f"🎯 Уверенность: {confidence}  [{score}/12]\n\n"
         f"<b>Сработавшие факторы:</b>\n{factors_s}\n\n"
         f"<b>Индикаторы:</b>\n"
@@ -1444,9 +1455,10 @@ async def monitor():
 
                 # ════════════════════════════════════════════════════════════
                 #  БЛОК 1: РАЗВОРОТ НА ШОРТ
-                #  Условие: пиковый рост за 24ч >= REVERSAL_GROWTH_MIN_PCT
+                #  Условие: пиковый рост за REVERSAL_WINDOW_SEC >= REVERSAL_GROWTH_MIN_PCT
                 # ════════════════════════════════════════════════════════════
-                peak_growth = get_peak_growth_24h(sym, price)
+                peak_growth = get_peak_growth(sym, price, REVERSAL_WINDOW_SEC)
+                # growth в текущем окне алертов; peak_growth — в окне разворота
                 if peak_growth >= REVERSAL_GROWTH_MIN_PCT or growth >= REVERSAL_GROWTH_MIN_PCT:
                     last_rev = _reversal_cooldown.get(sym, 0)
                     if now - last_rev >= REVERSAL_COOLDOWN_SEC:
@@ -1458,6 +1470,7 @@ async def monitor():
                             rev_text = format_reversal_alert(
                                 sym, price, max(growth, peak_growth), source, rev,
                                 duration_sec=duration,
+                                window_sec=REVERSAL_WINDOW_SEC,
                             )
                             _reversal_cooldown[sym] = now
                             db_save_reversal(
@@ -1575,7 +1588,7 @@ async def handle_message(msg: dict):
     global REVERSAL_MIN_SCORE, REVERSAL_RSI_OB, REVERSAL_STOCH_OB, REVERSAL_STOCH_EXT
     global REVERSAL_BB_OB, REVERSAL_MACD_SLOPE, REVERSAL_ACCEL, REVERSAL_HIGH_MARGIN
     global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC, REVERSAL_ATR_MULT, REVERSAL_VOL_RATIO
-    global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT
+    global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT, REVERSAL_WINDOW_SEC
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -1595,22 +1608,24 @@ async def handle_message(msg: dict):
         await send_message(
             f"🚀 <b>Crypto Alert Bot v15</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
-            f"⏱ Период: <b>{current_window // 60} мин</b>\n"
+            f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>\n"
-            f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b>\n"
+            f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b> за <b>{_fmt_dur(REVERSAL_WINDOW_SEC)}</b>\n"
             f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
-            f"  📉 Разворот 1-25% — порог роста для шорт-разворота\n"
-            f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна\n"
-            f"  🎚 Порог 3-7/12 — чувствительность разворота\n"
+            f"  📉 Разворот 1-25% — минимальный рост для шорт-разворота\n"
+            f"  🕐 Разворот 5м-1д — период расчёта роста разворота\n"
+            f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна алертов\n"
+            f"  🎚 Порог 3-7/12 — чувствительность (кол-во факторов)\n"
             f"  ⚙️ Настройки разворота — все параметры\n\n"
             f"<b>Команды:</b>\n"
-            f"  /set_percent 2.5 — произвольный порог (%)\n"
-            f"  /set_window 60 — произвольный период (мин)\n"
+            f"  /set_percent 2.5 — порог алертов (%)\n"
+            f"  /set_window 60 — период алертов (мин)\n"
             f"  /rev_score 4 — порог факторов разворота\n"
-            f"  /rev_growth 5 — порог роста для разворота (%)\n"
+            f"  /rev_growth 5 — % роста для разворота\n"
+            f"  /rev_window 60 — период роста разворота (мин)\n"
             f"  /notify_pct 15 — порог уведомлений движения (%)\n"
             f"  /rev_cooldown 5 — кулдаун разворота (мин)",
             chat_id,
@@ -1659,7 +1674,7 @@ async def handle_message(msg: dict):
             f"🔔 Сигналов: {signals_count}\n"
             f"🔄 Разворотов: {reversal_count}\n"
             f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/12\n"
-            f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}%\n"
+            f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}% за {_fmt_dur(REVERSAL_WINDOW_SEC)}\n"
             f"🔔 Уведомление движения: {NOTIFY_BIG_MOVE_PCT}%\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
             f"📈 Порог роста: {current_percent}%\n"
@@ -1762,6 +1777,39 @@ async def handle_message(msg: dict):
             await send_message(
                 f"❌ /rev_growth 5   (текущее: {REVERSAL_GROWTH_MIN_PCT}%)\n"
                 f"Диапазон: 0.1–100", chat_id
+            )
+        return
+
+    # Кнопки периода окна для расчёта роста разворота
+    _rev_window_map = {
+        "🕐 Разворот 5м":  (300,   "5 минут"),
+        "🕐 Разворот 30м": (1800,  "30 минут"),
+        "🕐 Разворот 1ч":  (3600,  "1 час"),
+        "🕐 Разворот 4ч":  (14400, "4 часа"),
+        "🕐 Разворот 1д":  (86400, "1 день"),
+    }
+    if text in _rev_window_map:
+        REVERSAL_WINDOW_SEC, label = _rev_window_map[text]
+        await send_message(
+            f"✅ Окно роста для разворота: <b>{label}</b>\n"
+            f"ℹ️ Разворотный детектор смотрит рост монеты за последние <b>{label}</b>.\n"
+            f"Порог: <b>{REVERSAL_GROWTH_MIN_PCT}%</b> за этот период.",
+            chat_id,
+        )
+        return
+
+    if text.startswith("/rev_window"):
+        try:
+            val = int(text.split()[1])
+            assert 1 <= val <= 10080
+            REVERSAL_WINDOW_SEC = val * 60
+            await send_message(
+                f"✅ Окно разворота: <b>{val} мин</b> ({_fmt_dur(REVERSAL_WINDOW_SEC)})", chat_id
+            )
+        except Exception:
+            cur = _fmt_dur(REVERSAL_WINDOW_SEC)
+            await send_message(
+                f"❌ /rev_window 60   (в минутах, 1–10080)\nТекущее: {cur}", chat_id
             )
         return
 
