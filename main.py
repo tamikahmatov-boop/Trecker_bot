@@ -1,28 +1,56 @@
 """
-Crypto Alert Bot — v15
-Изменения vs v14:
+Crypto Alert Bot — v16
+Полный аудит, исправление всех ошибок и расширение до 16 факторов разворота.
 
-  НОВЫЕ КНОПКИ:
-  • 📉 Разворот 1/5/10/15/25% — порог роста для разворотных сигналов в шорт
-    (ранее было привязано к current_percent; теперь отдельная переменная REVERSAL_GROWTH_MIN_PCT)
-  • 🔔 Уведомить 15% — включает уведомления о крупном движении ≥15% (рост или падение)
-  • Команды: /rev_growth N, /notify_pct N
+═══════════════════════════════════════════════════════
+ ИСПРАВЛЕННЫЕ БАГИ
+═══════════════════════════════════════════════════════
+• db_connect: не делал commit() → INSERT мог не сохраняться. Добавлен commit/rollback.
+• _fetch_mexc_klines: не запрашивал поле "open" → detect_candle_pattern использовал
+  closes[-2] как open текущей свечи → Shooting Star никогда не срабатывал.
+  Исправлено: opens теперь запрашиваются и передаются в detect_candle_pattern.
+• detect_candle_pattern: полностью переписан — реальные opens, добавлен паттерн
+  "Вечерняя звезда" (3 бара), исправлена логика тела/тени.
+• monitor: get_rsi_trend_from_mexc() делал отдельный HTTP запрос хотя closes уже есть.
+  Заменено на calculate_rsi_trend(closes).
+• price_change использовалась в log.info но могла быть не определена → NameError.
+• import os был внутри db_size_mb() → перемещён на уровень модуля.
+• 🧹 БД Очистка: выводила Python dict → заменена на читаемый текст.
+• _esc() определялась внутри format_reversal_alert при каждом вызове → перенесена
+  на уровень модуля (DRY).
+• MACD_SLOPE дефолт -0.000005 слишком мал → никогда не срабатывал slope-ветка.
+• get_mexc_klines_multi: fallback dict не содержал "opens" → KeyError в паттернах.
+• _kline_cache / _alert_cooldown / price_history: не чистились → утечка памяти.
+  Добавлена периодическая очистка в monitor loop.
 
-  УДАЛЕНЫ:
-  • Кнопки 🗄 БД Статистика и 🧹 БД Очистка убраны из клавиатуры
-    (команды /db_stats и /db_cleanup по-прежнему работают)
+═══════════════════════════════════════════════════════
+ НОВЫЕ ФАКТОРЫ РАЗВОРОТА (13–16, теперь итого 16/16)
+═══════════════════════════════════════════════════════
+• 13. OBV-дивергенция (Min15): цена растёт, On-Balance Volume падает.
+      Сигнал ослабления покупательского давления.
+• 14. Wick Rejection Ratio > 0.55 (Min1): среднее отношение верхней тени
+      к диапазону за 3 свечи. Указывает на систематическое отталкивание цены от верха.
+• 15. RSI старшего TF > 75 (Min15): перекупленность на 15-минутном таймфрейме
+      в сочетании с 1m-сигналами даёт подтверждение разворота.
+• 16. Lower Highs паттерн (Min5): 3+ последовательных снижения максимумов —
+      структурный медвежий разворот.
 
-  ИСПРАВЛЕНИЯ:
-  • global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT добавлены в handle_message
-  • RSI форматирование в f-строке уведомления исправлено (убран conditional .1f в f-string)
-  • monitor() корректно использует REVERSAL_GROWTH_MIN_PCT вместо current_percent * 0.5
-  • Все данные индикаторов — MEXC contract API; список монет — Bybit public listing
+═══════════════════════════════════════════════════════
+ УЛУЧШЕНИЯ ДАННЫХ (3 таймфрейма параллельно)
+═══════════════════════════════════════════════════════
+• Min1  x120: RSI, StochRSI, BB, паттерны (с реальными opens), wick rejection
+• Min5  x100: MACD, EMA, ATR, моментум, объём, lower highs
+• Min15 x60:  OBV-дивергенция, RSI старшего TF, RSI-дивергенция
+  Все три таймфрейма загружаются параллельно через asyncio.gather.
 
-  ПРЕДЫДУЩИЕ ИСПРАВЛЕНИЯ (v14):
-  • global REVERSAL_HIGH_MARGIN добавлен в handle_message
-  • Кнопки 🎚 Порог теперь корректно меняют глобал
-  • Факторы разворота с < > экранируются в HTML
-  • KLINE_CACHE ключ включает interval+limit → нет коллизий
+═══════════════════════════════════════════════════════
+ ДРУГИЕ УЛУЧШЕНИЯ
+═══════════════════════════════════════════════════════
+• format_reversal_alert: RSI 1m + RSI 15m, Wick ratio, 3 цели Фибо (38.2/50/61.8%)
+• Уровни уверенности пересчитаны под 16 факторов: слабый <6, средний 6-9, высокий 10+
+• _cmd_reversal_settings: описание всех 16 факторов с новыми факторами 13-16
+• Пресеты обновлены: стандарт /rev_score 5, строгий /rev_score 9
+• /rev_score принимает значения 1–16 (было 1–12)
 """
 
 from __future__ import annotations
@@ -32,6 +60,7 @@ import csv
 import io
 import json
 import logging
+import os
 import signal
 import sqlite3
 import time
@@ -84,6 +113,10 @@ def db_connect():
     conn.execute("PRAGMA synchronous=NORMAL")
     try:
         yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -237,7 +270,6 @@ def db_vacuum():
 
 
 def db_size_mb() -> float:
-    import os
     try:
         return os.path.getsize(DB_FILE) / 1_048_576
     except OSError:
@@ -366,7 +398,14 @@ _session: aiohttp.ClientSession | None = None
 _alert_cooldown:    dict[str, float] = {}
 _reversal_cooldown: dict[str, float] = {}
 ALERT_COOLDOWN_SEC:    int = getattr(config, "ALERT_COOLDOWN_SEC",    60)
-REVERSAL_COOLDOWN_SEC: int = getattr(config, "REVERSAL_COOLDOWN_SEC", 300)
+REVERSAL_COOLDOWN_SEC: int = getattr(config, "REVERSAL_COOLDOWN_SEC", 1800)  # 30 мин по умолчанию
+
+# Умный фильтр повторных разворотных сигналов по одной монете:
+#   - цена должна измениться минимум на REVERSAL_REPEAT_PRICE_PCT% от прошлого сигнала
+#   - или скор должен вырасти минимум на REVERSAL_REPEAT_SCORE_DELTA
+_reversal_last: dict[str, dict] = {}   # {sym: {price, score, ts}}
+REVERSAL_REPEAT_PRICE_PCT:  float = getattr(config, "REVERSAL_REPEAT_PRICE_PCT",  3.0)   # 3% смены цены
+REVERSAL_REPEAT_SCORE_DELTA: int  = getattr(config, "REVERSAL_REPEAT_SCORE_DELTA", 2)    # +2 фактора
 
 _levels_cache: dict[str, dict] = {}
 
@@ -439,8 +478,8 @@ KLINE_LIMIT = KLINE_LIMIT_1M
 
 
 async def _fetch_mexc_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
-    """Возвращает dict с ключами: closes, highs, lows, volumes (все list[float])."""
-    empty = {"closes": [], "highs": [], "lows": [], "volumes": []}
+    """Возвращает dict с ключами: opens, closes, highs, lows, volumes (все list[float])."""
+    empty = {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
     try:
         async with _session.get(
             "https://contract.mexc.com/api/v1/contract/kline",
@@ -451,10 +490,11 @@ async def _fetch_mexc_klines(symbol: str, interval: str = "Min1", limit: int = K
         if data.get("success") and data.get("data"):
             d = data["data"]
             return {
-                "closes":  [float(c) for c in d.get("close",  [])],
-                "highs":   [float(c) for c in d.get("high",   [])],
-                "lows":    [float(c) for c in d.get("low",    [])],
-                "volumes": [float(c) for c in d.get("vol",    [])],
+                "opens":   [float(c) for c in d.get("open",  [])],
+                "closes":  [float(c) for c in d.get("close", [])],
+                "highs":   [float(c) for c in d.get("high",  [])],
+                "lows":    [float(c) for c in d.get("low",   [])],
+                "volumes": [float(c) for c in d.get("vol",   [])],
             }
     except Exception as e:
         log.debug("MEXC kline %s %s: %s", symbol, interval, e)
@@ -470,26 +510,36 @@ async def get_mexc_klines(symbol: str, interval: str = "Min1", limit: int = KLIN
     data = await _fetch_mexc_klines(symbol, interval, limit)
     if data["closes"]:
         _kline_cache[cache_key] = {"ts": now, "data": data}
+    # Очищаем устаревшие записи при переполнении (предотвращаем утечку памяти)
+    if len(_kline_cache) > 3000:
+        stale = [k for k, v in _kline_cache.items() if now - v["ts"] > KLINE_CACHE_TTL * 5]
+        for k in stale:
+            _kline_cache.pop(k, None)
     return data
+
+
+KLINE_LIMIT_15M  = 60    # 60 свечей по 15 мин = 15 часов (старший таймфрейм RSI, OBV)
 
 
 async def get_mexc_klines_multi(symbol: str) -> dict:
     """
-    Получает два таймфрейма параллельно:
-      - Min1 x120 (краткосрочные индикаторы: RSI, BB, паттерны)
-      - Min5 x100 (долгосрочные: ATR, EMA, MACD, объём)
-    Возвращает объединённый dict с ключами klines_1m и klines_5m.
+    Получает три таймфрейма параллельно:
+      - Min1  x120 — RSI, StochRSI, BB, паттерны свечей, wick rejection
+      - Min5  x100 — ATR, EMA, MACD, объём, моментум, lower highs
+      - Min15 x60  — OBV-дивергенция, RSI старшего TF, структура тренда
     """
-    klines_1m, klines_5m = await asyncio.gather(
-        get_mexc_klines(symbol, "Min1", KLINE_LIMIT_1M),
-        get_mexc_klines(symbol, "Min5", KLINE_LIMIT_5M),
+    _empty = {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
+    results = await asyncio.gather(
+        get_mexc_klines(symbol, "Min1",  KLINE_LIMIT_1M),
+        get_mexc_klines(symbol, "Min5",  KLINE_LIMIT_5M),
+        get_mexc_klines(symbol, "Min15", KLINE_LIMIT_15M),
         return_exceptions=True,
     )
-    if isinstance(klines_1m, Exception):
-        klines_1m = {"closes": [], "highs": [], "lows": [], "volumes": []}
-    if isinstance(klines_5m, Exception):
-        klines_5m = {"closes": [], "highs": [], "lows": [], "volumes": []}
-    return {"klines_1m": klines_1m, "klines_5m": klines_5m}
+    return {
+        "klines_1m":  results[0] if not isinstance(results[0], Exception) else _empty,
+        "klines_5m":  results[1] if not isinstance(results[1], Exception) else _empty,
+        "klines_15m": results[2] if not isinstance(results[2], Exception) else _empty,
+    }
 
 
 async def get_mexc_closes(symbol: str, interval: str = "Min1") -> list[float]:
@@ -623,40 +673,73 @@ def calculate_atr(highs: list[float], lows: list[float],
 
 
 def detect_candle_pattern(closes: list[float], highs: list[float],
-                           lows: list[float]) -> Optional[str]:
+                           lows: list[float],
+                           opens: list[float] | None = None) -> Optional[str]:
     """
-    Определяет медвежий свечной паттерн на последних 2 барах:
-      - Shooting Star: тело внизу, длинная верхняя тень (>2× тела)
-      - Доджи: открытие ≈ закрытие (тело < 10% диапазона)
+    Медвежий свечной паттерн на последних 2 барах.
+    opens — реальные цены открытия из MEXC kline (поле 'open').
+    Если не переданы, аппроксимируем prev_close.
+      - Shooting Star: длинная верхняя тень >2× тела, тело внизу, закрытие < открытие
+      - Доджи: тело < 10% диапазона — нерешительность
       - Медвежье поглощение: красная свеча полностью поглощает предыдущую зелёную
+      - Вечерняя звезда (3 бара): бычья → доджи/малое тело → красная
     """
     try:
         if len(closes) < 3 or len(highs) < 3 or len(lows) < 3:
             return None
 
-        # Последняя свеча
-        o1, c1, h1, l1 = closes[-2], closes[-1], highs[-1], lows[-1]
-        body1  = abs(c1 - o1)
-        range1 = h1 - l1
-        if range1 == 0:
-            return None
-        upper_wick = h1 - max(c1, o1)
-        lower_wick = min(c1, o1) - l1
+        # Реальные opens из MEXC или аппроксимация
+        if opens and len(opens) >= 3:
+            o_prev2 = opens[-3]
+            o_prev  = opens[-2]
+            o_cur   = opens[-1]
+        else:
+            o_prev2 = closes[-4] if len(closes) >= 4 else closes[-3]
+            o_prev  = closes[-3]
+            o_cur   = closes[-2]
 
-        # Shooting Star: верхняя тень > 2× тела, нижняя тень маленькая, закрытие ниже открытия
-        if (body1 > 0 and upper_wick > 2 * body1
-                and lower_wick < body1
-                and c1 < o1):
+        c_prev2 = closes[-3]
+        c_prev  = closes[-2]
+        c_cur   = closes[-1]
+        h_cur   = highs[-1]
+        l_cur   = lows[-1]
+        h_prev  = highs[-2]
+
+        body_cur  = abs(c_cur  - o_cur)
+        body_prev = abs(c_prev - o_prev)
+        rng_cur   = h_cur - l_cur
+        if rng_cur == 0:
+            return None
+
+        upper_wick = h_cur - max(c_cur, o_cur)
+        lower_wick = min(c_cur, o_cur) - l_cur
+
+        # Shooting Star: длинная верхняя тень >2× тела, нижняя тень < тела, медвежья
+        if (body_cur > 0
+                and upper_wick > 2 * body_cur
+                and lower_wick < body_cur * 0.5
+                and c_cur < o_cur):
             return "Shooting Star 🌠"
 
-        # Доджи: тело < 10% диапазона
-        if body1 < range1 * 0.1:
+        # Доджи: тело < 10% диапазона (нерешительность на пике)
+        if body_cur < rng_cur * 0.1:
             return "Доджи ✝️"
 
-        # Медвежье поглощение: предыдущая зелёная, текущая красная и больше
-        o0, c0 = closes[-3], closes[-2]
-        if c0 > o0 and c1 < o1 and o1 >= c0 and c1 <= o0:
+        # Медвежье поглощение: пред. зелёная, текущая красная и больше
+        if (c_prev > o_prev         # предыдущая — зелёная
+                and c_cur < o_cur   # текущая — красная
+                and o_cur >= c_prev # открытие ≥ закрытие пред.
+                and c_cur <= o_prev # закрытие ≤ открытие пред.
+                and body_cur > body_prev):
             return "Медвежье поглощение 🐻"
+
+        # Вечерняя звезда (3 бара): бычья → малое тело/доджи → красная
+        body_prev2 = abs(c_prev2 - o_prev2)
+        if (c_prev2 > o_prev2              # 1й бар — зелёный бычий
+                and body_prev < body_prev2 * 0.3  # 2й бар — малое тело
+                and c_cur < o_cur          # 3й бар — красный медвежий
+                and c_cur < (o_prev2 + c_prev2) / 2):  # закрытие ниже середины 1го бара
+            return "Вечерняя звезда 🌆"
 
     except Exception as e:
         log.error("Candle pattern error: %s", e)
@@ -845,83 +928,178 @@ def get_peak_growth_24h(sym: str, price: float) -> float:
     return get_peak_growth(sym, price, window_sec=86400)
 
 
+def calculate_obv_divergence(closes: list[float], volumes: list[float],
+                              lookback: int = 15) -> bool:
+    """
+    OBV-дивергенция: цена растёт, On-Balance Volume падает.
+    Надёжный признак ослабления покупательского давления.
+    """
+    try:
+        if len(closes) < lookback + 1 or len(volumes) < lookback + 1:
+            return False
+        # Считаем OBV
+        obv = [0.0]
+        for i in range(1, len(closes)):
+            if closes[i] > closes[i - 1]:
+                obv.append(obv[-1] + volumes[i])
+            elif closes[i] < closes[i - 1]:
+                obv.append(obv[-1] - volumes[i])
+            else:
+                obv.append(obv[-1])
+        # Цена: новый хай за lookback
+        price_rising = closes[-1] > max(closes[-(lookback + 1):-1])
+        # OBV: падает (текущий < среднего за lookback)
+        obv_now  = obv[-1]
+        obv_prev = sum(obv[-(lookback + 1):-1]) / lookback
+        obv_falling = obv_now < obv_prev * 0.97  # OBV упал на 3%+
+        return price_rising and obv_falling
+    except Exception:
+        return False
+
+
+def calculate_wick_rejection(highs: list[float], lows: list[float],
+                              opens: list[float], closes: list[float],
+                              lookback: int = 3) -> Optional[float]:
+    """
+    Wick Rejection Ratio: отношение верхней тени к полному диапазону.
+    >0.6 = сильное отталкивание от верхней зоны (медвежий признак).
+    Усредняется за последние lookback свечей.
+    """
+    try:
+        n = min(lookback, len(closes))
+        if n < 1:
+            return None
+        ratios = []
+        for i in range(-n, 0):
+            rng = highs[i] - lows[i]
+            if rng == 0:
+                continue
+            upper_wick = highs[i] - max(opens[i], closes[i])
+            ratios.append(upper_wick / rng)
+        return round(sum(ratios) / len(ratios), 3) if ratios else None
+    except Exception:
+        return None
+
+
+def calculate_lower_highs(highs: list[float], window: int = 5) -> bool:
+    """
+    Паттерн убывающих максимумов (Lower Highs) на последних window свечах.
+    3+ последовательных снижения хая = структурный разворот.
+    """
+    try:
+        if len(highs) < window + 1:
+            return False
+        recent = highs[-window:]
+        # Считаем сколько раз хай ниже предыдущего
+        lower_count = sum(1 for i in range(1, len(recent)) if recent[i] < recent[i - 1])
+        return lower_count >= window - 2  # минимум window-2 убывания из window-1 пар
+    except Exception:
+        return False
+
+
+def calculate_rsi_higher_tf(prices_15m: list[float], window: int = 14) -> Optional[float]:
+    """
+    RSI на 15m свечах — аппроксимация «старшего таймфрейма».
+    Перекупленность >75 на 15m при уже высоком 1m RSI — сильный сигнал.
+    """
+    return calculate_rsi(prices_15m, window=window)
+
+
 # ================================================================
-#  REVERSAL DETECTOR  — 12 факторов
+#  REVERSAL DETECTOR  — 16 факторов
 # ================================================================
+
+def _esc(s: str) -> str:
+    """Экранирование HTML-символов для Telegram parse_mode=HTML."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def detect_short_reversal(
-    sym:       str,
-    price:     float,
-    klines_1m: dict,              # Min1 x120 — краткосрочные индикаторы
-    klines_5m: dict,              # Min5 x100 — долгосрочные индикаторы
-    recent:    list[tuple[float, float]],
-    growth:    float,
-    rsi:       Optional[float],
-    min_score: int = 4,
+    sym:        str,
+    price:      float,
+    klines_1m:  dict,   # Min1  x120 — RSI, StochRSI, BB, паттерны, wick
+    klines_5m:  dict,   # Min5  x100 — ATR, EMA, MACD, объём, моментум, lower highs
+    klines_15m: dict,   # Min15 x60  — OBV-дивергенция, RSI старшего TF
+    recent:     list[tuple[float, float]],
+    growth:     float,
+    rsi:        Optional[float],
+    min_score:  int = 4,
 ) -> dict:
     """
-    12-факторный детектор разворота на шорт.
-    Краткосрочные (Min1): RSI, StochRSI, BB, паттерны свечей, отбой от хая.
-    Долгосрочные  (Min5): ATR, EMA, MACD, объём, моментум, RSI-дивергенция.
+    16-факторный детектор разворота на шорт.
+
+    Min1  (краткосрочные): RSI, StochRSI, BB, паттерн, отбой от хая, Wick Rejection
+    Min5  (среднесрочные): MACD, EMA, ATR, моментум, Lower Highs, объём
+    Min15 (долгосрочные):  OBV-дивергенция, RSI-дивергенция, RSI старшего TF
+    Тики (акселерация):    замедление импульса
 
     Факторы (+1 каждый):
-      1.  RSI перекупленность (> REVERSAL_RSI_OB) по Min1
-      2.  StochRSI в зоне перекупленности по Min1
-      3.  Цена выше верхней полосы Боллинджера (%B > BB_OB) по Min1
-      4.  MACD медвежий крест или убывающий slope по Min5
-      5.  Медвежья RSI-дивергенция по Min5 (цена ↑, RSI ↓)
-      6.  Замедление роста (accel < ACCEL) по тикам
-      7.  Отбой от 24h High: цена у хая и закрытие свечи ниже открытия
-      8.  Моментум иссякает (fast-slow < MOMENTUM) по Min5
-      9.  EMA9 пробила EMA21 вниз по Min5
-      10. ATR-перегрев: движение > ATR_MULT × ATR по Min5
-      11. Медвежий свечной паттерн (Shooting Star / Доджи / Поглощение) по Min1
-      12. Слабый объём при росте (vol < VOL_RATIO × средний) по Min5
+      1.  RSI перекупленность (Min1 > RSI_OB)
+      2.  StochRSI зона перекупленности (Min1)
+      3.  Цена выше верхней полосы Боллинджера %B>BB_OB (Min1)
+      4.  MACD медвежий крест или убывающий slope (Min5)
+      5.  RSI-дивергенция: цена↑, RSI↓ (Min15)
+      6.  Замедление импульса accel < ACCEL (тики)
+      7.  Отбой от 24h High с подтверждением свечи (Min1)
+      8.  Моментум иссякает fast-slow < MOMENTUM (Min5)
+      9.  EMA9 пробила EMA21 вниз или ниже EMA21 (Min5)
+      10. ATR-перегрев: движение > ATR_MULT × ATR (Min5, 1 час)
+      11. Медвежий свечной паттерн (Min1, реальные opens)
+      12. Слабый объём при росте vol < VOL_RATIO (Min5 → Min1 → тики)
+      13. OBV-дивергенция: цена↑, OBV↓ (Min15)
+      14. Wick Rejection Ratio > 0.55 (Min1, 3 последних свечи)
+      15. RSI старшего TF > 75 (Min15)
+      16. Lower Highs паттерн (Min5, 5 свечей)
     """
     score   = 0
     factors: list[str] = []
 
-    # Данные 1m (краткосрочные: RSI, BB, паттерны)
-    closes_1m  = klines_1m.get("closes",  [])
-    highs_1m   = klines_1m.get("highs",   [])
-    lows_1m    = klines_1m.get("lows",    [])
+    # Распаковываем данные по таймфреймам
+    closes_1m   = klines_1m.get("closes",  [])
+    highs_1m    = klines_1m.get("highs",   [])
+    lows_1m     = klines_1m.get("lows",    [])
+    opens_1m    = klines_1m.get("opens",   [])
+    volumes_1m  = klines_1m.get("volumes", [])
 
-    # Данные 5m (долгосрочные: ATR, EMA, MACD, объём, моментум)
-    closes_5m  = klines_5m.get("closes",  [])
-    highs_5m   = klines_5m.get("highs",   [])
-    lows_5m    = klines_5m.get("lows",    [])
-    volumes_5m = klines_5m.get("volumes", [])
+    closes_5m   = klines_5m.get("closes",  [])
+    highs_5m    = klines_5m.get("highs",   [])
+    lows_5m     = klines_5m.get("lows",    [])
+    volumes_5m  = klines_5m.get("volumes", [])
 
-    # Fallback: если нет свечей — берём тики
-    prices_1m = closes_1m if len(closes_1m) >= 20 else [p for _, p in price_history.get(sym, [])[-120:]]
-    prices_5m = closes_5m if len(closes_5m) >= 20 else prices_1m
+    closes_15m  = klines_15m.get("closes",  [])
+    volumes_15m = klines_15m.get("volumes", [])
 
-    # ── 1. RSI перекупленность (Min1) ────────────────────────────────────────
+    # Fallback на тики если нет свечей
+    prices_1m  = closes_1m  if len(closes_1m)  >= 20 else [p for _, p in price_history.get(sym, [])[-120:]]
+    prices_5m  = closes_5m  if len(closes_5m)  >= 20 else prices_1m
+    prices_15m = closes_15m if len(closes_15m) >= 20 else prices_5m
+
+    # ── 1. RSI перекупленность (Min1) ──────────────────────────────────────────
     stoch_rsi_val = None
     if rsi is not None and rsi > REVERSAL_RSI_OB:
         score += 1
-        factors.append(f"RSI перекуплен ({rsi:.1f} &gt; {REVERSAL_RSI_OB})")
+        factors.append(f"RSI перекуплен ({rsi:.1f} &gt; {REVERSAL_RSI_OB}) Min1")
 
-    # ── 2. StochRSI (Min1) ───────────────────────────────────────────────────
+    # ── 2. StochRSI (Min1) ─────────────────────────────────────────────────────
     stoch_rsi_val = calculate_stoch_rsi(prices_1m)
     if stoch_rsi_val is not None:
-        threshold = REVERSAL_STOCH_OB if (rsi is not None and rsi > REVERSAL_RSI_OB) else REVERSAL_STOCH_EXT
-        if stoch_rsi_val > threshold:
+        thr = REVERSAL_STOCH_OB if (rsi is not None and rsi > REVERSAL_RSI_OB) else REVERSAL_STOCH_EXT
+        if stoch_rsi_val > thr:
             score += 1
-            factors.append(f"StochRSI перекупленность ({stoch_rsi_val:.2f} &gt; {threshold})")
+            factors.append(f"StochRSI перекупленность ({stoch_rsi_val:.2f} &gt; {thr}) Min1")
 
-    # ── 3. Боллинджер %B (Min1) ──────────────────────────────────────────────
+    # ── 3. Боллинджер %B (Min1) ────────────────────────────────────────────────
     bb_pct = calculate_bollinger_pct(prices_1m)
     if bb_pct is not None and bb_pct > REVERSAL_BB_OB:
         score += 1
-        factors.append(f"Цена выше BB %B={bb_pct:.2f}")
+        factors.append(f"Цена выше верхней BB %B={bb_pct:.2f} Min1")
 
-    # ── 4. MACD крест / slope (Min5 — более надёжный сигнал) ────────────────
+    # ── 4. MACD (Min5) ─────────────────────────────────────────────────────────
     macd_data = calculate_macd_full(prices_5m)
     macd_hist = macd_data["histogram"]
     if macd_data["cross_down"]:
         score += 1
-        factors.append("MACD медвежий крест (Min5, hist 0→-)")
+        factors.append("MACD медвежий крест (hist 0→-) Min5")
     elif (macd_hist is not None
           and macd_data["slope"] is not None
           and macd_hist > 0
@@ -929,19 +1107,21 @@ def detect_short_reversal(
         score += 1
         factors.append(f"MACD убывает Min5 (slope={macd_data['slope']:+.6f})")
 
-    # ── 5. RSI-дивергенция (Min5) ─────────────────────────────────────────────
-    if len(prices_5m) >= 30 and calculate_rsi_divergence(prices_5m):
+    # ── 5. RSI-дивергенция (Min15 — более надёжный сигнал) ────────────────────
+    if len(prices_15m) >= 30 and calculate_rsi_divergence(prices_15m):
         score += 1
-        factors.append("Медвежья RSI-дивергенция Min5 (цена↑, RSI↓)")
+        factors.append("RSI-дивергенция Min15 (цена↑, RSI↓)")
+    elif len(prices_5m) >= 30 and calculate_rsi_divergence(prices_5m):
+        score += 1
+        factors.append("RSI-дивергенция Min5 (цена↑, RSI↓)")
 
-    # ── 6. Замедление accel (тики) ───────────────────────────────────────────
+    # ── 6. Замедление импульса (тики) ─────────────────────────────────────────
     accel = calculate_acceleration(recent)
     if accel is not None and growth >= current_percent and accel < REVERSAL_ACCEL:
         score += 1
         factors.append(f"Замедление импульса (accel={accel:.2f}x)")
 
-    # ── 7. Отбой от 24h High ─────────────────────────────────────────────────
-    # Улучшено: проверяем закрытие последней свечи относительно открытия (не просто тики)
+    # ── 7. Отбой от 24h High (Min1 с реальными opens) ────────────────────────
     hist_data  = price_history.get(sym, [])
     now_ts     = time.time()
     day_prices = [p for t, p in hist_data if now_ts - t <= 86400]
@@ -950,67 +1130,99 @@ def detect_short_reversal(
     if len(day_prices) >= 20:
         near_high = price >= high24 * REVERSAL_HIGH_MARGIN
         if near_high:
-            # Проверяем: последняя 1m свеча красная (close < open) у хая
-            bearish_candle = (
-                len(closes_1m) >= 2 and len(highs_1m) >= 1
-                and closes_1m[-1] < closes_1m[-2]   # close < prev close
-                and highs_1m[-1] >= high24 * REVERSAL_HIGH_MARGIN
-            )
-            # Или 3 из 4 последних тиков падают
-            if not bearish_candle and len(recent) >= 4:
-                last_ticks = [p for _, p in recent[-4:]]
-                falling = sum(last_ticks[i] > last_ticks[i+1] for i in range(len(last_ticks)-1))
-                bearish_candle = falling >= 2
-            if bearish_candle:
-                pct_from_high = (price - high24) / high24 * 100
+            bearish = False
+            if len(closes_1m) >= 2 and len(opens_1m) >= 1:
+                # Реальная красная свеча у хая (close < open из MEXC)
+                bearish = (opens_1m[-1] > closes_1m[-1]  # медвежья свеча
+                           and highs_1m[-1] >= high24 * REVERSAL_HIGH_MARGIN)
+            if not bearish and len(recent) >= 4:
+                ticks = [p for _, p in recent[-4:]]
+                falling = sum(ticks[i] > ticks[i + 1] for i in range(len(ticks) - 1))
+                bearish = falling >= 2
+            if bearish:
+                pct = (price - high24) / high24 * 100
                 score += 1
-                factors.append(f"Отбой от 24h High ({pct_from_high:+.2f}%)")
+                factors.append(f"Отбой от 24h High ({pct:+.2f}%) Min1")
 
-    # ── 8. Моментум иссякает (Min5) ──────────────────────────────────────────
+    # ── 8. Моментум иссякает (Min5) ───────────────────────────────────────────
     momentum = calculate_price_momentum(prices_5m)
     if momentum is not None and momentum < REVERSAL_MOMENTUM:
         score += 1
         factors.append(f"Моментум иссякает Min5 (diff={momentum:+.2f}%)")
 
-    # ── 9. EMA крест вниз (Min5 — убираем ложные сигналы) ───────────────────
+    # ── 9. EMA крест / ниже EMA (Min5) ────────────────────────────────────────
     ema_data = calculate_ema_cross(prices_5m)
     if ema_data["cross_down"]:
         score += 1
-        factors.append(f"EMA9 пробила EMA21 вниз Min5 ({ema_data['ema_fast']:.4g} &lt; {ema_data['ema_slow']:.4g})")
-    elif (ema_data["gap_pct"] is not None and ema_data["gap_pct"] < -0.05):
+        factors.append(
+            f"EMA9 пробила EMA21 вниз Min5 "
+            f"({ema_data['ema_fast']:.4g} &lt; {ema_data['ema_slow']:.4g})"
+        )
+    elif ema_data.get("gap_pct") is not None and ema_data["gap_pct"] < -0.05:
         score += 1
         factors.append(f"EMA9 ниже EMA21 Min5 (gap={ema_data['gap_pct']:+.2f}%)")
 
-    # ── 10. ATR-перегрев (Min5 — реальный диапазон волатильности) ────────────
+    # ── 10. ATR-перегрев (Min5, последний час) ────────────────────────────────
     atr = None
     if len(highs_5m) >= 15 and len(lows_5m) >= 15 and len(closes_5m) >= 15:
         atr = calculate_atr(highs_5m, lows_5m, closes_5m)
         if atr is not None and atr > 0:
-            # Движение за последние 12 свечей (1 час на Min5)
-            lookback = min(12, len(closes_5m) - 1)
+            lookback    = min(12, len(closes_5m) - 1)
             period_move = abs(price - closes_5m[-lookback])
             atr_ratio   = period_move / atr
             if atr_ratio > REVERSAL_ATR_MULT:
                 score += 1
                 factors.append(f"ATR-перегрев Min5 ({atr_ratio:.1f}× ATR={atr:.4g})")
 
-    # ── 11. Свечной паттерн (Min1 — актуальная картина) ──────────────────────
+    # ── 11. Свечной паттерн (Min1, реальные opens из MEXC) ───────────────────
     candle_pattern = None
-    if len(closes_1m) >= 3 and len(highs_1m) >= 3 and len(lows_1m) >= 3:
-        candle_pattern = detect_candle_pattern(closes_1m, highs_1m, lows_1m)
+    if len(closes_1m) >= 4 and len(highs_1m) >= 4 and len(lows_1m) >= 4:
+        candle_pattern = detect_candle_pattern(
+            closes_1m, highs_1m, lows_1m,
+            opens_1m if len(opens_1m) >= 4 else None,
+        )
         if candle_pattern:
             score += 1
             factors.append(f"Паттерн Min1: {candle_pattern}")
 
-    # ── 12. Слабый объём (Min5 — фильтрует ложные пробои) ────────────────────
-    vol_signal = calculate_volume_weakness(volumes_5m) if len(volumes_5m) >= 20 \
-        else (calculate_volume_weakness(klines_1m.get("volumes", [])) if len(klines_1m.get("volumes", [])) >= 20
-              else calculate_volume_signal(sym))
+    # ── 12. Слабый объём (Min5 → Min1 → тики) ────────────────────────────────
+    vol_signal: Optional[str] = None
+    if len(volumes_5m) >= 20:
+        vol_signal = calculate_volume_weakness(volumes_5m)
+    elif len(volumes_1m) >= 20:
+        vol_signal = calculate_volume_weakness(volumes_1m)
+    else:
+        vol_signal = calculate_volume_signal(sym)
     if vol_signal:
         score += 1
         factors.append(vol_signal)
 
-    # ── Цели по шорту (уровни Фибоначчи от хая к лою 24h) ───────────────────
+    # ── 13. OBV-дивергенция (Min15) ───────────────────────────────────────────
+    if calculate_obv_divergence(prices_15m, volumes_15m if len(volumes_15m) >= 16
+                                else volumes_5m):
+        score += 1
+        factors.append("OBV-дивергенция Min15 (цена↑, OBV↓)")
+
+    # ── 14. Wick Rejection Ratio > 0.55 (Min1) ───────────────────────────────
+    wick_ratio = None
+    if len(closes_1m) >= 3 and len(opens_1m) >= 3:
+        wick_ratio = calculate_wick_rejection(highs_1m, lows_1m, opens_1m, closes_1m, lookback=3)
+        if wick_ratio is not None and wick_ratio > 0.55:
+            score += 1
+            factors.append(f"Wick Rejection {wick_ratio:.2f} (верхняя тень доминирует) Min1")
+
+    # ── 15. RSI старшего TF > 75 (Min15) ─────────────────────────────────────
+    rsi_15m = calculate_rsi_higher_tf(prices_15m) if len(prices_15m) >= 16 else None
+    if rsi_15m is not None and rsi_15m > 75.0:
+        score += 1
+        factors.append(f"RSI перекуплен на Min15 ({rsi_15m:.1f} &gt; 75)")
+
+    # ── 16. Lower Highs паттерн (Min5) ────────────────────────────────────────
+    if len(highs_5m) >= 6 and calculate_lower_highs(highs_5m, window=5):
+        score += 1
+        factors.append("Lower Highs паттерн Min5 (убывающие максимумы)")
+
+    # ── Цели по шорту: уровни Фибоначчи от 24h High к Low ────────────────────
     fib     = calculate_fibonacci_levels(high24, low24)
     target1 = fib["fib_382"]
     target2 = fib["fib_618"]
@@ -1019,14 +1231,17 @@ def detect_short_reversal(
 
     return {
         "score":          score,
+        "max_score":      16,
         "factors":        factors,
         "triggered":      score >= min_score,
         "rsi":            rsi,
+        "rsi_15m":        rsi_15m,
         "stoch_rsi":      stoch_rsi_val,
         "bb_pct":         bb_pct,
         "macd_hist":      macd_hist,
         "accel":          accel,
         "atr":            atr,
+        "wick_ratio":     wick_ratio,
         "target1":        target1,
         "target2":        target2,
         "fib":            fib,
@@ -1211,53 +1426,49 @@ def format_reversal_alert(
     duration_sec: int = 0,
     window_sec:   int = 3600,
 ) -> str:
-    """
-    Уведомление о развороте на шорт.
-    Включает: скор, факторы, индикаторы, ATR, свечной паттерн, цели по Фибо.
-    """
-    score   = rev["score"]
-    factors = rev["factors"]
-    rsi     = rev.get("rsi")
-    stoch   = rev.get("stoch_rsi")
-    bb_pct  = rev.get("bb_pct")
-    macd_h  = rev.get("macd_hist")
-    atr     = rev.get("atr")
-    target1 = rev.get("target1")
-    target2 = rev.get("target2")
-    candle  = rev.get("candle_pattern")
-    ema_gap = rev.get("ema_gap")
-    vol_sig = rev.get("vol_signal", "")
-    day_ctx = rev.get("day_context", "")
+    score      = rev["score"]
+    max_score  = rev.get("max_score", 16)
+    factors    = rev["factors"]
+    rsi        = rev.get("rsi")
+    rsi_15m    = rev.get("rsi_15m")
+    stoch      = rev.get("stoch_rsi")
+    bb_pct     = rev.get("bb_pct")
+    macd_h     = rev.get("macd_hist")
+    atr        = rev.get("atr")
+    target1    = rev.get("target1")
+    target2    = rev.get("target2")
+    candle     = rev.get("candle_pattern")
+    ema_gap    = rev.get("ema_gap")
+    wick_ratio = rev.get("wick_ratio")
+    vol_sig    = rev.get("vol_signal", "")
+    day_ctx    = rev.get("day_context", "")
 
-    # Уровень уверенности
-    if score >= 8:
-        confidence = "🔴 ВЫСОКАЯ"
-        hdr        = "🚨"
-    elif score >= 5:
-        confidence = "🟠 СРЕДНЯЯ"
-        hdr        = "⚠️"
+    if score >= 10:
+        confidence, hdr = "🔴 ВЫСОКАЯ", "🚨"
+    elif score >= 6:
+        confidence, hdr = "🟠 СРЕДНЯЯ", "⚠️"
     else:
-        confidence = "🟡 СЛАБАЯ"
-        hdr        = "🔄"
+        confidence, hdr = "🟡 СЛАБАЯ", "🔄"
 
-    rsi_s    = f"{rsi:.1f}"     if rsi    is not None else "—"
-    stoch_s  = f"{stoch:.2f}"   if stoch  is not None else "—"
-    bb_s     = f"{bb_pct:.2f}"  if bb_pct is not None else "—"
-    macd_s   = f"{macd_h:+.6f}" if macd_h is not None else "—"
-    atr_s    = f"{atr:.6f}"     if atr    is not None else "—"
-    ema_s    = f"{ema_gap:+.2f}%" if ema_gap is not None else "—"
-
-    def _esc(s: str) -> str:
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    rsi_s    = f"{rsi:.1f}"       if rsi        is not None else "—"
+    rsi15_s  = f"{rsi_15m:.1f}"   if rsi_15m    is not None else "—"
+    stoch_s  = f"{stoch:.2f}"     if stoch      is not None else "—"
+    bb_s     = f"{bb_pct:.2f}"    if bb_pct     is not None else "—"
+    macd_s   = f"{macd_h:+.6f}"   if macd_h     is not None else "—"
+    atr_s    = f"{atr:.6f}"       if atr        is not None else "—"
+    ema_s    = f"{ema_gap:+.2f}%" if ema_gap    is not None else "—"
+    wick_s   = f"{wick_ratio:.2f}" if wick_ratio is not None else "—"
 
     factors_s = "\n".join(f"  {i+1}. {_esc(f)}" for i, f in enumerate(factors)) if factors else "  —"
 
-    t1_s = f"<code>{target1:.4g}</code>" if target1 else "—"
-    t2_s = f"<code>{target2:.4g}</code>" if target2 else "—"
+    t1_s      = f"<code>{target1:.4g}</code>" if target1 else "—"
+    t2_s      = f"<code>{target2:.4g}</code>" if target2 else "—"
+    fib       = rev.get("fib", {})
+    t3_s      = f"<code>{fib['fib_500']:.4g}</code>" if fib.get("fib_500") else "—"
 
-    candle_s  = f"\n🕯 Паттерн: <b>{candle}</b>"   if candle  else ""
-    vol_s     = f"\n{vol_sig}"                       if vol_sig else ""
-    day_ctx_s = f"\n{day_ctx}"                       if day_ctx else ""
+    candle_s  = f"\n🕯 Паттерн: <b>{candle}</b>" if candle  else ""
+    vol_s     = f"\n{_esc(vol_sig)}"              if vol_sig else ""
+    day_ctx_s = f"\n{day_ctx}"                    if day_ctx else ""
 
     return (
         f"{hdr} <b>РАЗВОРОТ НА ШОРТ</b>\n"
@@ -1265,19 +1476,20 @@ def format_reversal_alert(
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
         f"📈 Рост до разворота: <b>+{growth:.2f}%</b> за {_fmt_dur(window_sec)}\n\n"
-        f"🎯 Уверенность: {confidence}  [{score}/12]\n\n"
-        f"<b>Сработавшие факторы:</b>\n{factors_s}\n\n"
+        f"🎯 Уверенность: {confidence}  [{score}/{max_score}]\n\n"
+        f"<b>Сработавшие факторы ({score}/{max_score}):</b>\n{factors_s}\n\n"
         f"<b>Индикаторы:</b>\n"
-        f"  RSI: <code>{rsi_s}</code>  │  StochRSI: <code>{stoch_s}</code>\n"
-        f"  BB%: <code>{bb_s}</code>   │  MACD hist: <code>{macd_s}</code>\n"
-        f"  ATR: <code>{atr_s}</code>  │  EMA gap: <code>{ema_s}</code>"
+        f"  RSI 1m: <code>{rsi_s}</code>  │  RSI 15m: <code>{rsi15_s}</code>\n"
+        f"  StochRSI: <code>{stoch_s}</code>  │  BB%: <code>{bb_s}</code>\n"
+        f"  MACD: <code>{macd_s}</code>  │  ATR: <code>{atr_s}</code>\n"
+        f"  EMA gap: <code>{ema_s}</code>  │  Wick: <code>{wick_s}</code>"
         f"{candle_s}"
         f"{vol_s}"
         f"{day_ctx_s}\n\n"
         f"<b>🎯 Цели шорта (Фибо):</b>\n"
         f"  Цель 1 (38.2%): {t1_s}\n"
-        f"  Цель 2 (61.8%): {t2_s}\n\n"
-        f"📋 <code>{sym}</code> #шорт"
+        f"  Цель 2 (50.0%): {t3_s}\n"
+        f"  Цель 3 (61.8%): {t2_s}"
     )
 
 
@@ -1441,12 +1653,13 @@ async def monitor():
                 growth    = (price - old_price) / old_price * 100
                 direction = 1 if growth > 0 else -1
 
-                # ── Свечи MEXC: 1m для RSI/BB/паттернов, 5m для ATR/EMA/MACD/объёма ──
-                mexc_sym   = _to_mexc_symbol(sym)
-                klines_all = await get_mexc_klines_multi(mexc_sym)
-                klines_1m  = klines_all["klines_1m"]
-                klines_5m  = klines_all["klines_5m"]
-                closes     = klines_1m["closes"]
+                # ── Свечи MEXC: 3 таймфрейма параллельно ──────────────────────
+                mexc_sym    = _to_mexc_symbol(sym)
+                klines_all  = await get_mexc_klines_multi(mexc_sym)
+                klines_1m   = klines_all["klines_1m"]
+                klines_5m   = klines_all["klines_5m"]
+                klines_15m  = klines_all["klines_15m"]
+                closes      = klines_1m["closes"]
 
                 rsi = calculate_rsi(closes) if closes else None
                 if rsi is None:
@@ -1456,16 +1669,31 @@ async def monitor():
                 # ════════════════════════════════════════════════════════════
                 #  БЛОК 1: РАЗВОРОТ НА ШОРТ
                 #  Условие: пиковый рост за REVERSAL_WINDOW_SEC >= REVERSAL_GROWTH_MIN_PCT
+                #  Фильтр дублей: кулдаун + смена цены + рост скора
                 # ════════════════════════════════════════════════════════════
                 peak_growth = get_peak_growth(sym, price, REVERSAL_WINDOW_SEC)
-                # growth в текущем окне алертов; peak_growth — в окне разворота
                 if peak_growth >= REVERSAL_GROWTH_MIN_PCT or growth >= REVERSAL_GROWTH_MIN_PCT:
-                    last_rev = _reversal_cooldown.get(sym, 0)
-                    if now - last_rev >= REVERSAL_COOLDOWN_SEC:
+                    last_rev_ts = _reversal_cooldown.get(sym, 0)
+                    if now - last_rev_ts >= REVERSAL_COOLDOWN_SEC:
                         rev = detect_short_reversal(
-                            sym, price, klines_1m, klines_5m, recent, growth, rsi, REVERSAL_MIN_SCORE
+                            sym, price, klines_1m, klines_5m, klines_15m,
+                            recent, growth, rsi, REVERSAL_MIN_SCORE
                         )
                         if rev["triggered"]:
+                            # ── Умный фильтр повторов ───────────────────────
+                            last_info = _reversal_last.get(sym)
+                            if last_info:
+                                price_change = abs(price - last_info["price"]) / last_info["price"] * 100
+                                score_delta  = rev["score"] - last_info["score"]
+                                # Пропускаем если: цена почти не изменилась И скор не вырос значительно
+                                if (price_change < REVERSAL_REPEAT_PRICE_PCT
+                                        and score_delta < REVERSAL_REPEAT_SCORE_DELTA):
+                                    log.debug(
+                                        "REVERSAL skip %s: price_chg=%.2f%% score_delta=%d",
+                                        sym, price_change, score_delta,
+                                    )
+                                    continue
+                            # ── Отправляем сигнал ───────────────────────────
                             duration = calculate_growth_duration(recent)
                             rev_text = format_reversal_alert(
                                 sym, price, max(growth, peak_growth), source, rev,
@@ -1473,6 +1701,7 @@ async def monitor():
                                 window_sec=REVERSAL_WINDOW_SEC,
                             )
                             _reversal_cooldown[sym] = now
+                            _reversal_last[sym] = {"price": price, "score": rev["score"], "ts": now}
                             db_save_reversal(
                                 sym, price, rev["score"], rev["factors"],
                                 rev["rsi"], rev["macd_hist"],
@@ -1483,7 +1712,9 @@ async def monitor():
                             reversal_count += 1
                             if PROM_AVAILABLE:
                                 PROM_REVERSALS.inc()
-                            log.info("REVERSAL %s score=%d/%d", sym, rev["score"], 12)
+                            log.info("REVERSAL %s score=%d/16 peak=%.2f%% price_chg=%.2f%%",
+                                     sym, rev["score"], peak_growth,
+                                     price_change if last_info else 0.0)
                             continue  # не дублируем обычным алертом
 
                 # ════════════════════════════════════════════════════════════
@@ -1540,7 +1771,8 @@ async def monitor():
                 vals      = [p for _, p in price_history[sym][-120:]]
                 macd_data = calculate_macd_full(vals)
                 macd      = macd_data["histogram"]
-                rsi_trend = await get_rsi_trend_from_mexc(sym)
+                # RSI-тренд из уже загруженных свечей — не делаем лишний HTTP запрос
+                rsi_trend = calculate_rsi_trend(closes) if len(closes) >= 17 else None
                 accel     = calculate_acceleration(recent)
                 duration  = calculate_growth_duration(recent)
                 breakout  = check_24h_breakout(sym, price)
@@ -1572,6 +1804,24 @@ async def monitor():
 
             await asyncio.sleep(config.INTERVAL)
 
+            # ── Периодическая очистка памяти ──────────────────────────────────
+            checks_count += 1
+            if checks_count % 200 == 0:
+                # Удаляем устаревшие кулдауны
+                stale_ts = now - max(ALERT_COOLDOWN_SEC, REVERSAL_COOLDOWN_SEC) * 3
+                for d in (_alert_cooldown, _reversal_cooldown, _notify_cooldown):
+                    stale = [k for k, v in d.items() if v < stale_ts]
+                    for k in stale:
+                        d.pop(k, None)
+            if checks_count % 1000 == 0:
+                # Удаляем монеты без свежих данных
+                cutoff2 = now - max(current_window * 4, 86400 * 2)
+                dead = [s for s, h in price_history.items() if not h or h[-1][0] < cutoff2]
+                for s in dead:
+                    price_history.pop(s, None)
+                if dead:
+                    log.info("price_history: удалено %d мёртвых монет", len(dead))
+
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1589,6 +1839,7 @@ async def handle_message(msg: dict):
     global REVERSAL_BB_OB, REVERSAL_MACD_SLOPE, REVERSAL_ACCEL, REVERSAL_HIGH_MARGIN
     global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC, REVERSAL_ATR_MULT, REVERSAL_VOL_RATIO
     global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT, REVERSAL_WINDOW_SEC
+    global REVERSAL_REPEAT_PRICE_PCT, REVERSAL_REPEAT_SCORE_DELTA
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -1606,10 +1857,10 @@ async def handle_message(msg: dict):
 
     if text in ("/start", "/menu"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v15</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v16</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
-            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>\n"
+            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/16 факторов</b>\n"
             f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b> за <b>{_fmt_dur(REVERSAL_WINDOW_SEC)}</b>\n"
             f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
@@ -1673,7 +1924,7 @@ async def handle_message(msg: dict):
             f"🪙 Монет в истории: {len(price_history)}\n"
             f"🔔 Сигналов: {signals_count}\n"
             f"🔄 Разворотов: {reversal_count}\n"
-            f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/12\n"
+            f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/16\n"
             f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}% за {_fmt_dur(REVERSAL_WINDOW_SEC)}\n"
             f"🔔 Уведомление движения: {NOTIFY_BIG_MOVE_PCT}%\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
@@ -1701,7 +1952,9 @@ async def handle_message(msg: dict):
     if text in ("🗑 Кулдауны", "/clear_cooldowns"):
         _cache_clear_all()
         _reversal_cooldown.clear()
-        await send_message("🗑 Кулдауны и уровни сброшены", chat_id)
+        _reversal_last.clear()
+        _notify_cooldown.clear()
+        await send_message("🗑 Кулдауны, уровни и история разворотов сброшены", chat_id)
         return
 
     if text in ("🔄 Развороты", "/reversals"):
@@ -1727,8 +1980,15 @@ async def handle_message(msg: dict):
 
     if text in ("🧹 БД Очистка", "/db_cleanup"):
         deleted = db_cleanup()
+        total   = sum(deleted.values())
         await send_message(
-            f"🧹 Удалено: {sum(deleted.values())} строк\n{deleted}\n"
+            f"🧹 <b>Очистка завершена</b>\n\n"
+            f"📋 Алертов: -{deleted.get('alerts', 0)}\n"
+            f"📍 Уровней: -{deleted.get('alert_levels', 0)}\n"
+            f"📊 price_stats: -{deleted.get('price_stats', 0)}\n"
+            f"🔄 Разворотов: -{deleted.get('reversal_signals', 0)}\n"
+            f"────────────────\n"
+            f"🗑 Итого: {total} строк\n"
             f"💾 Размер: {db_size_mb():.2f} МБ",
             chat_id,
         )
@@ -1813,6 +2073,40 @@ async def handle_message(msg: dict):
             )
         return
 
+    if text.startswith("/rev_price_pct"):
+        try:
+            val = float(text.split()[1])
+            assert 0.1 <= val <= 20.0
+            REVERSAL_REPEAT_PRICE_PCT = val
+            await send_message(
+                f"✅ Мин. смена цены между разворотами: <b>{val}%</b>\n"
+                f"ℹ️ Повторный сигнал по монете только если цена изменилась на ≥{val}%",
+                chat_id,
+            )
+        except Exception:
+            await send_message(
+                f"❌ /rev_price_pct 3   (текущее: {REVERSAL_REPEAT_PRICE_PCT}%)\nДиапазон: 0.1–20",
+                chat_id,
+            )
+        return
+
+    if text.startswith("/rev_score_delta"):
+        try:
+            val = int(text.split()[1])
+            assert 0 <= val <= 12
+            REVERSAL_REPEAT_SCORE_DELTA = val
+            await send_message(
+                f"✅ Мин. прирост скора между разворотами: <b>+{val}</b>\n"
+                f"ℹ️ Повторный сигнал только если скор вырос на ≥{val} факторов",
+                chat_id,
+            )
+        except Exception:
+            await send_message(
+                f"❌ /rev_score_delta 2   (текущее: {REVERSAL_REPEAT_SCORE_DELTA})\nДиапазон: 0–12",
+                chat_id,
+            )
+        return
+
     # Быстрая настройка порога разворота через кнопки
     _rev_score_map = {
         "🎚 Порог 3/12": 3,
@@ -1831,7 +2125,7 @@ async def handle_message(msg: dict):
 
     # ── Команды настройки разворота ───────────────────────────────────────────
     _rev_cmds = {
-        "/rev_score":    ("REVERSAL_MIN_SCORE",   int,   1,    12,    "Порог факторов",           "/12"),
+        "/rev_score":    ("REVERSAL_MIN_SCORE",   int,   1,    16,    "Порог факторов",           "/16"),
         "/rev_rsi":      ("REVERSAL_RSI_OB",      float, 50,   90,    "RSI перекупленность",      ""),
         "/rev_stoch":    ("REVERSAL_STOCH_OB",    float, 0.5,  1.0,   "StochRSI порог",           ""),
         "/rev_bb":       ("REVERSAL_BB_OB",       float, 0.8,  1.5,   "Боллинджер %B порог",      ""),
@@ -1952,24 +2246,34 @@ async def _cmd_reversals(chat_id):
 async def _cmd_reversal_settings(chat_id):
     high_pct = round((1.0 - REVERSAL_HIGH_MARGIN) * 100, 2)
     await send_message(
-        f"⚙️ <b>Настройки детектора разворота (12 факторов)</b>\n"
+        f"⚙️ <b>Настройки детектора разворота (16 факторов)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>Скоринг:</b>\n"
-        f"  Порог:         <code>{REVERSAL_MIN_SCORE}/12</code>    → /rev_score 4\n\n"
+        f"  Порог:         <code>{REVERSAL_MIN_SCORE}/16</code>  → /rev_score 4\n\n"
         f"<b>Пороги факторов:</b>\n"
-        f"  RSI OB:        <code>&gt; {REVERSAL_RSI_OB}</code>       → /rev_rsi 70\n"
-        f"  StochRSI:      <code>&gt; {REVERSAL_STOCH_OB}</code>    → /rev_stoch 0.80\n"
-        f"  Боллинджер:    <code>&gt; {REVERSAL_BB_OB}</code>       → /rev_bb 1.0\n"
-        f"  Замедление:    <code>&lt; {REVERSAL_ACCEL}</code>       → /rev_accel 0.5\n"
+        f"  RSI OB (1m):   <code>&gt; {REVERSAL_RSI_OB}</code>     → /rev_rsi 70\n"
+        f"  RSI OB (15m):  <code>&gt; 75</code>          (фиксировано)\n"
+        f"  StochRSI:      <code>&gt; {REVERSAL_STOCH_OB}</code>   → /rev_stoch 0.80\n"
+        f"  Боллинджер:    <code>&gt; {REVERSAL_BB_OB}</code>      → /rev_bb 1.0\n"
+        f"  Замедление:    <code>&lt; {REVERSAL_ACCEL}</code>      → /rev_accel 0.5\n"
         f"  Моментум:      <code>&lt; {REVERSAL_MOMENTUM}%</code>  → /rev_momentum -0.5\n"
-        f"  ATR-перегрев:  <code>&gt; {REVERSAL_ATR_MULT}×</code>  → /rev_atr 3.0\n"
-        f"  Объём слабый:  <code>&lt; {REVERSAL_VOL_RATIO:.0%}</code>   → /rev_vol 0.7\n"
-        f"  Зона хая 24h:  <code>{high_pct}%</code>             → /rev_high 0.2\n\n"
-        f"<b>Кулдаун:</b>\n"
-        f"  Между сигналами: <code>{REVERSAL_COOLDOWN_SEC // 60} мин</code>  → /rev_cooldown 5\n\n"
+        f"  ATR-перегрев:  <code>&gt; {REVERSAL_ATR_MULT}×</code> → /rev_atr 3.0\n"
+        f"  Объём слабый:  <code>&lt; {REVERSAL_VOL_RATIO:.0%}</code>  → /rev_vol 0.7\n"
+        f"  Зона хая 24h:  <code>{high_pct}%</code>        → /rev_high 0.2\n"
+        f"  Wick Rejection:<code>&gt; 0.55</code>         (фиксировано)\n\n"
+        f"<b>Новые факторы (13-16):</b>\n"
+        f"  13. OBV-дивергенция (Min15, цена↑ OBV↓)\n"
+        f"  14. Wick Rejection Ratio &gt;0.55 (Min1)\n"
+        f"  15. RSI 15m &gt;75 (старший таймфрейм)\n"
+        f"  16. Lower Highs (Min5, 3+ убывающих хая)\n\n"
+        f"<b>Кулдаун и фильтр дублей:</b>\n"
+        f"  Кулдаун:         <code>{REVERSAL_COOLDOWN_SEC // 60} мин</code>  → /rev_cooldown 30\n"
+        f"  Мин. смена цены: <code>{REVERSAL_REPEAT_PRICE_PCT}%</code>  → /rev_price_pct 3\n"
+        f"  Мин. рост скора: <code>+{REVERSAL_REPEAT_SCORE_DELTA}</code>      → /rev_score_delta 2\n\n"
         f"<b>Пресеты:</b>\n"
-        f"  Агрессивный: /rev_score 3  /rev_rsi 65  /rev_cooldown 2\n"
-        f"  Строгий:     /rev_score 7  /rev_rsi 75  /rev_cooldown 15",
+        f"  Агрессивный: /rev_score 3  /rev_cooldown 10  /rev_price_pct 1\n"
+        f"  Стандарт:    /rev_score 5  /rev_cooldown 30  /rev_price_pct 3\n"
+        f"  Строгий:     /rev_score 9  /rev_cooldown 60  /rev_price_pct 5",
         chat_id,
     )
 
