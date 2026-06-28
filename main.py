@@ -1,18 +1,19 @@
 """
-Crypto Alert Bot — v12
-Улучшения vs v11:
-  • Новые факторы разворота (итого до 12):
-      9.  EMA крест вниз (быстрая EMA9 пересекает медленную EMA21 вниз)
-      10. ATR-перегрев (цена выросла > 3×ATR за период — экстремальное движение)
-      11. Свечной паттерн: Доджи / Медвежье поглощение / Shooting Star
-      12. Откат от уровня Фибоначчи 0.618/0.786 (цена в зоне коррекции)
-  • Цель по шорту в уведомлении (ближайший уровень поддержки / Фибо)
-  • Реальный объём из MEXC kline (volume) для фильтрации слабых сигналов
-  • Убраны неиспользуемые импорты (asynccontextmanager, StochasticOscillator)
-  • REVERSAL_MIN_SCORE теперь из 12 факторов (порог по умолчанию 4)
-  • Разворот проверяется по пиковому росту за 24ч (не только текущий growth)
-  • /rev_target — показывает цели по шорту для монеты
-  • Улучшен формат уведомления: цель, ATR, Фибо-уровни
+Crypto Alert Bot — v13
+Улучшения vs v12:
+  • Все команды вынесены в кнопки Reply Keyboard:
+      - Управление: ⏸ Пауза / ▶️ Продолжить / 📊 Статус
+      - Порог роста: 📈 0.2% / 5% / 10% / 20%
+      - Период:      ⏱ 5 мин / 1 час / 4 ч / 1 д
+      - Данные:      📋 История / 🏆 Топ-5 / 📤 Экспорт
+      - Разворот:    🔄 Развороты / ⚙️ Настройки разворота / 🗑 Кулдауны
+      - БД:          🗄 БД Статистика / 🧹 БД Очистка
+      - Быстрый порог: 🎚 Порог 3/12 / 4/12 / 5/12 / 7/12
+  • Исправлен баг кнопки разворота: текст "⚙️ Разворот" → "⚙️ Настройки разворота"
+    (несовпадение текста кнопки и обработчика в v12)
+  • Дубли db_stats / db_cleanup убраны (объединены с кнопками)
+  • /menu теперь показывает полную справку по кнопкам и командам
+  • Неизвестная команда повторно показывает клавиатуру
 """
 
 from __future__ import annotations
@@ -1017,12 +1018,20 @@ async def broadcast(text: str, reply_markup=None):
 def reply_keyboard():
     return {
         "keyboard": [
-            ["📈 0.2%",  "📈 5%",   "📈 10%",  "📈 20%"   ],
-            ["⏱ 5 мин", "⏱ 1 час", "⏱ 4 ч",  "⏱ 1 д"   ],
-            ["📊 Статус", "📋 История", "🏆 Топ-5"          ],
-            ["⏸ Пауза",  "▶️ Продолжить"                   ],
-            ["🔄 Развороты", "⚙️ Разворот", "🗑 Кулдауны"  ],
-            ["📤 Экспорт"                                   ],
+            # Строка 1 — Управление мониторингом
+            ["⏸ Пауза", "▶️ Продолжить", "📊 Статус"],
+            # Строка 2 — Порог роста
+            ["📈 0.2%", "📈 5%", "📈 10%", "📈 20%"],
+            # Строка 3 — Временное окно
+            ["⏱ 5 мин", "⏱ 1 час", "⏱ 4 ч", "⏱ 1 д"],
+            # Строка 4 — Сигналы и история
+            ["📋 История", "🏆 Топ-5", "📤 Экспорт"],
+            # Строка 5 — Разворот
+            ["🔄 Развороты", "⚙️ Настройки разворота", "🗑 Кулдауны"],
+            # Строка 6 — База данных
+            ["🗄 БД Статистика", "🧹 БД Очистка"],
+            # Строка 7 — Порог разворота (быстрая настройка)
+            ["🎚 Порог 3/12", "🎚 Порог 4/12", "🎚 Порог 5/12", "🎚 Порог 7/12"],
         ],
         "resize_keyboard": True,
         "persistent":      True,
@@ -1496,11 +1505,22 @@ async def handle_message(msg: dict):
 
     if text in ("/start", "/menu"):
         await send_message(
-            f"🚀 <b>Бот v12</b>\n\n"
-            f"📈 Порог: <b>{current_percent}%</b>\n"
+            f"🚀 <b>Crypto Alert Bot v12</b>\n\n"
+            f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период: <b>{current_window // 60} мин</b>\n"
-            f"🔄 Разворот: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>\n"
-            f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг идёт'}",
+            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>\n"
+            f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
+            f"<b>Кнопки управления:</b>\n"
+            f"  📈 0.2% / 5% / 10% / 20% — порог роста\n"
+            f"  ⏱ 5 мин / 1 час / 4 ч / 1 д — период окна\n"
+            f"  🎚 Порог 3-7/12 — чувствительность разворота\n"
+            f"  ⚙️ Настройки разворота — все параметры\n"
+            f"  🗄 БД Статистика / 🧹 БД Очистка — база\n\n"
+            f"<b>Команды:</b>\n"
+            f"  /set_percent 2.5 — произвольный порог (%)\n"
+            f"  /set_window 60 — произвольный период (мин)\n"
+            f"  /rev_score 4 — порог факторов разворота\n"
+            f"  /rev_cooldown 5 — кулдаун разворота (мин)",
             chat_id,
             reply_markup=reply_keyboard(),
         )
@@ -1579,8 +1599,42 @@ async def handle_message(msg: dict):
         asyncio.create_task(_cmd_reversals(chat_id))
         return
 
-    if text in ("⚙️ Разворот", "/reversal_settings"):
+    if text in ("⚙️ Настройки разворота", "⚙️ Разворот", "/reversal_settings"):
         await _cmd_reversal_settings(chat_id)
+        return
+
+    if text in ("🗄 БД Статистика", "/db_stats"):
+        s = db_stats()
+        await send_message(
+            f"🗄 <b>База данных</b>\n\n"
+            f"📋 Алертов: {s['alerts']}\n"
+            f"📅 Старейший: {s['oldest_alert']}\n"
+            f"🪙 Уровней: {s['levels']}\n"
+            f"🔄 Разворотов: {s['reversals']}\n"
+            f"💾 Размер: {s['size_mb']:.2f} МБ",
+            chat_id,
+        )
+        return
+
+    if text in ("🧹 БД Очистка", "/db_cleanup"):
+        deleted = db_cleanup()
+        await send_message(
+            f"🧹 Удалено: {sum(deleted.values())} строк\n{deleted}\n"
+            f"💾 Размер: {db_size_mb():.2f} МБ",
+            chat_id,
+        )
+        return
+
+    # Быстрая настройка порога разворота через кнопки
+    _rev_score_map = {
+        "🎚 Порог 3/12": 3,
+        "🎚 Порог 4/12": 4,
+        "🎚 Порог 5/12": 5,
+        "🎚 Порог 7/12": 7,
+    }
+    if text in _rev_score_map:
+        REVERSAL_MIN_SCORE = _rev_score_map[text]
+        await send_message(f"✅ Порог разворота: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>", chat_id)
         return
 
     # ── Команды настройки разворота ───────────────────────────────────────────
@@ -1642,34 +1696,16 @@ async def handle_message(msg: dict):
             await send_message("❌ /set_window 60  (в минутах)", chat_id)
         return
 
-    if text == "/db_stats":
-        s = db_stats()
-        await send_message(
-            f"🗄 <b>База данных</b>\n\n"
-            f"📋 Алертов: {s['alerts']}\n"
-            f"📅 Старейший: {s['oldest_alert']}\n"
-            f"🪙 Уровней: {s['levels']}\n"
-            f"🔄 Разворотов: {s['reversals']}\n"
-            f"💾 Размер: {s['size_mb']:.2f} МБ",
-            chat_id,
-        )
-        return
-
-    if text == "/db_cleanup":
-        deleted = db_cleanup()
-        await send_message(
-            f"🧹 Удалено: {sum(deleted.values())} строк\n{deleted}\n"
-            f"💾 Размер: {db_size_mb():.2f} МБ",
-            chat_id,
-        )
-        return
-
     if text == "/subscribe":
         db_add_subscriber(chat_id)
         await send_message("✅ Вы в списке получателей", chat_id)
         return
 
-    await send_message("❓ Неизвестная команда. /menu — открыть панель", chat_id)
+    await send_message(
+        "❓ Неизвестная команда.\n/menu — открыть панель управления",
+        chat_id,
+        reply_markup=reply_keyboard(),
+    )
 
 
 async def _cmd_history(chat_id):
