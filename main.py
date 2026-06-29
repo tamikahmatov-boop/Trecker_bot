@@ -483,21 +483,6 @@ async def get_bybit_klines(symbol: str, interval: str = "Min1", limit: int = KLI
     return data
 
 
-async def get_bybit_klines_multi(symbol: str) -> dict:
-    """Получает три таймфрейма параллельно с Bybit."""
-    _empty = {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
-    results = await asyncio.gather(
-        get_bybit_klines(symbol, "Min1",  KLINE_LIMIT_1M),
-        get_bybit_klines(symbol, "Min5",  KLINE_LIMIT_5M),
-        get_bybit_klines(symbol, "Min15", KLINE_LIMIT_15M),
-        return_exceptions=True,
-    )
-    return {
-        "klines_1m":  results[0] if not isinstance(results[0], Exception) else _empty,
-        "klines_5m":  results[1] if not isinstance(results[1], Exception) else _empty,
-        "klines_15m": results[2] if not isinstance(results[2], Exception) else _empty,
-    }
-
 
 # ================================================================
 #  INDICATORS
@@ -1466,60 +1451,298 @@ async def get_symbols() -> set[str]:
 
 
 # ================================================================
-#  PRICES  — только Bybit Linear Perpetual
+#  BYBIT WEBSOCKET — цены и свечи в реальном времени
+# ================================================================
+#
+#  Архитектура:
+#    ws_ticker_loop  — подписка на tickers всех монет → price_history
+#    ws_kline_loop   — подписка на kline.1 / kline.5 / kline.15 → _kline_store
+#    monitor         — читает из памяти, не делает HTTP-запросов
+#
+#  При старте: REST-запрос для cold-start свечей (заполняем историю).
+#  WS-соединение одно на все монеты через batch-подписки по 500 символов.
 # ================================================================
 
-async def _fetch_bybit_prices(norm: dict) -> tuple[dict, dict]:
-    """Загружает цены всех linear-perpetual тикеров одним запросом."""
-    prices, sources = {}, {}
+BYBIT_WS_PUBLIC  = "wss://stream.bybit.com/v5/public/linear"
+WS_RECONNECT_SEC = 5
+WS_PING_INTERVAL = 20   # Bybit требует ping каждые 20 сек
+
+# ── Хранилище свечей (заполняется WS) ────────────────────────────
+# _kline_store[sym][interval] = {"opens":[], "closes":[], "highs":[], "lows":[], "volumes":[]}
+_kline_store: dict[str, dict[str, dict]] = {}
+_kline_store_lock: asyncio.Lock | None = None   # инициализируется в main()
+
+# Символы, на которые уже подписаны WS
+_ws_subscribed_syms: set[str] = set()
+
+# Флаги готовности — инициализируются в main() внутри event loop
+_ws_tickers_ready: asyncio.Event | None = None
+_ws_klines_ready:  asyncio.Event | None = None
+
+
+def _kline_empty() -> dict:
+    return {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
+
+
+def _kline_get(sym: str, interval: str) -> dict:
+    return _kline_store.get(sym, {}).get(interval, _kline_empty())
+
+
+def _kline_update(sym: str, interval: str, candle: list):
+    """Обновляет или добавляет последнюю свечу в хранилище."""
+    store = _kline_store.setdefault(sym, {})
+    buf   = store.setdefault(interval, _kline_empty())
+    o, h, l, c, v = (float(candle[i]) for i in (1, 2, 3, 4, 5))
+    # Последняя свеча — обновляем; если новее — добавляем
+    if buf["closes"] and candle[6] == "true":   # confirm=true → свеча закрыта
+        # Заменяем последнюю (она была неподтверждённой)
+        for key, val in zip(("opens","highs","lows","closes","volumes"), (o,h,l,c,v)):
+            if buf[key]:
+                buf[key][-1] = val
+            else:
+                buf[key].append(val)
+        # Добавляем новый незакрытый слот (следующая свеча придёт потом)
+    else:
+        # Неподтверждённая — просто обновляем последний элемент
+        if not buf["closes"]:
+            for key, val in zip(("opens","highs","lows","closes","volumes"), (o,h,l,c,v)):
+                buf[key].append(val)
+        else:
+            buf["opens"][-1]   = o
+            buf["highs"][-1]   = h
+            buf["lows"][-1]    = l
+            buf["closes"][-1]  = c
+            buf["volumes"][-1] = v
+
+
+async def _ws_send_ping(ws):
+    try:
+        await ws.send_str(json.dumps({"op": "ping"}))
+    except Exception:
+        pass
+
+
+async def _ws_subscribe(ws, topics: list[str]):
+    await ws.send_str(json.dumps({"op": "subscribe", "args": topics}))
+
+
+async def ws_ticker_loop(symbols: set[str]):
+    """
+    Подписывается на tickers всех монет через Bybit Public WS.
+    Обновляет price_history напрямую.
+    Использует прокси если задан (через _session.ws_connect).
+    """
+    global _ws_subscribed_syms
+    syms = sorted(symbols)
+    # Разбиваем на батчи по 500 (лимит Bybit)
+    batches = [syms[i:i+500] for i in range(0, len(syms), 500)]
+
+    while True:
+        try:
+            proxy = None
+            proxy_url = os.getenv("PROXY_URL") or getattr(config, "PROXY_URL", None)
+            async with _session.ws_connect(
+                BYBIT_WS_PUBLIC,
+                proxy=proxy_url,
+                heartbeat=WS_PING_INTERVAL,
+                timeout=30,
+            ) as ws:
+                # Подписываемся на tickers батчами
+                for batch in batches:
+                    topics = [f"tickers.{s}" for s in batch]
+                    await _ws_subscribe(ws, topics)
+                _ws_subscribed_syms = set(syms)
+                log.info("WS tickers: подписано на %d монет", len(syms))
+
+                ping_ts = time.time()
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        topic = data.get("topic", "")
+                        if topic.startswith("tickers."):
+                            ticker = data.get("data", {})
+                            sym    = ticker.get("symbol", "")
+                            last   = ticker.get("lastPrice", "")
+                            if sym and last:
+                                try:
+                                    price = float(last)
+                                    if price > 0:
+                                        now = time.time()
+                                        hist = price_history.setdefault(sym, [])
+                                        hist.append((now, price))
+                                        cutoff = max(current_window * 2, 86400)
+                                        if len(hist) % 100 == 0:
+                                            price_history[sym] = [
+                                                (t, p) for t, p in hist if now - t <= cutoff
+                                            ]
+                                        last_check_time = now
+                                        _ws_tickers_ready.set()
+                                except (ValueError, TypeError):
+                                    pass
+                        # Ping каждые WS_PING_INTERVAL сек
+                        if time.time() - ping_ts >= WS_PING_INTERVAL:
+                            await _ws_send_ping(ws)
+                            ping_ts = time.time()
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        log.warning("WS tickers: соединение закрыто, переподключение...")
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("ws_ticker_loop: %s", e)
+        await asyncio.sleep(WS_RECONNECT_SEC)
+
+
+async def ws_kline_loop(symbols: set[str]):
+    """
+    Подписывается на kline.1 / kline.5 / kline.15 для всех монет.
+    Обновляет _kline_store.
+    """
+    syms = sorted(symbols)
+    intervals = ["1", "5", "15"]
+    # Разбиваем на батчи (3 интервала × N монет, лимит 500 топиков за запрос)
+    all_topics = [f"kline.{iv}.{s}" for iv in intervals for s in syms]
+    batches    = [all_topics[i:i+500] for i in range(0, len(all_topics), 500)]
+
+    while True:
+        try:
+            proxy_url = os.getenv("PROXY_URL") or getattr(config, "PROXY_URL", None)
+            async with _session.ws_connect(
+                BYBIT_WS_PUBLIC,
+                proxy=proxy_url,
+                heartbeat=WS_PING_INTERVAL,
+                timeout=30,
+            ) as ws:
+                for batch in batches:
+                    await _ws_subscribe(ws, batch)
+                log.info("WS klines: подписано (%d топиков)", len(all_topics))
+
+                ping_ts = time.time()
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data  = json.loads(msg.data)
+                        topic = data.get("topic", "")
+                        if topic.startswith("kline."):
+                            parts = topic.split(".")   # kline.1.BTCUSDT
+                            if len(parts) == 3:
+                                _, iv_str, sym = parts
+                                iv_map = {"1": "Min1", "5": "Min5", "15": "Min15"}
+                                interval = iv_map.get(iv_str)
+                                if interval:
+                                    for candle in data.get("data", []):
+                                        _kline_update(sym, interval, [
+                                            candle.get("start"),
+                                            candle.get("open"),
+                                            candle.get("high"),
+                                            candle.get("low"),
+                                            candle.get("close"),
+                                            candle.get("volume"),
+                                            candle.get("confirm", "false"),
+                                        ])
+                        if time.time() - ping_ts >= WS_PING_INTERVAL:
+                            await _ws_send_ping(ws)
+                            ping_ts = time.time()
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        log.warning("WS klines: соединение закрыто, переподключение...")
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("ws_kline_loop: %s", e)
+        await asyncio.sleep(WS_RECONNECT_SEC)
+
+
+async def coldstart_klines(symbols: set[str]):
+    """
+    Один раз при старте загружает историю свечей через REST
+    чтобы индикаторы заработали сразу, не дожидаясь накопления WS-данных.
+    """
+    log.info("Cold-start: загружаем свечи для %d монет...", len(symbols))
+    sem = asyncio.Semaphore(20)   # параллельно не более 20 запросов
+
+    async def _load_one(sym: str):
+        async with sem:
+            results = await asyncio.gather(
+                _fetch_bybit_klines(sym, "Min1",  KLINE_LIMIT_1M),
+                _fetch_bybit_klines(sym, "Min5",  KLINE_LIMIT_5M),
+                _fetch_bybit_klines(sym, "Min15", KLINE_LIMIT_15M),
+                return_exceptions=True,
+            )
+            store = _kline_store.setdefault(sym, {})
+            for interval, res in zip(("Min1", "Min5", "Min15"), results):
+                if not isinstance(res, Exception) and res["closes"]:
+                    store[interval] = res
+
+    tasks = [_load_one(s) for s in symbols]
+    # Батчами по 100 чтобы не перегружать прокси
+    for i in range(0, len(tasks), 100):
+        await asyncio.gather(*tasks[i:i+100], return_exceptions=True)
+        await asyncio.sleep(0.5)
+
+    log.info("Cold-start свечей завершён")
+    _ws_klines_ready.set()
+
+
+def get_klines_multi(sym: str) -> dict:
+    """Читает свечи из памяти (заполнены WS + cold-start). Без HTTP."""
+    return {
+        "klines_1m":  _kline_get(sym, "Min1"),
+        "klines_5m":  _kline_get(sym, "Min5"),
+        "klines_15m": _kline_get(sym, "Min15"),
+    }
+
+
+# ── Оставляем REST-функции для cold-start (используются только там) ──────────
+
+_kline_cache: dict[str, dict] = {}
+KLINE_CACHE_TTL  = 60
+KLINE_LIMIT_1M   = 120
+KLINE_LIMIT_5M   = 100
+KLINE_LIMIT_15M  = 60
+KLINE_LIMIT      = KLINE_LIMIT_1M
+_BYBIT_INTERVAL  = {"Min1": "1", "Min5": "5", "Min15": "15"}
+
+
+async def _fetch_bybit_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
+    empty    = {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
+    bybit_iv = _BYBIT_INTERVAL.get(interval, "1")
     try:
         async with _session.get(
-            "https://api.bybit.com/v5/market/tickers",
-            params={"category": "linear"},
+            "https://api.bybit.com/v5/market/kline",
+            params={"category": "linear", "symbol": symbol,
+                    "interval": bybit_iv, "limit": limit},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
             data = await r.json()
         if data.get("retCode") == 0:
-            for item in data["result"]["list"]:
-                sym   = item.get("symbol", "")
-                last  = item.get("lastPrice", "0")
-                price = float(last) if last else 0.0
-                if price > 0 and sym in norm:
-                    real = norm[sym]
-                    prices[real]  = price
-                    sources[real] = "Bybit"
+            rows = list(reversed(data["result"]["list"]))
+            return {
+                "opens":   [float(c[1]) for c in rows],
+                "highs":   [float(c[2]) for c in rows],
+                "lows":    [float(c[3]) for c in rows],
+                "closes":  [float(c[4]) for c in rows],
+                "volumes": [float(c[5]) for c in rows],
+            }
     except Exception as e:
-        log.error("Bybit tickers: %s", e)
-    return prices, sources
-
-
-_norm_cache: dict[str, str] = {}
-_norm_symbols_key: frozenset = frozenset()
-
-
-async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
-    global _norm_cache, _norm_symbols_key
-    sym_key = frozenset(symbols)
-    if sym_key != _norm_symbols_key:
-        _norm_cache       = {s: s for s in symbols}   # Bybit символы совпадают
-        _norm_symbols_key = sym_key
-    norm = _norm_cache
-    return await _fetch_bybit_prices(norm)
+        log.debug("Bybit kline REST %s %s: %s", symbol, interval, e)
+    return empty
 
 
 # ================================================================
-#  MONITOR
+#  MONITOR  — читает данные из памяти (WS), без HTTP-запросов
 # ================================================================
 
 async def monitor():
     global current_percent, current_window, signals_count, reversal_count, checks_count, last_check_time
     global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT
 
-    symbols          = await get_symbols()
-    last_symbols_upd = time.time()
     _cache_load_levels()
+    await broadcast("✅ <b>Бот запущен</b> (v17 — Bybit WebSocket)")
 
-    await broadcast("✅ <b>Бот запущен</b> (v12 — 12-факторный разворот)")
+    # Ждём первых данных от WS
+    log.info("Ожидание первых тикеров от WebSocket...")
+    await asyncio.wait_for(_ws_tickers_ready.wait(), timeout=60)
+    log.info("WebSocket тикеры готовы, запускаем анализ")
 
     while True:
         if monitor_paused:
@@ -1527,37 +1750,33 @@ async def monitor():
             continue
 
         try:
-            now             = time.time()
-            checks_count   += 1
+            now          = time.time()
+            checks_count += 1
             last_check_time = now
 
             if PROM_AVAILABLE:
                 PROM_CHECKS.inc()
                 PROM_COINS.set(len(price_history))
 
-            if now - last_symbols_upd >= 1800:
-                new_sym = await get_symbols()
-                if new_sym:
-                    symbols = new_sym
-                    log.info("Монеты обновлены: %d", len(symbols))
-                last_symbols_upd = now
+            # Снимаем снэпшот текущих цен из price_history (заполняется WS)
+            snapshot: dict[str, float] = {}
+            for sym, hist in list(price_history.items()):
+                if hist:
+                    snapshot[sym] = hist[-1][1]
 
-            prices, sources = await get_prices(symbols)
-
-            for sym, price in prices.items():
+            for sym, price in snapshot.items():
                 await asyncio.sleep(0)
-                last_check_time = time.time()  # обновляем таймер watchdog на каждой монете
+                last_check_time = time.time()
 
                 if price <= 0:
                     continue
 
-                hist = price_history.setdefault(sym, [])
-                hist.append((now, price))
+                hist   = price_history.get(sym, [])
                 cutoff = max(current_window * 2, 86400)
                 price_history[sym] = [(t, p) for t, p in hist if now - t <= cutoff]
 
                 recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
-                source = sources.get(sym, "UNKNOWN")
+                source = "Bybit"
 
                 if len(recent) < MIN_SAMPLES:
                     continue
@@ -1569,12 +1788,12 @@ async def monitor():
                 growth    = (price - old_price) / old_price * 100
                 direction = 1 if growth > 0 else -1
 
-                # ── Свечи Bybit: 3 таймфрейма параллельно ─────────────────────
-                klines_all  = await get_bybit_klines_multi(sym)
-                klines_1m   = klines_all["klines_1m"]
-                klines_5m   = klines_all["klines_5m"]
-                klines_15m  = klines_all["klines_15m"]
-                closes      = klines_1m["closes"]
+                # ── Свечи из памяти (WS + cold-start) — нет HTTP ──────────────
+                klines_all = get_klines_multi(sym)
+                klines_1m  = klines_all["klines_1m"]
+                klines_5m  = klines_all["klines_5m"]
+                klines_15m = klines_all["klines_15m"]
+                closes     = klines_1m["closes"]
 
                 rsi = calculate_rsi(closes) if closes else None
                 if rsi is None:
@@ -1717,6 +1936,8 @@ async def monitor():
 
                 log.info("Signal: %s %+.2f%% [%s]", sym, growth, source)
 
+            # WS пушит данные непрерывно — делаем паузу config.INTERVAL
+            # чтобы не жечь CPU, но не ждать REST-ответа
             await asyncio.sleep(config.INTERVAL)
 
             # ── Периодическая очистка памяти ──────────────────────────────────
@@ -2351,8 +2572,12 @@ def handle_async_exception(loop, context):
 
 async def main():
     global monitor_task, _session, _shutdown_event
+    global _ws_tickers_ready, _ws_klines_ready, _kline_store_lock
 
-    _shutdown_event = asyncio.Event()
+    _shutdown_event    = asyncio.Event()
+    _ws_tickers_ready  = asyncio.Event()
+    _ws_klines_ready   = asyncio.Event()
+    _kline_store_lock  = asyncio.Lock()
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_async_exception)
 
@@ -2369,20 +2594,42 @@ async def main():
 
     proxy_url = os.getenv("PROXY_URL") or getattr(config, "PROXY_URL", None)
     if proxy_url and PROXY_AVAILABLE:
-        connector = ProxyConnector.from_url(proxy_url, limit=50, ttl_dns_cache=300)
+        connector = ProxyConnector.from_url(proxy_url, limit=100, ttl_dns_cache=300)
         log.info("🌐 Прокси активен: %s", proxy_url.split("@")[-1])
     elif proxy_url and not PROXY_AVAILABLE:
         log.warning("⚠️ PROXY_URL задан, но aiohttp-socks не установлен — работаем без прокси")
-        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
     else:
         log.info("Прокси не задан — прямое подключение")
-        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+
     async with aiohttp.ClientSession(connector=connector) as session:
-        _session     = session
-        monitor_task = asyncio.create_task(monitor())
+        _session = session
+
+        # 1. Получаем список символов через REST
+        log.info("Загружаем список монет...")
+        symbols = await get_symbols()
+        if not symbols:
+            log.error("Не удалось получить список символов — выход")
+            return
+
+        # 2. Cold-start: загружаем историю свечей через REST (параллельно с WS)
+        coldstart_task = asyncio.create_task(coldstart_klines(symbols))
+
+        # 3. WebSocket: тикеры (цены) — запускаем немедленно
+        ws_ticker_task = asyncio.create_task(ws_ticker_loop(symbols))
+
+        # 4. WebSocket: свечи — запускаем немедленно
+        ws_kline_task  = asyncio.create_task(ws_kline_loop(symbols))
+
+        # 5. Monitor — запускается, ждёт _ws_tickers_ready внутри
+        monitor_task   = asyncio.create_task(monitor())
 
         tasks = [
             monitor_task,
+            ws_ticker_task,
+            ws_kline_task,
+            coldstart_task,
             asyncio.create_task(telegram_loop()),
             asyncio.create_task(heartbeat()),
             asyncio.create_task(save_state_loop()),
