@@ -348,7 +348,8 @@ current_window:  int   = config.WINDOW
 monitor_paused = False
 monitor_task: asyncio.Task | None = None
 
-_session: aiohttp.ClientSession | None = None
+_session:    aiohttp.ClientSession | None = None
+_tg_session: aiohttp.ClientSession | None = None  # отдельная сессия для Telegram (через прокси)
 
 _alert_cooldown:    dict[str, float] = {}
 _reversal_cooldown: dict[str, float] = {}
@@ -1182,7 +1183,7 @@ def detect_short_reversal(
 async def _tg_post(method: str, payload: dict, retries: int = 3) -> Optional[dict]:
     for attempt in range(retries):
         try:
-            async with _session.post(
+            async with _tg_session.post(
                 f"{TG}/{method}", json=payload,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
@@ -1193,7 +1194,7 @@ async def _tg_post(method: str, payload: dict, retries: int = 3) -> Optional[dic
         except asyncio.TimeoutError:
             log.warning("[_tg_post] timeout %s (попытка %d/%d)", method, attempt + 1, retries)
             if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)  # 1s, 2s
+                await asyncio.sleep(2 ** attempt)
         except Exception as e:
             log.error("[_tg_post] %s: %s", method, e)
             if attempt < retries - 1:
@@ -1214,8 +1215,8 @@ async def send_document(chat_id, filename: str, content: str, caption: str = "")
         form.add_field("chat_id", str(chat_id))
         form.add_field("caption", caption)
         form.add_field("document", content.encode(), filename=filename, content_type="text/csv")
-        async with _session.post(f"{TG}/sendDocument", data=form,
-                                  timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        async with _tg_session.post(f"{TG}/sendDocument", data=form,
+                                     timeout=aiohttp.ClientTimeout(total=30)) as resp:
             return await resp.json()
     except Exception as e:
         log.error("sendDocument: %s", e)
@@ -1539,11 +1540,8 @@ async def ws_ticker_loop(symbols: set[str]):
 
     while True:
         try:
-            proxy = None
-            proxy_url = os.getenv("PROXY_URL") or getattr(config, "PROXY_URL", None)
             async with _session.ws_connect(
                 BYBIT_WS_PUBLIC,
-                proxy=proxy_url,
                 heartbeat=WS_PING_INTERVAL,
                 timeout=30,
             ) as ws:
@@ -1606,10 +1604,8 @@ async def ws_kline_loop(symbols: set[str]):
 
     while True:
         try:
-            proxy_url = os.getenv("PROXY_URL") or getattr(config, "PROXY_URL", None)
             async with _session.ws_connect(
                 BYBIT_WS_PUBLIC,
-                proxy=proxy_url,
                 heartbeat=WS_PING_INTERVAL,
                 timeout=30,
             ) as ws:
@@ -2435,7 +2431,7 @@ async def _cmd_export(chat_id):
 async def get_updates() -> list:
     global offset
     try:
-        async with _session.get(
+        async with _tg_session.get(
             f"{TG}/getUpdates",
             params={
                 "timeout":         20,       # long-polling — прокси медленный
@@ -2571,7 +2567,7 @@ def handle_async_exception(loop, context):
 # ================================================================
 
 async def main():
-    global monitor_task, _session, _shutdown_event
+    global monitor_task, _session, _tg_session, _shutdown_event
     global _ws_tickers_ready, _ws_klines_ready, _kline_store_lock
 
     _shutdown_event    = asyncio.Event()
@@ -2593,36 +2589,46 @@ async def main():
             log.warning("Prometheus failed: %s", e)
 
     proxy_url = os.getenv("PROXY_URL") or getattr(config, "PROXY_URL", None)
+
+    # ── Bybit: всегда напрямую (WebSocket + REST) ─────────────────────────────
+    bybit_connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+
+    # ── Telegram: через прокси если задан ────────────────────────────────────
     if proxy_url and PROXY_AVAILABLE:
-        connector = ProxyConnector.from_url(proxy_url, limit=100, ttl_dns_cache=300)
-        log.info("🌐 Прокси активен: %s", proxy_url.split("@")[-1])
+        tg_connector = ProxyConnector.from_url(proxy_url, limit=20, ttl_dns_cache=300)
+        log.info("🌐 Telegram через прокси: %s", proxy_url.split("@")[-1])
+        log.info("🔗 Bybit WebSocket + REST — прямое подключение")
     elif proxy_url and not PROXY_AVAILABLE:
-        log.warning("⚠️ PROXY_URL задан, но aiohttp-socks не установлен — работаем без прокси")
-        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+        log.warning("⚠️ PROXY_URL задан, но aiohttp-socks не установлен — Telegram без прокси")
+        tg_connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
     else:
-        log.info("Прокси не задан — прямое подключение")
-        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+        log.info("Прокси не задан — всё напрямую")
+        tg_connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
 
-    async with aiohttp.ClientSession(connector=connector) as session:
-        _session = session
+    async with (
+        aiohttp.ClientSession(connector=bybit_connector) as bybit_sess,
+        aiohttp.ClientSession(connector=tg_connector)   as tg_sess,
+    ):
+        _session    = bybit_sess   # Bybit REST + WebSocket (прямой)
+        _tg_session = tg_sess      # Telegram API (через прокси)
 
-        # 1. Получаем список символов через REST
+        # 1. Список монет через Bybit REST (напрямую)
         log.info("Загружаем список монет...")
         symbols = await get_symbols()
         if not symbols:
             log.error("Не удалось получить список символов — выход")
             return
 
-        # 2. Cold-start: загружаем историю свечей через REST (параллельно с WS)
+        # 2. Cold-start свечей через Bybit REST (параллельно с WS)
         coldstart_task = asyncio.create_task(coldstart_klines(symbols))
 
-        # 3. WebSocket: тикеры (цены) — запускаем немедленно
+        # 3. WebSocket тикеры — напрямую к Bybit
         ws_ticker_task = asyncio.create_task(ws_ticker_loop(symbols))
 
-        # 4. WebSocket: свечи — запускаем немедленно
+        # 4. WebSocket свечи — напрямую к Bybit
         ws_kline_task  = asyncio.create_task(ws_kline_loop(symbols))
 
-        # 5. Monitor — запускается, ждёт _ws_tickers_ready внутри
+        # 5. Monitor — читает из памяти, ждёт _ws_tickers_ready
         monitor_task   = asyncio.create_task(monitor())
 
         tasks = [
