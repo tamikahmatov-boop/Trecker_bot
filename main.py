@@ -68,6 +68,11 @@ from contextlib import contextmanager
 from typing import Optional
 
 import aiohttp
+try:
+    from aiohttp_socks import ProxyConnector
+    PROXY_AVAILABLE = True
+except ImportError:
+    PROXY_AVAILABLE = False
 import pandas as pd
 from bs4 import BeautifulSoup
 from ta.momentum import RSIIndicator
@@ -2433,7 +2438,16 @@ async def main():
         except Exception as e:
             log.warning("Prometheus failed: %s", e)
 
-    connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+    proxy_url = os.getenv("PROXY_URL") or getattr(config, "PROXY_URL", None)
+    if proxy_url and PROXY_AVAILABLE:
+        connector = ProxyConnector.from_url(proxy_url, limit=50, ttl_dns_cache=300)
+        log.info("🌐 Прокси активен: %s", proxy_url.split("@")[-1])
+    elif proxy_url and not PROXY_AVAILABLE:
+        log.warning("⚠️ PROXY_URL задан, но aiohttp-socks не установлен — работаем без прокси")
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+    else:
+        log.info("Прокси не задан — прямое подключение")
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
         _session     = session
         monitor_task = asyncio.create_task(monitor())
