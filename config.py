@@ -1,8 +1,8 @@
 BOT_TOKEN = "8626739818:AAFt7kmdfTgTVlXD-5FnKOVYq1fvNW9hUAw"
 CHAT_ID = 6716942872
-PERCENT = 1
+PERCENT = 5
 WINDOW = 600 * 600
-INTERVAL = 5
+INTERVAL = 3
 COOLDOWN = 600
 DB_KEEP_ALERTS_DAYS  = 7   # сколько дней хранить алерты
 DB_KEEP_LEVELS_DAYS  = 7    # сколько дней хранить уровни монет
