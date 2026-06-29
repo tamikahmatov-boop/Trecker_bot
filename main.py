@@ -1263,24 +1263,32 @@ def detect_short_reversal(
 #  TELEGRAM HELPERS
 # ================================================================
 
-async def _tg_post(method: str, payload: dict) -> Optional[dict]:
-    try:
-        async with _session.post(
-            f"{TG}/{method}", json=payload, timeout=aiohttp.ClientTimeout(total=20)
-        ) as resp:
-            data = await resp.json()
-            if not data.get("ok"):
-                log.warning("Telegram %s error: %s", method, data)
-            return data
-    except Exception as e:
-        log.error("Telegram %s: %s", method, e)
-        return None
+async def _tg_post(method: str, payload: dict, retries: int = 3) -> Optional[dict]:
+    for attempt in range(retries):
+        try:
+            async with _session.post(
+                f"{TG}/{method}", json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+                if not data.get("ok"):
+                    log.warning("[_tg_post] Telegram %s error: %s", method, data)
+                return data
+        except asyncio.TimeoutError:
+            log.warning("[_tg_post] timeout %s (попытка %d/%d)", method, attempt + 1, retries)
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)  # 1s, 2s
+        except Exception as e:
+            log.error("[_tg_post] %s: %s", method, e)
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+    return None
 
 
 async def send_message(text: str, chat_id, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
-        payload["reply_markup"] = reply_markup
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     await _tg_post("sendMessage", payload)
 
 
@@ -1894,7 +1902,10 @@ async def handle_message(msg: dict):
     }
     if text in _pct_map:
         current_percent = _pct_map[text]
-        await send_message(f"✅ Порог роста/падения: <b>{current_percent}%</b>", chat_id)
+        await send_message(
+            f"✅ Порог роста/падения: <b>{current_percent}%</b>",
+            chat_id, reply_markup=reply_keyboard(),
+        )
         return
 
     _win_map = {
@@ -1905,17 +1916,20 @@ async def handle_message(msg: dict):
     }
     if text in _win_map:
         current_window, label = _win_map[text]
-        await send_message(f"✅ Период: <b>{label}</b>", chat_id)
+        await send_message(
+            f"✅ Период: <b>{label}</b>",
+            chat_id, reply_markup=reply_keyboard(),
+        )
         return
 
     if text == "⏸ Пауза":
         monitor_paused = True
-        await send_message("⏸ Мониторинг приостановлен", chat_id)
+        await send_message("⏸ Мониторинг приостановлен", chat_id, reply_markup=reply_keyboard())
         return
 
     if text == "▶️ Продолжить":
         monitor_paused = False
-        await send_message("▶️ Мониторинг возобновлён", chat_id)
+        await send_message("▶️ Мониторинг возобновлён", chat_id, reply_markup=reply_keyboard())
         return
 
     if text in ("📊 Статус", "/status"):
@@ -2120,11 +2134,12 @@ async def handle_message(msg: dict):
         "🎚 Порог 7/12": 7,
     }
     if text in _rev_score_map:
-        REVERSAL_MIN_SCORE = _rev_score_map[text]  # global объявлен выше — OK
+        REVERSAL_MIN_SCORE = _rev_score_map[text]
         await send_message(
-            f"✅ Порог разворота: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>\n"
+            f"✅ Порог разворота: <b>{REVERSAL_MIN_SCORE}/16 факторов</b>\n"
             f"ℹ️ Агрессивный: 3, Стандарт: 4-5, Строгий: 7",
             chat_id,
+            reply_markup=reply_keyboard(),
         )
         return
 
@@ -2299,8 +2314,12 @@ async def get_updates() -> list:
     try:
         async with _session.get(
             f"{TG}/getUpdates",
-            params={"timeout": 30, "offset": offset},
-            timeout=aiohttp.ClientTimeout(total=35),
+            params={
+                "timeout":         5,        # короткий таймаут — прокси медленный
+                "offset":          offset,
+                "allowed_updates": json.dumps(["message", "edited_message"]),
+            },
+            timeout=aiohttp.ClientTimeout(total=15),  # запас на прокси
         ) as resp:
             data = await resp.json()
         if data.get("ok"):
@@ -2312,15 +2331,23 @@ async def get_updates() -> list:
 
 async def telegram_loop():
     global offset
+    log.info("Telegram polling запущен")
     while True:
         try:
-            for update in await get_updates():
+            updates = await get_updates()
+            for update in updates:
                 offset = update["update_id"] + 1
-                if "message" in update:
-                    asyncio.create_task(handle_message(update["message"]))
+                msg = update.get("message") or update.get("edited_message")
+                if msg:
+                    asyncio.create_task(handle_message(msg))
+            # Если обновлений нет — пауза 0.5с, если есть — сразу следующий запрос
+            if not updates:
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.exception("telegram_loop: %s", e)
-        await asyncio.sleep(0.2)
+            await asyncio.sleep(3)
 
 
 # ================================================================
