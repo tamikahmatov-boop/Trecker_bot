@@ -1181,6 +1181,8 @@ def detect_short_reversal(
 # ================================================================
 
 async def _tg_post(method: str, payload: dict, retries: int = 3) -> Optional[dict]:
+    if _tg_session is None:
+        return None
     for attempt in range(retries):
         try:
             async with _tg_session.post(
@@ -1428,23 +1430,37 @@ def format_reversal_alert(
 # ================================================================
 
 async def get_symbols() -> set[str]:
-    """Загружает все бессрочные USDT-контракты с Bybit V5 API."""
+    """Загружает все бессрочные USDT-контракты с Bybit V5 API (с пагинацией)."""
     symbols: set[str] = set()
+    cursor = None
     try:
-        async with _session.get(
-            "https://api.bybit.com/v5/market/instruments-info",
-            params={"category": "linear", "limit": 1000},
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            data = await r.json()
-        if data.get("retCode") == 0:
+        while True:
+            params: dict = {"category": "linear", "limit": 1000}
+            if cursor:
+                params["cursor"] = cursor
+            async with _session.get(
+                "https://api.bybit.com/v5/market/instruments-info",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                raw = await r.text()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                log.error("get_symbols: невалидный ответ Bybit:\n%.500s", raw)
+                break
+            if data.get("retCode") != 0:
+                log.error("get_symbols Bybit retCode=%s msg=%s", data.get("retCode"), data.get("retMsg"))
+                break
             for item in data["result"]["list"]:
                 sym = item.get("symbol", "")
-                # Только бессрочные USDT-контракты (не квартальные)
                 if (sym.endswith("USDT")
                         and item.get("contractType") == "LinearPerpetual"
                         and item.get("status") == "Trading"):
                     symbols.add(sym)
+            cursor = data["result"].get("nextPageCursor")
+            if not cursor:
+                break
         log.info("Bybit Linear Perpetual USDT: %d монет", len(symbols))
     except Exception as e:
         log.error("get_symbols Bybit: %s", e)
@@ -2450,6 +2466,9 @@ async def get_updates() -> list:
 
 async def telegram_loop():
     global offset
+    # Ждём пока main() инициализирует _tg_session
+    while _tg_session is None:
+        await asyncio.sleep(0.1)
     log.info("Telegram polling запущен")
     while True:
         try:
