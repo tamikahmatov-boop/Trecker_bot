@@ -2447,6 +2447,16 @@ async def main():
         _session     = session
         monitor_task = asyncio.create_task(monitor())
 
+        # Отправляем клавиатуру владельцу при каждом запуске бота
+        try:
+            await send_message(
+                "🤖 <b>Бот запущен</b> — клавиатура активирована",
+                int(config.CHAT_ID),
+                reply_markup=reply_keyboard(),
+            )
+        except Exception as e:
+            log.warning("Не удалось отправить стартовое сообщение: %s", e)
+
         tasks = [
             monitor_task,
             asyncio.create_task(telegram_loop()),
