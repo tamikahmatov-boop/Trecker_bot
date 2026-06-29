@@ -2456,6 +2456,17 @@ async def main():
         _session     = session
         monitor_task = asyncio.create_task(monitor())
 
+        # Удаляем вебхук если активен (иначе getUpdates не работает)
+        try:
+            async with session.get(f"{TG}/deleteWebhook", params={"drop_pending_updates": "false"}) as resp:
+                result = await resp.json()
+                if result.get("ok"):
+                    log.info("Вебхук удалён успешно")
+                else:
+                    log.warning("deleteWebhook: %s", result)
+        except Exception as e:
+            log.warning("deleteWebhook error: %s", e)
+
         # Отправляем клавиатуру владельцу при каждом запуске бота
         try:
             await send_message(
