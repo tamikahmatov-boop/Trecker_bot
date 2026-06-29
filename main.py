@@ -2308,7 +2308,12 @@ async def get_updates() -> list:
         ) as resp:
             data = await resp.json()
         if data.get("ok"):
-            return data["result"]
+            results = data["result"]
+            if results:
+                log.info("get_updates: получено %d обновлений, offset=%s", len(results), offset)
+            return results
+        else:
+            log.warning("get_updates not ok: %s", data)
     except Exception as e:
         log.error("get_updates: %s", e)
     return []
@@ -2318,10 +2323,14 @@ async def telegram_loop():
     global offset
     while True:
         try:
-            for update in await get_updates():
+            updates = await get_updates()
+            for update in updates:
                 offset = update["update_id"] + 1
+                log.info("UPDATE: %s", update)
                 if "message" in update:
                     asyncio.create_task(handle_message(update["message"]))
+                elif "callback_query" in update:
+                    asyncio.create_task(handle_message(update["callback_query"]["message"]))
         except Exception as e:
             log.exception("telegram_loop: %s", e)
         await asyncio.sleep(0.2)
