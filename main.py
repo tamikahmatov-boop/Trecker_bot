@@ -1,7 +1,56 @@
 """
-Crypto Alert Bot — v17
-Только Bybit бессрочные USDT-контракты (Linear Perpetual).
-Цены и свечи исключительно с Bybit V5 API. MEXC и OKX удалены.
+Crypto Alert Bot — v16
+Полный аудит, исправление всех ошибок и расширение до 16 факторов разворота.
+
+═══════════════════════════════════════════════════════
+ ИСПРАВЛЕННЫЕ БАГИ
+═══════════════════════════════════════════════════════
+• db_connect: не делал commit() → INSERT мог не сохраняться. Добавлен commit/rollback.
+• _fetch_mexc_klines: не запрашивал поле "open" → detect_candle_pattern использовал
+  closes[-2] как open текущей свечи → Shooting Star никогда не срабатывал.
+  Исправлено: opens теперь запрашиваются и передаются в detect_candle_pattern.
+• detect_candle_pattern: полностью переписан — реальные opens, добавлен паттерн
+  "Вечерняя звезда" (3 бара), исправлена логика тела/тени.
+• monitor: get_rsi_trend_from_mexc() делал отдельный HTTP запрос хотя closes уже есть.
+  Заменено на calculate_rsi_trend(closes).
+• price_change использовалась в log.info но могла быть не определена → NameError.
+• import os был внутри db_size_mb() → перемещён на уровень модуля.
+• 🧹 БД Очистка: выводила Python dict → заменена на читаемый текст.
+• _esc() определялась внутри format_reversal_alert при каждом вызове → перенесена
+  на уровень модуля (DRY).
+• MACD_SLOPE дефолт -0.000005 слишком мал → никогда не срабатывал slope-ветка.
+• get_mexc_klines_multi: fallback dict не содержал "opens" → KeyError в паттернах.
+• _kline_cache / _alert_cooldown / price_history: не чистились → утечка памяти.
+  Добавлена периодическая очистка в monitor loop.
+
+═══════════════════════════════════════════════════════
+ НОВЫЕ ФАКТОРЫ РАЗВОРОТА (13–16, теперь итого 16/16)
+═══════════════════════════════════════════════════════
+• 13. OBV-дивергенция (Min15): цена растёт, On-Balance Volume падает.
+      Сигнал ослабления покупательского давления.
+• 14. Wick Rejection Ratio > 0.55 (Min1): среднее отношение верхней тени
+      к диапазону за 3 свечи. Указывает на систематическое отталкивание цены от верха.
+• 15. RSI старшего TF > 75 (Min15): перекупленность на 15-минутном таймфрейме
+      в сочетании с 1m-сигналами даёт подтверждение разворота.
+• 16. Lower Highs паттерн (Min5): 3+ последовательных снижения максимумов —
+      структурный медвежий разворот.
+
+═══════════════════════════════════════════════════════
+ УЛУЧШЕНИЯ ДАННЫХ (3 таймфрейма параллельно)
+═══════════════════════════════════════════════════════
+• Min1  x120: RSI, StochRSI, BB, паттерны (с реальными opens), wick rejection
+• Min5  x100: MACD, EMA, ATR, моментум, объём, lower highs
+• Min15 x60:  OBV-дивергенция, RSI старшего TF, RSI-дивергенция
+  Все три таймфрейма загружаются параллельно через asyncio.gather.
+
+═══════════════════════════════════════════════════════
+ ДРУГИЕ УЛУЧШЕНИЯ
+═══════════════════════════════════════════════════════
+• format_reversal_alert: RSI 1m + RSI 15m, Wick ratio, 3 цели Фибо (38.2/50/61.8%)
+• Уровни уверенности пересчитаны под 16 факторов: слабый <6, средний 6-9, высокий 10+
+• _cmd_reversal_settings: описание всех 16 факторов с новыми факторами 13-16
+• Пресеты обновлены: стандарт /rev_score 5, строгий /rev_score 9
+• /rev_score принимает значения 1–16 (было 1–12)
 """
 
 from __future__ import annotations
@@ -25,6 +74,7 @@ try:
 except ImportError:
     PROXY_AVAILABLE = False
 import pandas as pd
+from bs4 import BeautifulSoup
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, EMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
@@ -348,8 +398,7 @@ current_window:  int   = config.WINDOW
 monitor_paused = False
 monitor_task: asyncio.Task | None = None
 
-_session:    aiohttp.ClientSession | None = None
-_tg_session: aiohttp.ClientSession | None = None  # отдельная сессия для Telegram (через прокси)
+_session: aiohttp.ClientSession | None = None
 
 _alert_cooldown:    dict[str, float] = {}
 _reversal_cooldown: dict[str, float] = {}
@@ -422,67 +471,94 @@ def normalize_symbol(sym: str) -> str:
 
 
 # ================================================================
-#  BYBIT KLINE CACHE  (цена + объём)
+#  MEXC KLINE CACHE  (цена + объём)
 # ================================================================
 
 _kline_cache: dict[str, dict] = {}
 KLINE_CACHE_TTL  = 60
-KLINE_LIMIT_1M   = 120   # 120 свечей по 1 мин = 2 часа
-KLINE_LIMIT_5M   = 100   # 100 свечей по 5 мин = 8+ часов
-KLINE_LIMIT_15M  = 60    # 60 свечей по 15 мин = 15 часов
+KLINE_LIMIT_1M   = 120   # 120 свечей по 1 мин = 2 часа (RSI, BB, StochRSI, паттерны)
+KLINE_LIMIT_5M   = 100   # 100 свечей по 5 мин = 8+ часов (ATR, EMA, MACD, объём)
+# Для обратной совместимости
 KLINE_LIMIT = KLINE_LIMIT_1M
 
-# Bybit: интервалы в минутах строкой
-_BYBIT_INTERVAL = {"Min1": "1", "Min5": "5", "Min15": "15"}
 
-
-async def _fetch_bybit_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
-    """Возвращает dict с ключами: opens, closes, highs, lows, volumes (все list[float]).
-    Bybit V5 kline: GET /v5/market/kline
-    interval: "1" | "5" | "15" | "60" | "D" и т.д.
-    Ответ: list[[ startTime, open, high, low, close, volume, turnover ]]
-    Данные идут от новых к старым — разворачиваем.
-    """
+async def _fetch_mexc_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
+    """Возвращает dict с ключами: opens, closes, highs, lows, volumes (все list[float])."""
     empty = {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
-    bybit_iv = _BYBIT_INTERVAL.get(interval, "1")
     try:
         async with _session.get(
-            "https://api.bybit.com/v5/market/kline",
-            params={"category": "linear", "symbol": symbol,
-                    "interval": bybit_iv, "limit": limit},
+            "https://contract.mexc.com/api/v1/contract/kline",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
             data = await r.json()
-        if data.get("retCode") == 0:
-            rows = data["result"]["list"]
-            rows = list(reversed(rows))   # от старых к новым
+        if data.get("success") and data.get("data"):
+            d = data["data"]
             return {
-                "opens":   [float(c[1]) for c in rows],
-                "highs":   [float(c[2]) for c in rows],
-                "lows":    [float(c[3]) for c in rows],
-                "closes":  [float(c[4]) for c in rows],
-                "volumes": [float(c[5]) for c in rows],
+                "opens":   [float(c) for c in d.get("open",  [])],
+                "closes":  [float(c) for c in d.get("close", [])],
+                "highs":   [float(c) for c in d.get("high",  [])],
+                "lows":    [float(c) for c in d.get("low",   [])],
+                "volumes": [float(c) for c in d.get("vol",   [])],
             }
     except Exception as e:
-        log.debug("Bybit kline %s %s: %s", symbol, interval, e)
+        log.debug("MEXC kline %s %s: %s", symbol, interval, e)
     return empty
 
 
-async def get_bybit_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
+async def get_mexc_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
     cache_key = f"{symbol}:{interval}:{limit}"
     now       = time.time()
     cached    = _kline_cache.get(cache_key)
     if cached and now - cached["ts"] < KLINE_CACHE_TTL:
         return cached["data"]
-    data = await _fetch_bybit_klines(symbol, interval, limit)
+    data = await _fetch_mexc_klines(symbol, interval, limit)
     if data["closes"]:
         _kline_cache[cache_key] = {"ts": now, "data": data}
+    # Очищаем устаревшие записи при переполнении (предотвращаем утечку памяти)
     if len(_kline_cache) > 3000:
         stale = [k for k, v in _kline_cache.items() if now - v["ts"] > KLINE_CACHE_TTL * 5]
         for k in stale:
             _kline_cache.pop(k, None)
     return data
 
+
+KLINE_LIMIT_15M  = 60    # 60 свечей по 15 мин = 15 часов (старший таймфрейм RSI, OBV)
+
+
+async def get_mexc_klines_multi(symbol: str) -> dict:
+    """
+    Получает три таймфрейма параллельно:
+      - Min1  x120 — RSI, StochRSI, BB, паттерны свечей, wick rejection
+      - Min5  x100 — ATR, EMA, MACD, объём, моментум, lower highs
+      - Min15 x60  — OBV-дивергенция, RSI старшего TF, структура тренда
+    """
+    _empty = {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
+    results = await asyncio.gather(
+        get_mexc_klines(symbol, "Min1",  KLINE_LIMIT_1M),
+        get_mexc_klines(symbol, "Min5",  KLINE_LIMIT_5M),
+        get_mexc_klines(symbol, "Min15", KLINE_LIMIT_15M),
+        return_exceptions=True,
+    )
+    return {
+        "klines_1m":  results[0] if not isinstance(results[0], Exception) else _empty,
+        "klines_5m":  results[1] if not isinstance(results[1], Exception) else _empty,
+        "klines_15m": results[2] if not isinstance(results[2], Exception) else _empty,
+    }
+
+
+async def get_mexc_closes(symbol: str, interval: str = "Min1") -> list[float]:
+    return (await get_mexc_klines(symbol, interval))["closes"]
+
+
+def _to_mexc_symbol(sym: str) -> str:
+    if sym.endswith("USDT"):
+        return sym[:-4] + "_USDT"
+    if sym.endswith("PERP"):
+        base = sym[:-4]
+        if base.endswith("USDT"):
+            return base[:-4] + "_USDT"
+    return sym
 
 
 # ================================================================
@@ -606,7 +682,7 @@ def detect_candle_pattern(closes: list[float], highs: list[float],
                            opens: list[float] | None = None) -> Optional[str]:
     """
     Медвежий свечной паттерн на последних 2 барах.
-    opens — реальные цены открытия из Bybit kline.
+    opens — реальные цены открытия из MEXC kline (поле 'open').
     Если не переданы, аппроксимируем prev_close.
       - Shooting Star: длинная верхняя тень >2× тела, тело внизу, закрытие < открытие
       - Доджи: тело < 10% диапазона — нерешительность
@@ -617,7 +693,7 @@ def detect_candle_pattern(closes: list[float], highs: list[float],
         if len(closes) < 3 or len(highs) < 3 or len(lows) < 3:
             return None
 
-        # Реальные opens из Bybit или аппроксимация
+        # Реальные opens из MEXC или аппроксимация
         if opens and len(opens) >= 3:
             o_prev2 = opens[-3]
             o_prev  = opens[-2]
@@ -724,7 +800,7 @@ def calculate_price_momentum(prices: list[float],
 
 def calculate_volume_weakness(volumes: list[float]) -> Optional[str]:
     """
-    Реальный объём из свечей Bybit.
+    Реальный объём из свечей MEXC.
     Если последний бар < REVERSAL_VOL_RATIO от среднего — сигнал слабости роста.
     """
     try:
@@ -758,6 +834,13 @@ def calculate_volume_signal(sym: str) -> Optional[str]:
         return "📊 Движение без импульса (иссякание)"
     return None
 
+
+async def get_rsi_trend_from_mexc(symbol: str, window: int = 14) -> Optional[str]:
+    mexc_sym = _to_mexc_symbol(symbol)
+    closes   = await get_mexc_closes(mexc_sym, interval="Min1")
+    if len(closes) < window + 3:
+        return None
+    return calculate_rsi_trend(closes, window=window)
 
 
 def calculate_rsi_trend(prices: list[float], window: int = 14) -> Optional[str]:
@@ -1054,7 +1137,7 @@ def detect_short_reversal(
         if near_high:
             bearish = False
             if len(closes_1m) >= 2 and len(opens_1m) >= 1:
-                # Реальная красная свеча у хая (close < open из Bybit)
+                # Реальная красная свеча у хая (close < open из MEXC)
                 bearish = (opens_1m[-1] > closes_1m[-1]  # медвежья свеча
                            and highs_1m[-1] >= high24 * REVERSAL_HIGH_MARGIN)
             if not bearish and len(recent) >= 4:
@@ -1096,7 +1179,7 @@ def detect_short_reversal(
                 score += 1
                 factors.append(f"ATR-перегрев Min5 ({atr_ratio:.1f}× ATR={atr:.4g})")
 
-    # ── 11. Свечной паттерн (Min1, реальные opens из Bybit) ───────────────────
+    # ── 11. Свечной паттерн (Min1, реальные opens из MEXC) ───────────────────
     candle_pattern = None
     if len(closes_1m) >= 4 and len(highs_1m) >= 4 and len(lows_1m) >= 4:
         candle_pattern = detect_candle_pattern(
@@ -1181,11 +1264,9 @@ def detect_short_reversal(
 # ================================================================
 
 async def _tg_post(method: str, payload: dict, retries: int = 3) -> Optional[dict]:
-    if _tg_session is None:
-        return None
     for attempt in range(retries):
         try:
-            async with _tg_session.post(
+            async with _session.post(
                 f"{TG}/{method}", json=payload,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
@@ -1196,7 +1277,7 @@ async def _tg_post(method: str, payload: dict, retries: int = 3) -> Optional[dic
         except asyncio.TimeoutError:
             log.warning("[_tg_post] timeout %s (попытка %d/%d)", method, attempt + 1, retries)
             if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(2 ** attempt)  # 1s, 2s
         except Exception as e:
             log.error("[_tg_post] %s: %s", method, e)
             if attempt < retries - 1:
@@ -1217,8 +1298,8 @@ async def send_document(chat_id, filename: str, content: str, caption: str = "")
         form.add_field("chat_id", str(chat_id))
         form.add_field("caption", caption)
         form.add_field("document", content.encode(), filename=filename, content_type="text/csv")
-        async with _tg_session.post(f"{TG}/sendDocument", data=form,
-                                     timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        async with _session.post(f"{TG}/sendDocument", data=form,
+                                  timeout=aiohttp.ClientTimeout(total=30)) as resp:
             return await resp.json()
     except Exception as e:
         log.error("sendDocument: %s", e)
@@ -1426,335 +1507,117 @@ def format_reversal_alert(
 
 
 # ================================================================
-#  SYMBOLS  — только Bybit Linear Perpetual USDT
+#  SYMBOLS
 # ================================================================
 
 async def get_symbols() -> set[str]:
-    """Загружает все бессрочные USDT-контракты с Bybit V5 API (с пагинацией)."""
     symbols: set[str] = set()
-    cursor = None
-    try:
-        while True:
-            params: dict = {"category": "linear", "limit": 1000}
-            if cursor:
-                params["cursor"] = cursor
-            async with _session.get(
-                "https://api.bybit.com/v5/market/instruments-info",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as r:
-                raw = await r.text()
-            try:
-                data = json.loads(raw)
-            except Exception:
-                log.error("get_symbols: невалидный ответ Bybit:\n%.500s", raw)
-                break
-            if data.get("retCode") != 0:
-                log.error("get_symbols Bybit retCode=%s msg=%s", data.get("retCode"), data.get("retMsg"))
-                break
-            for item in data["result"]["list"]:
-                sym = item.get("symbol", "")
-                if (sym.endswith("USDT")
-                        and item.get("contractType") == "LinearPerpetual"
-                        and item.get("status") == "Trading"):
-                    symbols.add(sym)
-            cursor = data["result"].get("nextPageCursor")
-            if not cursor:
-                break
-        log.info("Bybit Linear Perpetual USDT: %d монет", len(symbols))
-    except Exception as e:
-        log.error("get_symbols Bybit: %s", e)
+    for label, url, suffixes in [
+        ("Trading", "https://public.bybit.com/trading/", ("USDT", "PERP")),
+        ("Spot",    "https://public.bybit.com/spot/",    ("USDT",)),
+    ]:
+        try:
+            async with _session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                html = await r.text()
+            soup  = BeautifulSoup(html, "html.parser")
+            count = 0
+            for a in soup.find_all("a"):
+                sym = a.text.strip("/")
+                if sym.endswith(suffixes):
+                    symbols.add(sym.replace("/", ""))
+                    count += 1
+            log.info("%s: %d символов", label, count)
+        except Exception as e:
+            log.error("get_symbols %s: %s", label, e)
+    log.info("Всего монет: %d", len(symbols))
     return symbols
 
 
 # ================================================================
-#  BYBIT WEBSOCKET — цены и свечи в реальном времени
-# ================================================================
-#
-#  Архитектура:
-#    ws_ticker_loop  — подписка на tickers всех монет → price_history
-#    ws_kline_loop   — подписка на kline.1 / kline.5 / kline.15 → _kline_store
-#    monitor         — читает из памяти, не делает HTTP-запросов
-#
-#  При старте: REST-запрос для cold-start свечей (заполняем историю).
-#  WS-соединение одно на все монеты через batch-подписки по 500 символов.
+#  PRICES
 # ================================================================
 
-BYBIT_WS_PUBLIC  = "wss://stream.bybit.com/v5/public/linear"
-WS_RECONNECT_SEC = 5
-WS_PING_INTERVAL = 20   # Bybit требует ping каждые 20 сек
-
-# ── Хранилище свечей (заполняется WS) ────────────────────────────
-# _kline_store[sym][interval] = {"opens":[], "closes":[], "highs":[], "lows":[], "volumes":[]}
-_kline_store: dict[str, dict[str, dict]] = {}
-_kline_store_lock: asyncio.Lock | None = None   # инициализируется в main()
-
-# Символы, на которые уже подписаны WS
-_ws_subscribed_syms: set[str] = set()
-
-# Флаги готовности — инициализируются в main() внутри event loop
-_ws_tickers_ready: asyncio.Event | None = None
-_ws_klines_ready:  asyncio.Event | None = None
-
-
-def _kline_empty() -> dict:
-    return {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
-
-
-def _kline_get(sym: str, interval: str) -> dict:
-    return _kline_store.get(sym, {}).get(interval, _kline_empty())
-
-
-def _kline_update(sym: str, interval: str, candle: list):
-    """Обновляет или добавляет последнюю свечу в хранилище."""
-    store = _kline_store.setdefault(sym, {})
-    buf   = store.setdefault(interval, _kline_empty())
-    o, h, l, c, v = (float(candle[i]) for i in (1, 2, 3, 4, 5))
-    # Последняя свеча — обновляем; если новее — добавляем
-    if buf["closes"] and candle[6] == "true":   # confirm=true → свеча закрыта
-        # Заменяем последнюю (она была неподтверждённой)
-        for key, val in zip(("opens","highs","lows","closes","volumes"), (o,h,l,c,v)):
-            if buf[key]:
-                buf[key][-1] = val
-            else:
-                buf[key].append(val)
-        # Добавляем новый незакрытый слот (следующая свеча придёт потом)
-    else:
-        # Неподтверждённая — просто обновляем последний элемент
-        if not buf["closes"]:
-            for key, val in zip(("opens","highs","lows","closes","volumes"), (o,h,l,c,v)):
-                buf[key].append(val)
-        else:
-            buf["opens"][-1]   = o
-            buf["highs"][-1]   = h
-            buf["lows"][-1]    = l
-            buf["closes"][-1]  = c
-            buf["volumes"][-1] = v
-
-
-async def _ws_send_ping(ws):
-    try:
-        await ws.send_str(json.dumps({"op": "ping"}))
-    except Exception:
-        pass
-
-
-async def _ws_subscribe(ws, topics: list[str]):
-    await ws.send_str(json.dumps({"op": "subscribe", "args": topics}))
-
-
-async def ws_ticker_loop(symbols: set[str]):
-    """
-    Подписывается на tickers всех монет через Bybit Public WS.
-    Обновляет price_history напрямую.
-    Использует прокси если задан (через _session.ws_connect).
-    """
-    global _ws_subscribed_syms
-    syms = sorted(symbols)
-    # Разбиваем на батчи по 500 (лимит Bybit)
-    batches = [syms[i:i+500] for i in range(0, len(syms), 500)]
-
-    while True:
-        try:
-            async with _session.ws_connect(
-                BYBIT_WS_PUBLIC,
-                heartbeat=WS_PING_INTERVAL,
-                timeout=30,
-            ) as ws:
-                # Подписываемся на tickers батчами
-                for batch in batches:
-                    topics = [f"tickers.{s}" for s in batch]
-                    await _ws_subscribe(ws, topics)
-                _ws_subscribed_syms = set(syms)
-                log.info("WS tickers: подписано на %d монет", len(syms))
-
-                ping_ts = time.time()
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = json.loads(msg.data)
-                        topic = data.get("topic", "")
-                        if topic.startswith("tickers."):
-                            ticker = data.get("data", {})
-                            sym    = ticker.get("symbol", "")
-                            last   = ticker.get("lastPrice", "")
-                            if sym and last:
-                                try:
-                                    price = float(last)
-                                    if price > 0:
-                                        now = time.time()
-                                        hist = price_history.setdefault(sym, [])
-                                        hist.append((now, price))
-                                        cutoff = max(current_window * 2, 86400)
-                                        if len(hist) % 100 == 0:
-                                            price_history[sym] = [
-                                                (t, p) for t, p in hist if now - t <= cutoff
-                                            ]
-                                        last_check_time = now
-                                        _ws_tickers_ready.set()
-                                except (ValueError, TypeError):
-                                    pass
-                        # Ping каждые WS_PING_INTERVAL сек
-                        if time.time() - ping_ts >= WS_PING_INTERVAL:
-                            await _ws_send_ping(ws)
-                            ping_ts = time.time()
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        log.warning("WS tickers: соединение закрыто, переподключение...")
-                        break
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.error("ws_ticker_loop: %s", e)
-        await asyncio.sleep(WS_RECONNECT_SEC)
-
-
-async def ws_kline_loop(symbols: set[str]):
-    """
-    Подписывается на kline.1 / kline.5 / kline.15 для всех монет.
-    Обновляет _kline_store.
-    """
-    syms = sorted(symbols)
-    intervals = ["1", "5", "15"]
-    # Разбиваем на батчи (3 интервала × N монет, лимит 500 топиков за запрос)
-    all_topics = [f"kline.{iv}.{s}" for iv in intervals for s in syms]
-    batches    = [all_topics[i:i+500] for i in range(0, len(all_topics), 500)]
-
-    while True:
-        try:
-            async with _session.ws_connect(
-                BYBIT_WS_PUBLIC,
-                heartbeat=WS_PING_INTERVAL,
-                timeout=30,
-            ) as ws:
-                for batch in batches:
-                    await _ws_subscribe(ws, batch)
-                log.info("WS klines: подписано (%d топиков)", len(all_topics))
-
-                ping_ts = time.time()
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data  = json.loads(msg.data)
-                        topic = data.get("topic", "")
-                        if topic.startswith("kline."):
-                            parts = topic.split(".")   # kline.1.BTCUSDT
-                            if len(parts) == 3:
-                                _, iv_str, sym = parts
-                                iv_map = {"1": "Min1", "5": "Min5", "15": "Min15"}
-                                interval = iv_map.get(iv_str)
-                                if interval:
-                                    for candle in data.get("data", []):
-                                        _kline_update(sym, interval, [
-                                            candle.get("start"),
-                                            candle.get("open"),
-                                            candle.get("high"),
-                                            candle.get("low"),
-                                            candle.get("close"),
-                                            candle.get("volume"),
-                                            candle.get("confirm", "false"),
-                                        ])
-                        if time.time() - ping_ts >= WS_PING_INTERVAL:
-                            await _ws_send_ping(ws)
-                            ping_ts = time.time()
-                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                        log.warning("WS klines: соединение закрыто, переподключение...")
-                        break
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.error("ws_kline_loop: %s", e)
-        await asyncio.sleep(WS_RECONNECT_SEC)
-
-
-async def coldstart_klines(symbols: set[str]):
-    """
-    Один раз при старте загружает историю свечей через REST
-    чтобы индикаторы заработали сразу, не дожидаясь накопления WS-данных.
-    """
-    log.info("Cold-start: загружаем свечи для %d монет...", len(symbols))
-    sem = asyncio.Semaphore(20)   # параллельно не более 20 запросов
-
-    async def _load_one(sym: str):
-        async with sem:
-            results = await asyncio.gather(
-                _fetch_bybit_klines(sym, "Min1",  KLINE_LIMIT_1M),
-                _fetch_bybit_klines(sym, "Min5",  KLINE_LIMIT_5M),
-                _fetch_bybit_klines(sym, "Min15", KLINE_LIMIT_15M),
-                return_exceptions=True,
-            )
-            store = _kline_store.setdefault(sym, {})
-            for interval, res in zip(("Min1", "Min5", "Min15"), results):
-                if not isinstance(res, Exception) and res["closes"]:
-                    store[interval] = res
-
-    tasks = [_load_one(s) for s in symbols]
-    # Батчами по 100 чтобы не перегружать прокси
-    for i in range(0, len(tasks), 100):
-        await asyncio.gather(*tasks[i:i+100], return_exceptions=True)
-        await asyncio.sleep(0.5)
-
-    log.info("Cold-start свечей завершён")
-    _ws_klines_ready.set()
-
-
-def get_klines_multi(sym: str) -> dict:
-    """Читает свечи из памяти (заполнены WS + cold-start). Без HTTP."""
-    return {
-        "klines_1m":  _kline_get(sym, "Min1"),
-        "klines_5m":  _kline_get(sym, "Min5"),
-        "klines_15m": _kline_get(sym, "Min15"),
-    }
-
-
-# ── Оставляем REST-функции для cold-start (используются только там) ──────────
-
-_kline_cache: dict[str, dict] = {}
-KLINE_CACHE_TTL  = 60
-KLINE_LIMIT_1M   = 120
-KLINE_LIMIT_5M   = 100
-KLINE_LIMIT_15M  = 60
-KLINE_LIMIT      = KLINE_LIMIT_1M
-_BYBIT_INTERVAL  = {"Min1": "1", "Min5": "5", "Min15": "15"}
-
-
-async def _fetch_bybit_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
-    empty    = {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
-    bybit_iv = _BYBIT_INTERVAL.get(interval, "1")
+async def _fetch_okx(norm: dict) -> tuple[dict, dict]:
+    prices, sources = {}, {}
     try:
         async with _session.get(
-            "https://api.bybit.com/v5/market/kline",
-            params={"category": "linear", "symbol": symbol,
-                    "interval": bybit_iv, "limit": limit},
-            timeout=aiohttp.ClientTimeout(total=10),
+            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as r:
             data = await r.json()
-        if data.get("retCode") == 0:
-            rows = list(reversed(data["result"]["list"]))
-            return {
-                "opens":   [float(c[1]) for c in rows],
-                "highs":   [float(c[2]) for c in rows],
-                "lows":    [float(c[3]) for c in rows],
-                "closes":  [float(c[4]) for c in rows],
-                "volumes": [float(c[5]) for c in rows],
-            }
+        for item in data.get("data", []):
+            sym   = normalize_symbol(item["instId"])
+            price = float(item["last"])
+            if price > 0 and sym in norm:
+                real = norm[sym]
+                prices[real]  = price
+                sources[real] = "OKX"
     except Exception as e:
-        log.debug("Bybit kline REST %s %s: %s", symbol, interval, e)
-    return empty
+        log.error("OKX: %s", e)
+    return prices, sources
+
+
+async def _fetch_mexc(norm: dict) -> tuple[dict, dict]:
+    prices, sources = {}, {}
+    try:
+        async with _session.get(
+            "https://contract.mexc.com/api/v1/contract/ticker",
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as r:
+            data = await r.json()
+        if data.get("success"):
+            for item in data["data"]:
+                sym   = normalize_symbol(item["symbol"])
+                price = float(item["lastPrice"])
+                if price > 0 and sym in norm:
+                    real = norm[sym]
+                    prices[real]  = price
+                    sources[real] = "MEXC"
+    except Exception as e:
+        log.error("MEXC: %s", e)
+    return prices, sources
+
+
+_norm_cache: dict[str, str] = {}
+_norm_symbols_key: frozenset = frozenset()
+
+
+async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
+    global _norm_cache, _norm_symbols_key
+    sym_key = frozenset(symbols)
+    if sym_key != _norm_symbols_key:
+        _norm_cache       = {normalize_symbol(s): s for s in symbols}
+        _norm_symbols_key = sym_key
+    norm = _norm_cache
+
+    merged: dict = {}
+    msrc:   dict = {}
+    results = await asyncio.gather(_fetch_mexc(norm), _fetch_okx(norm), return_exceptions=True)
+    for res in results:
+        if isinstance(res, Exception):
+            log.error("Fetch error: %s", res)
+            continue
+        p, s = res
+        for sym, price in p.items():
+            if sym not in merged:
+                merged[sym] = price
+                msrc[sym]   = s[sym]
+    return merged, msrc
 
 
 # ================================================================
-#  MONITOR  — читает данные из памяти (WS), без HTTP-запросов
+#  MONITOR
 # ================================================================
 
 async def monitor():
     global current_percent, current_window, signals_count, reversal_count, checks_count, last_check_time
     global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT
 
+    symbols          = await get_symbols()
+    last_symbols_upd = time.time()
     _cache_load_levels()
-    await broadcast("✅ <b>Бот запущен</b> (v17 — Bybit WebSocket)")
 
-    # Ждём первых данных от WS
-    log.info("Ожидание первых тикеров от WebSocket...")
-    await asyncio.wait_for(_ws_tickers_ready.wait(), timeout=60)
-    log.info("WebSocket тикеры готовы, запускаем анализ")
+    await broadcast("✅ <b>Бот запущен</b> (v12 — 12-факторный разворот)")
 
     while True:
         if monitor_paused:
@@ -1762,33 +1625,36 @@ async def monitor():
             continue
 
         try:
-            now          = time.time()
-            checks_count += 1
+            now             = time.time()
+            checks_count   += 1
             last_check_time = now
 
             if PROM_AVAILABLE:
                 PROM_CHECKS.inc()
                 PROM_COINS.set(len(price_history))
 
-            # Снимаем снэпшот текущих цен из price_history (заполняется WS)
-            snapshot: dict[str, float] = {}
-            for sym, hist in list(price_history.items()):
-                if hist:
-                    snapshot[sym] = hist[-1][1]
+            if now - last_symbols_upd >= 1800:
+                new_sym = await get_symbols()
+                if new_sym:
+                    symbols = new_sym
+                    log.info("Монеты обновлены: %d", len(symbols))
+                last_symbols_upd = now
 
-            for sym, price in snapshot.items():
+            prices, sources = await get_prices(symbols)
+
+            for sym, price in prices.items():
                 await asyncio.sleep(0)
-                last_check_time = time.time()
 
                 if price <= 0:
                     continue
 
-                hist   = price_history.get(sym, [])
+                hist = price_history.setdefault(sym, [])
+                hist.append((now, price))
                 cutoff = max(current_window * 2, 86400)
                 price_history[sym] = [(t, p) for t, p in hist if now - t <= cutoff]
 
                 recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
-                source = "Bybit"
+                source = sources.get(sym, "UNKNOWN")
 
                 if len(recent) < MIN_SAMPLES:
                     continue
@@ -1800,12 +1666,13 @@ async def monitor():
                 growth    = (price - old_price) / old_price * 100
                 direction = 1 if growth > 0 else -1
 
-                # ── Свечи из памяти (WS + cold-start) — нет HTTP ──────────────
-                klines_all = get_klines_multi(sym)
-                klines_1m  = klines_all["klines_1m"]
-                klines_5m  = klines_all["klines_5m"]
-                klines_15m = klines_all["klines_15m"]
-                closes     = klines_1m["closes"]
+                # ── Свечи MEXC: 3 таймфрейма параллельно ──────────────────────
+                mexc_sym    = _to_mexc_symbol(sym)
+                klines_all  = await get_mexc_klines_multi(mexc_sym)
+                klines_1m   = klines_all["klines_1m"]
+                klines_5m   = klines_all["klines_5m"]
+                klines_15m  = klines_all["klines_15m"]
+                closes      = klines_1m["closes"]
 
                 rsi = calculate_rsi(closes) if closes else None
                 if rsi is None:
@@ -1948,8 +1815,6 @@ async def monitor():
 
                 log.info("Signal: %s %+.2f%% [%s]", sym, growth, source)
 
-            # WS пушит данные непрерывно — делаем паузу config.INTERVAL
-            # чтобы не жечь CPU, но не ждать REST-ответа
             await asyncio.sleep(config.INTERVAL)
 
             # ── Периодическая очистка памяти ──────────────────────────────────
@@ -2447,14 +2312,14 @@ async def _cmd_export(chat_id):
 async def get_updates() -> list:
     global offset
     try:
-        async with _tg_session.get(
+        async with _session.get(
             f"{TG}/getUpdates",
             params={
-                "timeout":         20,       # long-polling — прокси медленный
+                "timeout":         5,        # короткий таймаут — прокси медленный
                 "offset":          offset,
                 "allowed_updates": json.dumps(["message", "edited_message"]),
             },
-            timeout=aiohttp.ClientTimeout(total=35),  # запас на прокси
+            timeout=aiohttp.ClientTimeout(total=15),  # запас на прокси
         ) as resp:
             data = await resp.json()
         if data.get("ok"):
@@ -2466,9 +2331,6 @@ async def get_updates() -> list:
 
 async def telegram_loop():
     global offset
-    # Ждём пока main() инициализирует _tg_session
-    while _tg_session is None:
-        await asyncio.sleep(0.1)
     log.info("Telegram polling запущен")
     while True:
         try:
@@ -2532,7 +2394,7 @@ async def db_cleanup_loop():
 #  WATCHDOG
 # ================================================================
 
-WATCHDOG_TIMEOUT = 300  # 5 минут — прокси медленный, монет много
+WATCHDOG_TIMEOUT = 90
 
 
 async def watchdog():
@@ -2586,13 +2448,9 @@ def handle_async_exception(loop, context):
 # ================================================================
 
 async def main():
-    global monitor_task, _session, _tg_session, _shutdown_event
-    global _ws_tickers_ready, _ws_klines_ready, _kline_store_lock
+    global monitor_task, _session, _shutdown_event
 
-    _shutdown_event    = asyncio.Event()
-    _ws_tickers_ready  = asyncio.Event()
-    _ws_klines_ready   = asyncio.Event()
-    _kline_store_lock  = asyncio.Lock()
+    _shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(handle_async_exception)
 
@@ -2608,53 +2466,21 @@ async def main():
             log.warning("Prometheus failed: %s", e)
 
     proxy_url = os.getenv("PROXY_URL") or getattr(config, "PROXY_URL", None)
-
-    # ── Bybit: всегда напрямую (WebSocket + REST) ─────────────────────────────
-    bybit_connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
-
-    # ── Telegram: через прокси если задан ────────────────────────────────────
     if proxy_url and PROXY_AVAILABLE:
-        tg_connector = ProxyConnector.from_url(proxy_url, limit=20, ttl_dns_cache=300)
-        log.info("🌐 Telegram через прокси: %s", proxy_url.split("@")[-1])
-        log.info("🔗 Bybit WebSocket + REST — прямое подключение")
+        connector = ProxyConnector.from_url(proxy_url, limit=50, ttl_dns_cache=300)
+        log.info("🌐 Прокси активен: %s", proxy_url.split("@")[-1])
     elif proxy_url and not PROXY_AVAILABLE:
-        log.warning("⚠️ PROXY_URL задан, но aiohttp-socks не установлен — Telegram без прокси")
-        tg_connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+        log.warning("⚠️ PROXY_URL задан, но aiohttp-socks не установлен — работаем без прокси")
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     else:
-        log.info("Прокси не задан — всё напрямую")
-        tg_connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-
-    async with (
-        aiohttp.ClientSession(connector=bybit_connector) as bybit_sess,
-        aiohttp.ClientSession(connector=tg_connector)   as tg_sess,
-    ):
-        _session    = bybit_sess   # Bybit REST + WebSocket (прямой)
-        _tg_session = tg_sess      # Telegram API (через прокси)
-
-        # 1. Список монет через Bybit REST (напрямую)
-        log.info("Загружаем список монет...")
-        symbols = await get_symbols()
-        if not symbols:
-            log.error("Не удалось получить список символов — выход")
-            return
-
-        # 2. Cold-start свечей через Bybit REST (параллельно с WS)
-        coldstart_task = asyncio.create_task(coldstart_klines(symbols))
-
-        # 3. WebSocket тикеры — напрямую к Bybit
-        ws_ticker_task = asyncio.create_task(ws_ticker_loop(symbols))
-
-        # 4. WebSocket свечи — напрямую к Bybit
-        ws_kline_task  = asyncio.create_task(ws_kline_loop(symbols))
-
-        # 5. Monitor — читает из памяти, ждёт _ws_tickers_ready
-        monitor_task   = asyncio.create_task(monitor())
+        log.info("Прокси не задан — прямое подключение")
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        _session     = session
+        monitor_task = asyncio.create_task(monitor())
 
         tasks = [
             monitor_task,
-            ws_ticker_task,
-            ws_kline_task,
-            coldstart_task,
             asyncio.create_task(telegram_loop()),
             asyncio.create_task(heartbeat()),
             asyncio.create_task(save_state_loop()),
