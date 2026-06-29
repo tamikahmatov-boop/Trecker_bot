@@ -1844,6 +1844,15 @@ async def handle_message(msg: dict):
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
 
+    if text == "/start":
+        await send_message(
+            f"🚀 <b>Crypto Alert Bot v16</b>\n\n"
+            f"Используйте /subscribe чтобы подписаться на сигналы.\n"
+            f"Для отписки: /unsubscribe",
+            chat_id,
+        )
+        return
+
     if chat_id != int(config.CHAT_ID):
         if text == "/subscribe":
             db_add_subscriber(chat_id)
