@@ -1,56 +1,7 @@
 """
-Crypto Alert Bot — v16
-Полный аудит, исправление всех ошибок и расширение до 16 факторов разворота.
-
-═══════════════════════════════════════════════════════
- ИСПРАВЛЕННЫЕ БАГИ
-═══════════════════════════════════════════════════════
-• db_connect: не делал commit() → INSERT мог не сохраняться. Добавлен commit/rollback.
-• _fetch_mexc_klines: не запрашивал поле "open" → detect_candle_pattern использовал
-  closes[-2] как open текущей свечи → Shooting Star никогда не срабатывал.
-  Исправлено: opens теперь запрашиваются и передаются в detect_candle_pattern.
-• detect_candle_pattern: полностью переписан — реальные opens, добавлен паттерн
-  "Вечерняя звезда" (3 бара), исправлена логика тела/тени.
-• monitor: get_rsi_trend_from_mexc() делал отдельный HTTP запрос хотя closes уже есть.
-  Заменено на calculate_rsi_trend(closes).
-• price_change использовалась в log.info но могла быть не определена → NameError.
-• import os был внутри db_size_mb() → перемещён на уровень модуля.
-• 🧹 БД Очистка: выводила Python dict → заменена на читаемый текст.
-• _esc() определялась внутри format_reversal_alert при каждом вызове → перенесена
-  на уровень модуля (DRY).
-• MACD_SLOPE дефолт -0.000005 слишком мал → никогда не срабатывал slope-ветка.
-• get_mexc_klines_multi: fallback dict не содержал "opens" → KeyError в паттернах.
-• _kline_cache / _alert_cooldown / price_history: не чистились → утечка памяти.
-  Добавлена периодическая очистка в monitor loop.
-
-═══════════════════════════════════════════════════════
- НОВЫЕ ФАКТОРЫ РАЗВОРОТА (13–16, теперь итого 16/16)
-═══════════════════════════════════════════════════════
-• 13. OBV-дивергенция (Min15): цена растёт, On-Balance Volume падает.
-      Сигнал ослабления покупательского давления.
-• 14. Wick Rejection Ratio > 0.55 (Min1): среднее отношение верхней тени
-      к диапазону за 3 свечи. Указывает на систематическое отталкивание цены от верха.
-• 15. RSI старшего TF > 75 (Min15): перекупленность на 15-минутном таймфрейме
-      в сочетании с 1m-сигналами даёт подтверждение разворота.
-• 16. Lower Highs паттерн (Min5): 3+ последовательных снижения максимумов —
-      структурный медвежий разворот.
-
-═══════════════════════════════════════════════════════
- УЛУЧШЕНИЯ ДАННЫХ (3 таймфрейма параллельно)
-═══════════════════════════════════════════════════════
-• Min1  x120: RSI, StochRSI, BB, паттерны (с реальными opens), wick rejection
-• Min5  x100: MACD, EMA, ATR, моментум, объём, lower highs
-• Min15 x60:  OBV-дивергенция, RSI старшего TF, RSI-дивергенция
-  Все три таймфрейма загружаются параллельно через asyncio.gather.
-
-═══════════════════════════════════════════════════════
- ДРУГИЕ УЛУЧШЕНИЯ
-═══════════════════════════════════════════════════════
-• format_reversal_alert: RSI 1m + RSI 15m, Wick ratio, 3 цели Фибо (38.2/50/61.8%)
-• Уровни уверенности пересчитаны под 16 факторов: слабый <6, средний 6-9, высокий 10+
-• _cmd_reversal_settings: описание всех 16 факторов с новыми факторами 13-16
-• Пресеты обновлены: стандарт /rev_score 5, строгий /rev_score 9
-• /rev_score принимает значения 1–16 (было 1–12)
+Crypto Alert Bot — v17
+Только Bybit бессрочные USDT-контракты (Linear Perpetual).
+Цены и свечи исключительно с Bybit V5 API. MEXC и OKX удалены.
 """
 
 from __future__ import annotations
@@ -74,7 +25,6 @@ try:
 except ImportError:
     PROXY_AVAILABLE = False
 import pandas as pd
-from bs4 import BeautifulSoup
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, EMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
@@ -471,51 +421,61 @@ def normalize_symbol(sym: str) -> str:
 
 
 # ================================================================
-#  MEXC KLINE CACHE  (цена + объём)
+#  BYBIT KLINE CACHE  (цена + объём)
 # ================================================================
 
 _kline_cache: dict[str, dict] = {}
 KLINE_CACHE_TTL  = 60
-KLINE_LIMIT_1M   = 120   # 120 свечей по 1 мин = 2 часа (RSI, BB, StochRSI, паттерны)
-KLINE_LIMIT_5M   = 100   # 100 свечей по 5 мин = 8+ часов (ATR, EMA, MACD, объём)
-# Для обратной совместимости
+KLINE_LIMIT_1M   = 120   # 120 свечей по 1 мин = 2 часа
+KLINE_LIMIT_5M   = 100   # 100 свечей по 5 мин = 8+ часов
+KLINE_LIMIT_15M  = 60    # 60 свечей по 15 мин = 15 часов
 KLINE_LIMIT = KLINE_LIMIT_1M
 
+# Bybit: интервалы в минутах строкой
+_BYBIT_INTERVAL = {"Min1": "1", "Min5": "5", "Min15": "15"}
 
-async def _fetch_mexc_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
-    """Возвращает dict с ключами: opens, closes, highs, lows, volumes (все list[float])."""
+
+async def _fetch_bybit_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
+    """Возвращает dict с ключами: opens, closes, highs, lows, volumes (все list[float]).
+    Bybit V5 kline: GET /v5/market/kline
+    interval: "1" | "5" | "15" | "60" | "D" и т.д.
+    Ответ: list[[ startTime, open, high, low, close, volume, turnover ]]
+    Данные идут от новых к старым — разворачиваем.
+    """
     empty = {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
+    bybit_iv = _BYBIT_INTERVAL.get(interval, "1")
     try:
         async with _session.get(
-            "https://contract.mexc.com/api/v1/contract/kline",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
+            "https://api.bybit.com/v5/market/kline",
+            params={"category": "linear", "symbol": symbol,
+                    "interval": bybit_iv, "limit": limit},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
             data = await r.json()
-        if data.get("success") and data.get("data"):
-            d = data["data"]
+        if data.get("retCode") == 0:
+            rows = data["result"]["list"]
+            rows = list(reversed(rows))   # от старых к новым
             return {
-                "opens":   [float(c) for c in d.get("open",  [])],
-                "closes":  [float(c) for c in d.get("close", [])],
-                "highs":   [float(c) for c in d.get("high",  [])],
-                "lows":    [float(c) for c in d.get("low",   [])],
-                "volumes": [float(c) for c in d.get("vol",   [])],
+                "opens":   [float(c[1]) for c in rows],
+                "highs":   [float(c[2]) for c in rows],
+                "lows":    [float(c[3]) for c in rows],
+                "closes":  [float(c[4]) for c in rows],
+                "volumes": [float(c[5]) for c in rows],
             }
     except Exception as e:
-        log.debug("MEXC kline %s %s: %s", symbol, interval, e)
+        log.debug("Bybit kline %s %s: %s", symbol, interval, e)
     return empty
 
 
-async def get_mexc_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
+async def get_bybit_klines(symbol: str, interval: str = "Min1", limit: int = KLINE_LIMIT_1M) -> dict:
     cache_key = f"{symbol}:{interval}:{limit}"
     now       = time.time()
     cached    = _kline_cache.get(cache_key)
     if cached and now - cached["ts"] < KLINE_CACHE_TTL:
         return cached["data"]
-    data = await _fetch_mexc_klines(symbol, interval, limit)
+    data = await _fetch_bybit_klines(symbol, interval, limit)
     if data["closes"]:
         _kline_cache[cache_key] = {"ts": now, "data": data}
-    # Очищаем устаревшие записи при переполнении (предотвращаем утечку памяти)
     if len(_kline_cache) > 3000:
         stale = [k for k, v in _kline_cache.items() if now - v["ts"] > KLINE_CACHE_TTL * 5]
         for k in stale:
@@ -523,21 +483,13 @@ async def get_mexc_klines(symbol: str, interval: str = "Min1", limit: int = KLIN
     return data
 
 
-KLINE_LIMIT_15M  = 60    # 60 свечей по 15 мин = 15 часов (старший таймфрейм RSI, OBV)
-
-
-async def get_mexc_klines_multi(symbol: str) -> dict:
-    """
-    Получает три таймфрейма параллельно:
-      - Min1  x120 — RSI, StochRSI, BB, паттерны свечей, wick rejection
-      - Min5  x100 — ATR, EMA, MACD, объём, моментум, lower highs
-      - Min15 x60  — OBV-дивергенция, RSI старшего TF, структура тренда
-    """
+async def get_bybit_klines_multi(symbol: str) -> dict:
+    """Получает три таймфрейма параллельно с Bybit."""
     _empty = {"opens": [], "closes": [], "highs": [], "lows": [], "volumes": []}
     results = await asyncio.gather(
-        get_mexc_klines(symbol, "Min1",  KLINE_LIMIT_1M),
-        get_mexc_klines(symbol, "Min5",  KLINE_LIMIT_5M),
-        get_mexc_klines(symbol, "Min15", KLINE_LIMIT_15M),
+        get_bybit_klines(symbol, "Min1",  KLINE_LIMIT_1M),
+        get_bybit_klines(symbol, "Min5",  KLINE_LIMIT_5M),
+        get_bybit_klines(symbol, "Min15", KLINE_LIMIT_15M),
         return_exceptions=True,
     )
     return {
@@ -545,20 +497,6 @@ async def get_mexc_klines_multi(symbol: str) -> dict:
         "klines_5m":  results[1] if not isinstance(results[1], Exception) else _empty,
         "klines_15m": results[2] if not isinstance(results[2], Exception) else _empty,
     }
-
-
-async def get_mexc_closes(symbol: str, interval: str = "Min1") -> list[float]:
-    return (await get_mexc_klines(symbol, interval))["closes"]
-
-
-def _to_mexc_symbol(sym: str) -> str:
-    if sym.endswith("USDT"):
-        return sym[:-4] + "_USDT"
-    if sym.endswith("PERP"):
-        base = sym[:-4]
-        if base.endswith("USDT"):
-            return base[:-4] + "_USDT"
-    return sym
 
 
 # ================================================================
@@ -682,7 +620,7 @@ def detect_candle_pattern(closes: list[float], highs: list[float],
                            opens: list[float] | None = None) -> Optional[str]:
     """
     Медвежий свечной паттерн на последних 2 барах.
-    opens — реальные цены открытия из MEXC kline (поле 'open').
+    opens — реальные цены открытия из Bybit kline.
     Если не переданы, аппроксимируем prev_close.
       - Shooting Star: длинная верхняя тень >2× тела, тело внизу, закрытие < открытие
       - Доджи: тело < 10% диапазона — нерешительность
@@ -693,7 +631,7 @@ def detect_candle_pattern(closes: list[float], highs: list[float],
         if len(closes) < 3 or len(highs) < 3 or len(lows) < 3:
             return None
 
-        # Реальные opens из MEXC или аппроксимация
+        # Реальные opens из Bybit или аппроксимация
         if opens and len(opens) >= 3:
             o_prev2 = opens[-3]
             o_prev  = opens[-2]
@@ -800,7 +738,7 @@ def calculate_price_momentum(prices: list[float],
 
 def calculate_volume_weakness(volumes: list[float]) -> Optional[str]:
     """
-    Реальный объём из свечей MEXC.
+    Реальный объём из свечей Bybit.
     Если последний бар < REVERSAL_VOL_RATIO от среднего — сигнал слабости роста.
     """
     try:
@@ -834,13 +772,6 @@ def calculate_volume_signal(sym: str) -> Optional[str]:
         return "📊 Движение без импульса (иссякание)"
     return None
 
-
-async def get_rsi_trend_from_mexc(symbol: str, window: int = 14) -> Optional[str]:
-    mexc_sym = _to_mexc_symbol(symbol)
-    closes   = await get_mexc_closes(mexc_sym, interval="Min1")
-    if len(closes) < window + 3:
-        return None
-    return calculate_rsi_trend(closes, window=window)
 
 
 def calculate_rsi_trend(prices: list[float], window: int = 14) -> Optional[str]:
@@ -1137,7 +1068,7 @@ def detect_short_reversal(
         if near_high:
             bearish = False
             if len(closes_1m) >= 2 and len(opens_1m) >= 1:
-                # Реальная красная свеча у хая (close < open из MEXC)
+                # Реальная красная свеча у хая (close < open из Bybit)
                 bearish = (opens_1m[-1] > closes_1m[-1]  # медвежья свеча
                            and highs_1m[-1] >= high24 * REVERSAL_HIGH_MARGIN)
             if not bearish and len(recent) >= 4:
@@ -1179,7 +1110,7 @@ def detect_short_reversal(
                 score += 1
                 factors.append(f"ATR-перегрев Min5 ({atr_ratio:.1f}× ATR={atr:.4g})")
 
-    # ── 11. Свечной паттерн (Min1, реальные opens из MEXC) ───────────────────
+    # ── 11. Свечной паттерн (Min1, реальные opens из Bybit) ───────────────────
     candle_pattern = None
     if len(closes_1m) >= 4 and len(highs_1m) >= 4 and len(lows_1m) >= 4:
         candle_pattern = detect_candle_pattern(
@@ -1507,74 +1438,58 @@ def format_reversal_alert(
 
 
 # ================================================================
-#  SYMBOLS
+#  SYMBOLS  — только Bybit Linear Perpetual USDT
 # ================================================================
 
 async def get_symbols() -> set[str]:
+    """Загружает все бессрочные USDT-контракты с Bybit V5 API."""
     symbols: set[str] = set()
-    for label, url, suffixes in [
-        ("Trading", "https://public.bybit.com/trading/", ("USDT", "PERP")),
-        ("Spot",    "https://public.bybit.com/spot/",    ("USDT",)),
-    ]:
-        try:
-            async with _session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-                html = await r.text()
-            soup  = BeautifulSoup(html, "html.parser")
-            count = 0
-            for a in soup.find_all("a"):
-                sym = a.text.strip("/")
-                if sym.endswith(suffixes):
-                    symbols.add(sym.replace("/", ""))
-                    count += 1
-            log.info("%s: %d символов", label, count)
-        except Exception as e:
-            log.error("get_symbols %s: %s", label, e)
-    log.info("Всего монет: %d", len(symbols))
+    try:
+        async with _session.get(
+            "https://api.bybit.com/v5/market/instruments-info",
+            params={"category": "linear", "limit": 1000},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            data = await r.json()
+        if data.get("retCode") == 0:
+            for item in data["result"]["list"]:
+                sym = item.get("symbol", "")
+                # Только бессрочные USDT-контракты (не квартальные)
+                if (sym.endswith("USDT")
+                        and item.get("contractType") == "LinearPerpetual"
+                        and item.get("status") == "Trading"):
+                    symbols.add(sym)
+        log.info("Bybit Linear Perpetual USDT: %d монет", len(symbols))
+    except Exception as e:
+        log.error("get_symbols Bybit: %s", e)
     return symbols
 
 
 # ================================================================
-#  PRICES
+#  PRICES  — только Bybit Linear Perpetual
 # ================================================================
 
-async def _fetch_okx(norm: dict) -> tuple[dict, dict]:
+async def _fetch_bybit_prices(norm: dict) -> tuple[dict, dict]:
+    """Загружает цены всех linear-perpetual тикеров одним запросом."""
     prices, sources = {}, {}
     try:
         async with _session.get(
-            "https://www.okx.com/api/v5/market/tickers?instType=SWAP",
-            timeout=aiohttp.ClientTimeout(total=5),
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "linear"},
+            timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
             data = await r.json()
-        for item in data.get("data", []):
-            sym   = normalize_symbol(item["instId"])
-            price = float(item["last"])
-            if price > 0 and sym in norm:
-                real = norm[sym]
-                prices[real]  = price
-                sources[real] = "OKX"
-    except Exception as e:
-        log.error("OKX: %s", e)
-    return prices, sources
-
-
-async def _fetch_mexc(norm: dict) -> tuple[dict, dict]:
-    prices, sources = {}, {}
-    try:
-        async with _session.get(
-            "https://contract.mexc.com/api/v1/contract/ticker",
-            timeout=aiohttp.ClientTimeout(total=5),
-        ) as r:
-            data = await r.json()
-        if data.get("success"):
-            for item in data["data"]:
-                sym   = normalize_symbol(item["symbol"])
-                price = float(item["lastPrice"])
+        if data.get("retCode") == 0:
+            for item in data["result"]["list"]:
+                sym   = item.get("symbol", "")
+                last  = item.get("lastPrice", "0")
+                price = float(last) if last else 0.0
                 if price > 0 and sym in norm:
                     real = norm[sym]
                     prices[real]  = price
-                    sources[real] = "MEXC"
+                    sources[real] = "Bybit"
     except Exception as e:
-        log.error("MEXC: %s", e)
+        log.error("Bybit tickers: %s", e)
     return prices, sources
 
 
@@ -1586,23 +1501,10 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
     global _norm_cache, _norm_symbols_key
     sym_key = frozenset(symbols)
     if sym_key != _norm_symbols_key:
-        _norm_cache       = {normalize_symbol(s): s for s in symbols}
+        _norm_cache       = {s: s for s in symbols}   # Bybit символы совпадают
         _norm_symbols_key = sym_key
     norm = _norm_cache
-
-    merged: dict = {}
-    msrc:   dict = {}
-    results = await asyncio.gather(_fetch_mexc(norm), _fetch_okx(norm), return_exceptions=True)
-    for res in results:
-        if isinstance(res, Exception):
-            log.error("Fetch error: %s", res)
-            continue
-        p, s = res
-        for sym, price in p.items():
-            if sym not in merged:
-                merged[sym] = price
-                msrc[sym]   = s[sym]
-    return merged, msrc
+    return await _fetch_bybit_prices(norm)
 
 
 # ================================================================
@@ -1644,6 +1546,7 @@ async def monitor():
 
             for sym, price in prices.items():
                 await asyncio.sleep(0)
+                last_check_time = time.time()  # обновляем таймер watchdog на каждой монете
 
                 if price <= 0:
                     continue
@@ -1666,9 +1569,8 @@ async def monitor():
                 growth    = (price - old_price) / old_price * 100
                 direction = 1 if growth > 0 else -1
 
-                # ── Свечи MEXC: 3 таймфрейма параллельно ──────────────────────
-                mexc_sym    = _to_mexc_symbol(sym)
-                klines_all  = await get_mexc_klines_multi(mexc_sym)
+                # ── Свечи Bybit: 3 таймфрейма параллельно ─────────────────────
+                klines_all  = await get_bybit_klines_multi(sym)
                 klines_1m   = klines_all["klines_1m"]
                 klines_5m   = klines_all["klines_5m"]
                 klines_15m  = klines_all["klines_15m"]
@@ -2315,11 +2217,11 @@ async def get_updates() -> list:
         async with _session.get(
             f"{TG}/getUpdates",
             params={
-                "timeout":         5,        # короткий таймаут — прокси медленный
+                "timeout":         20,       # long-polling — прокси медленный
                 "offset":          offset,
                 "allowed_updates": json.dumps(["message", "edited_message"]),
             },
-            timeout=aiohttp.ClientTimeout(total=15),  # запас на прокси
+            timeout=aiohttp.ClientTimeout(total=35),  # запас на прокси
         ) as resp:
             data = await resp.json()
         if data.get("ok"):
@@ -2394,7 +2296,7 @@ async def db_cleanup_loop():
 #  WATCHDOG
 # ================================================================
 
-WATCHDOG_TIMEOUT = 90
+WATCHDOG_TIMEOUT = 300  # 5 минут — прокси медленный, монет много
 
 
 async def watchdog():
