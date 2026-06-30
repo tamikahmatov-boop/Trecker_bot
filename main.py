@@ -1,10 +1,31 @@
 """
-Crypto Alert Bot — v18
-Добавлено 4 новых фактора разворота (17-20), итого 20/20. Обновлены кнопки
-быстрой настройки порога: 3/20, 5/20, 7/20, 9/20, 12/20, 15/20.
+Crypto Alert Bot — v19
+Защита от двойного запуска (409 Conflict).
 
 ═══════════════════════════════════════════════════════
- НОВОЕ v18
+ НОВОЕ v19
+═══════════════════════════════════════════════════════
+• Single-instance lock через fcntl.flock на файл bot.lock (путь
+  настраивается через config.LOCK_FILE). Раньше при случайном запуске
+  второй копии бота оба процесса начинали бесконечно конфликтовать за
+  getUpdates, Telegram отвечал 409 Conflict, сообщения терялись/дублировались,
+  а причина была не очевидна из логов.
+  Теперь второй процесс при старте сразу видит занятый лок, печатает
+  понятную ошибку с инструкцией (ps aux | grep python3 + что убить) и
+  завершается с exit code 1 — вместо тихого зависания в цикле 409-ошибок.
+• Лок — на уровне ОС (POSIX advisory lock), не PID-файл: если процесс
+  убит любым способом (kill -9, OOM killer, краш сервера), ядро снимает
+  лок автоматически. Никаких "залипших" lock-файлов со старым PID,
+  которые пришлось бы вручную чистить.
+• Лок захватывается ОДИН раз на весь жизненный цикл процесса, до входа
+  во внутренний retry-цикл (while True: asyncio.run(main())), а не
+  внутри main() — иначе при каждом внутреннем перезапуске после
+  необработанного исключения возникало бы окно release→acquire.
+• Если fcntl недоступен (не-POSIX окружение) — бот не падает, просто
+  логирует предупреждение, что защита от двойного запуска отключена.
+
+═══════════════════════════════════════════════════════
+ v18 — ИСТОРИЯ ИЗМЕНЕНИЙ
 ═══════════════════════════════════════════════════════
 • 17. MACD гистограмма падает (Min1) — быстрое подтверждение разворота,
       не дожидаясь Min5-сигнала (фактор 4).
@@ -134,12 +155,14 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import fcntl
 import io
 import json
 import logging
 import os
 import signal
 import sqlite3
+import sys
 import time
 from contextlib import contextmanager
 from typing import Optional
@@ -174,6 +197,64 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+# ================================================================
+#  SINGLE INSTANCE LOCK
+# ================================================================
+#  Защита от двойного запуска бота с одним BOT_TOKEN.
+#  Без этого второй запущенный процесс получает от Telegram:
+#    409 Conflict: terminated by other getUpdates request
+#  и оба процесса начинают бесконечно конфликтовать, теряя/дублируя
+#  сообщения. Используем POSIX file lock (fcntl.flock) — он атомарный
+#  на уровне ОС и автоматически снимается ядром, если процесс убит
+#  любым способом (kill -9, OOM killer, падение питания), поэтому
+#  никаких "зависших" lock-файлов с устаревшим PID не остаётся.
+
+LOCK_FILE = getattr(config, "LOCK_FILE", "bot.lock")
+_lock_fh = None  # держим файловый дескриптор открытым на всё время жизни процесса
+
+
+def acquire_single_instance_lock() -> None:
+    """
+    Гарантирует, что одновременно запущен только один процесс бота.
+    Если лок уже занят другим процессом — печатает понятную ошибку
+    в лог и завершает процесс с кодом 1 (вместо тихого 409-конфликта
+    с Telegram, который раньше было сложно диагностировать).
+    """
+    global _lock_fh
+    try:
+        _lock_fh = open(LOCK_FILE, "w")
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fh.write(str(os.getpid()))
+        _lock_fh.flush()
+        log.info("Single-instance lock получен (PID=%d, файл=%s)", os.getpid(), LOCK_FILE)
+    except BlockingIOError:
+        log.error(
+            "❌ Бот уже запущен другим процессом! Lock-файл '%s' занят. "
+            "Завершаю работу, чтобы не получать 409 Conflict от Telegram. "
+            "Проверьте: ps aux | grep python3 — и убейте лишний процесс перед перезапуском.",
+            LOCK_FILE,
+        )
+        sys.exit(1)
+    except OSError as e:
+        # fcntl недоступен (например Windows) — не блокируем запуск,
+        # просто предупреждаем, что защита от двойного запуска отключена.
+        log.warning("Single-instance lock недоступен (%s) — защита от двойного запуска отключена", e)
+
+
+def release_single_instance_lock() -> None:
+    global _lock_fh
+    if _lock_fh is not None:
+        try:
+            fcntl.flock(_lock_fh, fcntl.LOCK_UN)
+            _lock_fh.close()
+        except Exception:
+            pass
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
+        _lock_fh = None
 
 # ================================================================
 #  DATABASE
@@ -2698,11 +2779,19 @@ async def main():
     log.info("Бот остановлен")
 
 
-while True:
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        break
-    except Exception as e:
-        log.exception("Критическая ошибка: %s", e)
-        time.sleep(10)
+# ── Захватываем single-instance lock ОДИН раз на весь процесс, ДО входа
+#    в retry-цикл. Если лок брать внутри main(), при каждом внутреннем
+#    перезапуске (после необработанного исключения) возникало бы окно
+#    release→acquire, в которое мог проскочить второй конкурентный процесс.
+acquire_single_instance_lock()
+try:
+    while True:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            log.exception("Критическая ошибка: %s", e)
+            time.sleep(10)
+finally:
+    release_single_instance_lock()
