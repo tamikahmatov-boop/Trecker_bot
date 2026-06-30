@@ -1,9 +1,28 @@
 """
-Crypto Alert Bot — v17
-Полный аудит v16, исправление оставшихся багов, новые кнопки управления.
+Crypto Alert Bot — v18
+Добавлено 4 новых фактора разворота (17-20), итого 20/20. Обновлены кнопки
+быстрой настройки порога: 3/20, 5/20, 7/20, 9/20, 12/20, 15/20.
 
 ═══════════════════════════════════════════════════════
- ИСПРАВЛЕННЫЕ БАГИ v17
+ НОВОЕ v18
+═══════════════════════════════════════════════════════
+• 17. MACD гистограмма падает (Min1) — быстрое подтверждение разворота,
+      не дожидаясь Min5-сигнала (фактор 4).
+• 18. Цена растянута >1.5% над EMA21 (Min5) — перегрев тренда,
+      дополняет крест/gap EMA (фактор 9) количественной мерой растяжения.
+• 19. Серия из 3+ красных свечей подряд (Min1) — прямой признак давления
+      продавцов, не пересекается с Wick Rejection (фактор 14).
+• 20. StochRSI разворачивается вниз из экстремума >0.85 (Min1) — отличается
+      от фактора 2 (статичная перекупленность): здесь ловится именно момент
+      разворота индикатора, а не просто нахождение в зоне.
+  Все 4 фактора используют уже загруженные Min1/Min5 свечи —
+  никаких дополнительных HTTP-запросов, скорость не падает.
+• max_score теперь 20 везде: кнопки, /rev_score (1–20), /rev_score_delta
+  (0–20), _cmd_reversal_settings, format_reversal_alert, лог разворотов.
+• Кнопки порога разворота: 3/20, 5/20, 7/20, 9/20, 12/20, 15/20.
+
+═══════════════════════════════════════════════════════
+ v17 — ИСТОРИЯ ИЗМЕНЕНИЙ
 ═══════════════════════════════════════════════════════
 • handle_message: первый блок `if text == "/start"` перехватывал /start
   ДО проверки chat_id, из-за чего владелец бота (CHAT_ID) никогда не видел
@@ -470,7 +489,7 @@ REVERSAL_REPEAT_SCORE_DELTA: int  = getattr(config, "REVERSAL_REPEAT_SCORE_DELTA
 _levels_cache: dict[str, dict] = {}
 
 # ── Настройки детектора разворота (все изменяемы через Telegram) ──────────────
-REVERSAL_MIN_SCORE:   int   = getattr(config, "REVERSAL_MIN_SCORE",   5)      # из 16
+REVERSAL_MIN_SCORE:   int   = getattr(config, "REVERSAL_MIN_SCORE",   5)      # из 20
 REVERSAL_RSI_OB:      float = getattr(config, "REVERSAL_RSI_OB",      70.0)
 REVERSAL_STOCH_OB:    float = getattr(config, "REVERSAL_STOCH_OB",    0.80)
 REVERSAL_STOCH_EXT:   float = getattr(config, "REVERSAL_STOCH_EXT",   0.85)
@@ -1066,7 +1085,7 @@ def calculate_rsi_higher_tf(prices_15m: list[float], window: int = 14) -> Option
 
 
 # ================================================================
-#  REVERSAL DETECTOR  — 16 факторов
+#  REVERSAL DETECTOR  — 20 факторов
 # ================================================================
 
 def _esc(s: str) -> str:
@@ -1086,10 +1105,11 @@ def detect_short_reversal(
     min_score:  int = 4,
 ) -> dict:
     """
-    16-факторный детектор разворота на шорт.
+    20-факторный детектор разворота на шорт.
 
-    Min1  (краткосрочные): RSI, StochRSI, BB, паттерн, отбой от хая, Wick Rejection
-    Min5  (среднесрочные): MACD, EMA, ATR, моментум, Lower Highs, объём
+    Min1  (краткосрочные): RSI, StochRSI, BB, паттерн, отбой от хая, Wick Rejection,
+                            MACD Min1, серия красных свечей, разворот StochRSI
+    Min5  (среднесрочные): MACD, EMA, ATR, моментум, Lower Highs, объём, растяжение от EMA21
     Min15 (долгосрочные):  OBV-дивергенция, RSI-дивергенция, RSI старшего TF
     Тики (акселерация):    замедление импульса
 
@@ -1110,6 +1130,10 @@ def detect_short_reversal(
       14. Wick Rejection Ratio > 0.55 (Min1, 3 последних свечи)
       15. RSI старшего TF > 75 (Min15)
       16. Lower Highs паттерн (Min5, 5 свечей)
+      17. MACD гистограмма падает (Min1, быстрое подтверждение разворота)
+      18. Цена растянута выше EMA21 на >1.5% (Min5, перегрев)
+      19. Серия из 3+ красных свечей подряд (Min1)
+      20. StochRSI разворачивается вниз из экстремума >0.85 (Min1)
     """
     score   = 0
     factors: list[str] = []
@@ -1282,6 +1306,46 @@ def detect_short_reversal(
         score += 1
         factors.append("Lower Highs паттерн Min5 (убывающие максимумы)")
 
+    # ── 17. MACD гистограмма падает (Min1, быстрое подтверждение) ────────────
+    macd_data_1m = calculate_macd_full(prices_1m)
+    macd_hist_1m = macd_data_1m["histogram"]
+    if (macd_hist_1m is not None
+            and macd_data_1m["histogram_prev"] is not None
+            and macd_hist_1m > 0
+            and macd_hist_1m < macd_data_1m["histogram_prev"]):
+        score += 1
+        factors.append(f"MACD гистограмма падает Min1 ({macd_hist_1m:+.6f})")
+
+    # ── 18. Цена сильно растянута выше EMA21 (Min5) ───────────────────────────
+    ema_extension_pct = None
+    if ema_data.get("ema_slow"):
+        ema_extension_pct = (price - ema_data["ema_slow"]) / ema_data["ema_slow"] * 100
+        if ema_extension_pct > 1.5:
+            score += 1
+            factors.append(f"Цена растянута над EMA21 Min5 (+{ema_extension_pct:.2f}%)")
+
+    # ── 19. Серия красных свечей (Min1, 3+ подряд) ────────────────────────────
+    red_streak = 0
+    if len(closes_1m) >= 3 and len(opens_1m) >= 3:
+        for i in range(-1, -4, -1):
+            if closes_1m[i] < opens_1m[i]:
+                red_streak += 1
+            else:
+                break
+        if red_streak >= 3:
+            score += 1
+            factors.append(f"Серия красных свечей Min1 ({red_streak} подряд)")
+
+    # ── 20. StochRSI разворачивается вниз из экстремума (Min1) ───────────────
+    stoch_turn = False
+    if len(prices_1m) >= 30:
+        stoch_prev = calculate_stoch_rsi(prices_1m[:-1])
+        if (stoch_rsi_val is not None and stoch_prev is not None
+                and stoch_prev > 0.85 and stoch_rsi_val < stoch_prev - 0.05):
+            stoch_turn = True
+            score += 1
+            factors.append(f"StochRSI разворот вниз Min1 ({stoch_prev:.2f} → {stoch_rsi_val:.2f})")
+
     # ── Цели по шорту: уровни Фибоначчи от 24h High к Low ────────────────────
     fib     = calculate_fibonacci_levels(high24, low24)
     target1 = fib["fib_382"]
@@ -1291,7 +1355,7 @@ def detect_short_reversal(
 
     return {
         "score":          score,
-        "max_score":      16,
+        "max_score":      20,
         "factors":        factors,
         "triggered":      score >= min_score,
         "rsi":            rsi,
@@ -1299,9 +1363,13 @@ def detect_short_reversal(
         "stoch_rsi":      stoch_rsi_val,
         "bb_pct":         bb_pct,
         "macd_hist":      macd_hist,
+        "macd_hist_1m":   macd_hist_1m,
         "accel":          accel,
         "atr":            atr,
         "wick_ratio":     wick_ratio,
+        "ema_extension_pct": ema_extension_pct,
+        "red_streak":     red_streak,
+        "stoch_turn":     stoch_turn,
         "target1":        target1,
         "target2":        target2,
         "fib":            fib,
@@ -1370,8 +1438,9 @@ def reply_keyboard():
             ["📋 История", "🏆 Топ-5", "📤 Экспорт"],
             # Строка 5 — Разворот + кулдауны
             ["🔄 Развороты", "⚙️ Настройки разворота", "🗑 Кулдауны"],
-            # Строка 6 — Порог разворота (быстрая настройка, из 16 факторов)
-            ["🎚 Порог 3/16", "🎚 Порог 5/16", "🎚 Порог 9/16", "🎚 Порог 12/16"],
+            # Строка 6 — Порог разворота (быстрая настройка, из 20 факторов)
+            ["🎚 Порог 3/20", "🎚 Порог 5/20", "🎚 Порог 7/20"],
+            ["🎚 Порог 9/20", "🎚 Порог 12/20", "🎚 Порог 15/20"],
             # Строка 7 — Процент роста для разворотных сигналов в шорт
             ["📉 Разворот 1%", "📉 Разворот 5%", "📉 Разворот 10%", "📉 Разворот 15%", "📉 Разворот 25%"],
             # Строка 8 — Период окна для расчёта роста разворота
@@ -1489,7 +1558,7 @@ def format_reversal_alert(
     window_sec:   int = 3600,
 ) -> str:
     score      = rev["score"]
-    max_score  = rev.get("max_score", 16)
+    max_score  = rev.get("max_score", 20)
     factors    = rev["factors"]
     rsi        = rev.get("rsi")
     rsi_15m    = rev.get("rsi_15m")
@@ -1666,7 +1735,7 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    await broadcast("✅ <b>Бот запущен</b> (v16 — 16-факторный разворот)")
+    await broadcast("✅ <b>Бот запущен</b> (v17 — 20-факторный разворот)")
 
     while True:
         if monitor_paused:
@@ -1774,7 +1843,7 @@ async def monitor():
                             reversal_count += 1
                             if PROM_AVAILABLE:
                                 PROM_REVERSALS.inc()
-                            log.info("REVERSAL %s score=%d/16 peak=%.2f%% price_chg=%.2f%%",
+                            log.info("REVERSAL %s score=%d/20 peak=%.2f%% price_chg=%.2f%%",
                                      sym, rev["score"], peak_growth,
                                      abs(price - last_info["price"]) / last_info["price"] * 100 if last_info else 0.0)
                             continue  # не дублируем обычным алертом
@@ -1926,7 +1995,7 @@ async def handle_message(msg: dict):
             f"🚀 <b>Crypto Alert Bot v16</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
-            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/16 факторов</b>\n"
+            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
             f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b> за <b>{_fmt_dur(REVERSAL_WINDOW_SEC)}</b>\n"
             f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
@@ -1935,7 +2004,7 @@ async def handle_message(msg: dict):
             f"  📉 Разворот 1-25% — минимальный рост для шорт-разворота\n"
             f"  🕐 Разворот 5м-1д — период расчёта роста разворота\n"
             f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна алертов\n"
-            f"  🎚 Порог 3-12/16 — чувствительность (кол-во факторов)\n"
+            f"  🎚 Порог 3-12/20 — чувствительность (кол-во факторов)\n"
             f"  ⚙️ Настройки разворота — все параметры\n"
             f"  🔄 Полный перезапуск — перезапуск без потери данных\n"
             f"  🆘 Помощь — краткая справка\n\n"
@@ -1987,13 +2056,13 @@ async def handle_message(msg: dict):
             f"🚀 <b>Crypto Alert Bot v16 — справка</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
-            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/16 факторов</b>\n\n"
+            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
             f"  📉 Разворот 1-25% — мин. рост для шорт-разворота\n"
             f"  🕐 Разворот 5м-1д — период расчёта роста разворота\n"
             f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна алертов\n"
-            f"  🎚 Порог 3-12/16 — чувствительность разворота\n"
+            f"  🎚 Порог 3-12/20 — чувствительность разворота\n"
             f"  ⚙️ Настройки разворота — все параметры детально\n"
             f"  🔄 Полный перезапуск — перезапуск процесса без потери данных\n\n"
             f"Полный список команд: /menu",
@@ -2027,7 +2096,7 @@ async def handle_message(msg: dict):
             f"🪙 Монет в истории: {len(price_history)}\n"
             f"🔔 Сигналов: {signals_count}\n"
             f"🔄 Разворотов: {reversal_count}\n"
-            f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/16\n"
+            f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/20\n"
             f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}% за {_fmt_dur(REVERSAL_WINDOW_SEC)}\n"
             f"🔔 Уведомление движения: {NOTIFY_BIG_MOVE_PCT}%\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
@@ -2196,7 +2265,7 @@ async def handle_message(msg: dict):
     if text.startswith("/rev_score_delta"):
         try:
             val = int(text.split()[1])
-            assert 0 <= val <= 16
+            assert 0 <= val <= 20
             REVERSAL_REPEAT_SCORE_DELTA = val
             await send_message(
                 f"✅ Мин. прирост скора между разворотами: <b>+{val}</b>\n"
@@ -2205,30 +2274,33 @@ async def handle_message(msg: dict):
             )
         except Exception:
             await send_message(
-                f"❌ /rev_score_delta 2   (текущее: {REVERSAL_REPEAT_SCORE_DELTA})\nДиапазон: 0–16",
+                f"❌ /rev_score_delta 2   (текущее: {REVERSAL_REPEAT_SCORE_DELTA})\nДиапазон: 0–20",
                 chat_id,
             )
         return
 
-    # Быстрая настройка порога разворота через кнопки (из 16 факторов)
+    # Быстрая настройка порога разворота через кнопки (из 20 факторов)
     _rev_score_map = {
-        "🎚 Порог 3/16":  3,
-        "🎚 Порог 5/16":  5,
-        "🎚 Порог 9/16":  9,
-        "🎚 Порог 12/16": 12,
+        "🎚 Порог 3/20":  3,
+        "🎚 Порог 5/20":  5,
+        "🎚 Порог 7/20":  7,
+        "🎚 Порог 9/20":  9,
+        "🎚 Порог 12/20": 12,
+        "🎚 Порог 15/20": 15,
     }
     if text in _rev_score_map:
         REVERSAL_MIN_SCORE = _rev_score_map[text]  # global объявлен выше — OK
         await send_message(
-            f"✅ Порог разворота: <b>{REVERSAL_MIN_SCORE}/16 факторов</b>\n"
-            f"ℹ️ Агрессивный: 3, Стандарт: 5, Строгий: 9, Очень строгий: 12",
+            f"✅ Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
+            f"ℹ️ Агрессивный: 3, Мягкий: 5, Стандарт: 7, Строгий: 9, "
+            f"Очень строгий: 12, Экстремальный: 15",
             chat_id,
         )
         return
 
     # ── Команды настройки разворота ───────────────────────────────────────────
     _rev_cmds = {
-        "/rev_score":    ("REVERSAL_MIN_SCORE",   int,   1,    16,    "Порог факторов",           "/16"),
+        "/rev_score":    ("REVERSAL_MIN_SCORE",   int,   1,    20,    "Порог факторов",           "/20"),
         "/rev_rsi":      ("REVERSAL_RSI_OB",      float, 50,   90,    "RSI перекупленность",      ""),
         "/rev_stoch":    ("REVERSAL_STOCH_OB",    float, 0.5,  1.0,   "StochRSI порог",           ""),
         "/rev_bb":       ("REVERSAL_BB_OB",       float, 0.8,  1.5,   "Боллинджер %B порог",      ""),
@@ -2342,7 +2414,7 @@ async def _cmd_reversals(chat_id):
         f_brief = factors[0].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") if factors else "—"
         t1_s    = f" → цель {r['target1']:.4g}" if r.get("target1") else ""
         lines.append(
-            f"{lvl} <b>{r['symbol']}</b> [{score}/16] {ts}{t1_s}\n"
+            f"{lvl} <b>{r['symbol']}</b> [{score}/20] {ts}{t1_s}\n"
             f"   <i>{f_brief}</i>"
         )
     await send_message("\n".join(lines), chat_id)
@@ -2351,10 +2423,10 @@ async def _cmd_reversals(chat_id):
 async def _cmd_reversal_settings(chat_id):
     high_pct = round((1.0 - REVERSAL_HIGH_MARGIN) * 100, 2)
     await send_message(
-        f"⚙️ <b>Настройки детектора разворота (16 факторов)</b>\n"
+        f"⚙️ <b>Настройки детектора разворота (20 факторов)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>Скоринг:</b>\n"
-        f"  Порог:         <code>{REVERSAL_MIN_SCORE}/16</code>  → /rev_score 5\n\n"
+        f"  Порог:         <code>{REVERSAL_MIN_SCORE}/20</code>  → /rev_score 5\n\n"
         f"<b>Пороги факторов:</b>\n"
         f"  RSI OB (1m):   <code>&gt; {REVERSAL_RSI_OB}</code>     → /rev_rsi 70\n"
         f"  RSI OB (15m):  <code>&gt; 75</code>          (фиксировано)\n"
@@ -2366,19 +2438,24 @@ async def _cmd_reversal_settings(chat_id):
         f"  Объём слабый:  <code>&lt; {REVERSAL_VOL_RATIO:.0%}</code>  → /rev_vol 0.7\n"
         f"  Зона хая 24h:  <code>{high_pct}%</code>        → /rev_high 0.2\n"
         f"  Wick Rejection:<code>&gt; 0.55</code>         (фиксировано)\n\n"
-        f"<b>Новые факторы (13-16):</b>\n"
+        f"<b>Факторы 13-16:</b>\n"
         f"  13. OBV-дивергенция (Min15, цена↑ OBV↓)\n"
         f"  14. Wick Rejection Ratio &gt;0.55 (Min1)\n"
         f"  15. RSI 15m &gt;75 (старший таймфрейм)\n"
         f"  16. Lower Highs (Min5, 3+ убывающих хая)\n\n"
+        f"<b>Факторы 17-20:</b>\n"
+        f"  17. MACD гистограмма падает (Min1)\n"
+        f"  18. Цена растянута &gt;1.5% над EMA21 (Min5)\n"
+        f"  19. Серия из 3+ красных свечей (Min1)\n"
+        f"  20. StochRSI разворот вниз из экстремума (Min1)\n\n"
         f"<b>Кулдаун и фильтр дублей:</b>\n"
         f"  Кулдаун:         <code>{REVERSAL_COOLDOWN_SEC // 60} мин</code>  → /rev_cooldown 30\n"
         f"  Мин. смена цены: <code>{REVERSAL_REPEAT_PRICE_PCT}%</code>  → /rev_price_pct 3\n"
         f"  Мин. рост скора: <code>+{REVERSAL_REPEAT_SCORE_DELTA}</code>      → /rev_score_delta 2\n\n"
         f"<b>Пресеты:</b>\n"
         f"  Агрессивный: /rev_score 3  /rev_cooldown 10  /rev_price_pct 1\n"
-        f"  Стандарт:    /rev_score 5  /rev_cooldown 30  /rev_price_pct 3\n"
-        f"  Строгий:     /rev_score 9  /rev_cooldown 60  /rev_price_pct 5",
+        f"  Стандарт:    /rev_score 7  /rev_cooldown 30  /rev_price_pct 3\n"
+        f"  Строгий:     /rev_score 12  /rev_cooldown 60  /rev_price_pct 5",
         chat_id,
     )
 
