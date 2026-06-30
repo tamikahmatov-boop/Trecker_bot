@@ -625,6 +625,13 @@ REVERSAL_MOMENTUM:    float = getattr(config, "REVERSAL_MOMENTUM",    -0.5)
 REVERSAL_ATR_MULT:    float = getattr(config, "REVERSAL_ATR_MULT",    3.0)    # ATR перегрев
 REVERSAL_VOL_RATIO:   float = getattr(config, "REVERSAL_VOL_RATIO",   0.7)    # объём < 70% средн.
 
+# ── Настраиваемый RSI-фильтр (через кнопки) ────────────────────────────────
+# Для обычных сигналов роста/падения:
+RSI_SIGNAL_TF:    str   = getattr(config, "RSI_SIGNAL_TF",    "Min1")   # ТФ: Min1/Min5/Min15/Min60/Hour4/Hour12/Day1
+RSI_SIGNAL_LEVEL: float = getattr(config, "RSI_SIGNAL_LEVEL", 50.0)     # "не меньше": 50/60/70/80/90/95
+# Для разворотных сигналов (фактор 15 + переопределяет REVERSAL_RSI_OB по выбранному ТФ):
+RSI_REVERSAL_TF:  str   = getattr(config, "RSI_REVERSAL_TF",  "Min15")
+
 # Минимальный % роста за период для проверки разворота на шорт (кнопки 1/5/10/15/25%)
 REVERSAL_GROWTH_MIN_PCT: float = getattr(config, "REVERSAL_GROWTH_MIN_PCT", 5.0)
 
@@ -747,6 +754,56 @@ async def get_mexc_klines_multi(symbol: str) -> dict:
 
 async def get_mexc_closes(symbol: str, interval: str = "Min1") -> list[float]:
     return (await get_mexc_klines(symbol, interval))["closes"]
+
+
+# ── Настраиваемые таймфреймы RSI (кнопки 5м/15м/1ч/4ч/12ч/1д) ─────────────────
+RSI_TF_INTERVALS = {
+    "5 мин":  "Min5",
+    "15 мин": "Min15",
+    "1ч":     "Min60",
+    "4ч":     "Hour4",
+    "12ч":    "Hour12",
+    "1 день": "Day1",
+}
+RSI_TF_LABELS = {v: k for k, v in RSI_TF_INTERVALS.items()}
+RSI_TF_LABELS["Min1"] = "1м"
+RSI_TF_LIMIT = {
+    "Min1": 120, "Min5": 100, "Min15": 60, "Min60": 60,
+    "Hour4": 60, "Hour12": 60, "Day1": 60,
+}
+
+
+def _resample_closes(closes: list[float], group: int) -> list[float]:
+    """Грубая агрегация серии закрытий в более крупный ТФ
+    (берём цену закрытия последней свечи каждой группы — точное значение,
+    просто реже семплированное, без интерполяции/округлений)."""
+    if group <= 1 or len(closes) < group:
+        return closes
+    n = (len(closes) // group) * group
+    trimmed = closes[-n:]
+    return [trimmed[i + group - 1] for i in range(0, n, group)]
+
+
+async def get_rsi_for_tf(symbol: str, interval: str, window: int = 14) -> Optional[float]:
+    """
+    Точный RSI с биржи MEXC (contract klines) для выбранного через кнопки
+    таймфрейма. Использует тот же TTL-кэш свечей (60с), поэтому повторное
+    обращение в течение минуты не делает лишних HTTP-запросов.
+    Hour12 не поддерживается биржей MEXC напрямую — агрегируется из Hour4×3
+    (берётся реальная цена закрытия каждой 3-й 4-часовой свечи).
+    """
+    if interval == "Hour12":
+        data = await get_mexc_klines(symbol, "Hour4", 180)
+        closes = _resample_closes(data["closes"], 3)
+        if len(closes) < window + 1:
+            return None
+        return calculate_rsi(closes, window=window)
+    limit  = RSI_TF_LIMIT.get(interval, 60)
+    data   = await get_mexc_klines(symbol, interval, limit)
+    closes = data["closes"]
+    if len(closes) < window + 1:
+        return None
+    return calculate_rsi(closes, window=window)
 
 
 def _to_mexc_symbol(sym: str) -> str:
@@ -1227,6 +1284,8 @@ def detect_short_reversal(
     growth:     float,
     rsi:        Optional[float],
     min_score:  int = 4,
+    rsi_reversal_tf:       Optional[float] = None,
+    rsi_reversal_tf_label: str             = "Min15",
 ) -> dict:
     """
     20-факторный детектор разворота на шорт.
@@ -1418,11 +1477,16 @@ def detect_short_reversal(
             score += 1
             factors.append(f"Wick Rejection {wick_ratio:.2f} (верхняя тень доминирует) Min1")
 
-    # ── 15. RSI старшего TF > 75 (Min15) ─────────────────────────────────────
-    rsi_15m = calculate_rsi_higher_tf(prices_15m) if len(prices_15m) >= 16 else None
-    if rsi_15m is not None and rsi_15m > 75.0:
+    # ── 15. RSI настраиваемого старшего ТФ > REVERSAL_RSI_OB (кнопки) ─────────
+    if rsi_reversal_tf is not None:
+        rsi_15m       = rsi_reversal_tf
+        rsi_15m_label = rsi_reversal_tf_label
+    else:
+        rsi_15m       = calculate_rsi_higher_tf(prices_15m) if len(prices_15m) >= 16 else None
+        rsi_15m_label = "Min15"
+    if rsi_15m is not None and rsi_15m > REVERSAL_RSI_OB:
         score += 1
-        factors.append(f"RSI перекуплен на Min15 ({rsi_15m:.1f} &gt; 75)")
+        factors.append(f"RSI перекуплен на {rsi_15m_label} ({rsi_15m:.1f} &gt; {REVERSAL_RSI_OB})")
 
     # ── 16. Lower Highs паттерн (Min5) ────────────────────────────────────────
     if len(highs_5m) >= 6 and calculate_lower_highs(highs_5m, window=5):
@@ -1483,6 +1547,7 @@ def detect_short_reversal(
         "triggered":      score >= min_score,
         "rsi":            rsi,
         "rsi_15m":        rsi_15m,
+        "rsi_15m_label":  rsi_15m_label,
         "stoch_rsi":      stoch_rsi_val,
         "bb_pct":         bb_pct,
         "macd_hist":      macd_hist,
@@ -1570,6 +1635,14 @@ def reply_keyboard():
             ["🕐 Разворот 5м", "🕐 Разворот 30м", "🕐 Разворот 1ч", "🕐 Разворот 4ч", "🕐 Разворот 1д"],
             # Строка 9 — Управление процессом
             ["🔄 Полный перезапуск", "🆘 Помощь"],
+            # Строка 10 — RSI-фильтр обычных сигналов: таймфрейм
+            ["📊 RSI ТФ 5м", "📊 RSI ТФ 15м", "📊 RSI ТФ 1ч", "📊 RSI ТФ 4ч", "📊 RSI ТФ 12ч", "📊 RSI ТФ 1д"],
+            # Строка 11 — RSI-фильтр обычных сигналов: порог "не меньше"
+            ["📊 RSI ≥50", "📊 RSI ≥60", "📊 RSI ≥70", "📊 RSI ≥80", "📊 RSI ≥90", "📊 RSI ≥95"],
+            # Строка 12 — RSI разворота: таймфрейм (отдельно от сигналов роста/падения)
+            ["🔄📊 RSI ТФ 5м", "🔄📊 RSI ТФ 15м", "🔄📊 RSI ТФ 1ч", "🔄📊 RSI ТФ 4ч", "🔄📊 RSI ТФ 12ч", "🔄📊 RSI ТФ 1д"],
+            # Строка 13 — RSI разворота: порог "не меньше"
+            ["🔄📊 RSI ≥50", "🔄📊 RSI ≥60", "🔄📊 RSI ≥70", "🔄📊 RSI ≥80", "🔄📊 RSI ≥90", "🔄📊 RSI ≥95"],
         ],
         "resize_keyboard": True,
         "persistent":      True,
@@ -1605,6 +1678,9 @@ def format_growth_alert(
     duration_sec: int        = 0,
     breakout: Optional[str]  = None,
     day_context: Optional[str] = None,
+    rsi_tf_label: Optional[str] = None,
+    rsi_tf_val:   Optional[float] = None,
+    rsi_tf_level: Optional[float] = None,
 ) -> str:
     emoji = alert_emoji(growth)
     sign  = "+" if growth > 0 else ""
@@ -1616,6 +1692,11 @@ def format_growth_alert(
                 else "")
     rsi_t    = f" {rsi_trend}" if rsi_trend else ""
     macd_s   = f"{macd:+.6f}" if macd is not None else "—"
+
+    rsi_tf_s = ""
+    if rsi_tf_label and rsi_tf_val is not None:
+        lvl_s = f" (порог ≥{rsi_tf_level:g})" if rsi_tf_level is not None else ""
+        rsi_tf_s = f"\n📊 RSI {rsi_tf_label}: <code>{rsi_tf_val:.1f}</code>{lvl_s}"
 
     accel_s = ""
     if accel is not None:
@@ -1633,6 +1714,7 @@ def format_growth_alert(
         f"📈 {label}: <b>{sign}{growth:.2f}%</b> за {_fmt_dur(duration_sec)}\n"
         f"📊 RSI: <code>{rsi_s}</code>{rsi_t}{rsi_hint}\n"
         f"〽️ MACD: <code>{macd_s}</code>"
+        f"{rsi_tf_s}"
         f"{accel_s}"
         f"{chr(10) + breakout if breakout else ''}"
         f"{chr(10) + day_context if day_context else ''}"
@@ -1650,6 +1732,9 @@ def format_drop_alert(
     duration_sec: int        = 0,
     breakout: Optional[str]  = None,
     day_context: Optional[str] = None,
+    rsi_tf_label: Optional[str] = None,
+    rsi_tf_val:   Optional[float] = None,
+    rsi_tf_level: Optional[float] = None,
 ) -> str:
     a     = abs(growth)
     emoji = "💥" if a >= 20 else "🔥" if a >= 10 else "📉"
@@ -1658,6 +1743,11 @@ def format_drop_alert(
     rsi_t = f" {rsi_trend}" if rsi_trend else ""
     macd_s = f"{macd:+.6f}" if macd is not None else "—"
 
+    rsi_tf_s = ""
+    if rsi_tf_label and rsi_tf_val is not None:
+        lvl_s = f" (порог ≤{100 - rsi_tf_level:g})" if rsi_tf_level is not None else ""
+        rsi_tf_s = f"\n📊 RSI {rsi_tf_label}: <code>{rsi_tf_val:.1f}</code>{lvl_s}"
+
     return (
         f"{emoji} <b>ПАДЕНИЕ</b>\n\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
@@ -1665,6 +1755,7 @@ def format_drop_alert(
         f"📉 Падение: <b>{growth:.2f}%</b> за {_fmt_dur(duration_sec)}\n"
         f"📊 RSI: <code>{rsi_s}</code>{rsi_t}{hint}\n"
         f"〽️ MACD: <code>{macd_s}</code>"
+        f"{rsi_tf_s}"
         f"{chr(10) + breakout if breakout else ''}"
         f"{chr(10) + day_context if day_context else ''}"
         f"\n\n📋 <code>{sym}</code> #падение"
@@ -1685,6 +1776,7 @@ def format_reversal_alert(
     factors    = rev["factors"]
     rsi        = rev.get("rsi")
     rsi_15m    = rev.get("rsi_15m")
+    rsi15_lbl  = rev.get("rsi_15m_label", "15m")
     stoch      = rev.get("stoch_rsi")
     bb_pct     = rev.get("bb_pct")
     macd_h     = rev.get("macd_hist")
@@ -1733,7 +1825,7 @@ def format_reversal_alert(
         f"🎯 Уверенность: {confidence}  [{score}/{max_score}]\n\n"
         f"<b>Сработавшие факторы ({score}/{max_score}):</b>\n{factors_s}\n\n"
         f"<b>Индикаторы:</b>\n"
-        f"  RSI 1m: <code>{rsi_s}</code>  │  RSI 15m: <code>{rsi15_s}</code>\n"
+        f"  RSI 1m: <code>{rsi_s}</code>  │  RSI {rsi15_lbl}: <code>{rsi15_s}</code> (порог &gt;{REVERSAL_RSI_OB})\n"
         f"  StochRSI: <code>{stoch_s}</code>  │  BB%: <code>{bb_s}</code>\n"
         f"  MACD: <code>{macd_s}</code>  │  ATR: <code>{atr_s}</code>\n"
         f"  EMA gap: <code>{ema_s}</code>  │  Wick: <code>{wick_s}</code>"
@@ -1850,6 +1942,198 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
 #  MONITOR
 # ================================================================
 
+# ================================================================
+#  ОБРАБОТКА ОДНОЙ МОНЕТЫ (вынесено для конкурентной обработки —
+#  чтобы уведомления слались сразу по готовности, не дожидаясь
+#  последовательного перебора всех остальных монет)
+# ================================================================
+
+# Сколько монет обрабатываем одновременно (ограничивает параллельные HTTP-запросы к MEXC)
+MONITOR_CONCURRENCY: int = getattr(config, "MONITOR_CONCURRENCY", 25)
+
+
+async def _process_one_symbol(sym: str, price: float, now: float, source: str) -> None:
+    global signals_count, reversal_count
+
+    if price <= 0:
+        return
+
+    hist = price_history.setdefault(sym, [])
+    hist.append((now, price))
+    cutoff = max(current_window * 2, 86400)
+    price_history[sym] = [(t, p) for t, p in hist if now - t <= cutoff]
+
+    recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
+
+    if len(recent) < MIN_SAMPLES:
+        return
+
+    old_price = recent[0][1]
+    if old_price <= 0:
+        return
+
+    growth    = (price - old_price) / old_price * 100
+    direction = 1 if growth > 0 else -1
+
+    # ── Свечи MEXC: 3 таймфрейма параллельно ──────────────────────
+    mexc_sym    = _to_mexc_symbol(sym)
+    klines_all  = await get_mexc_klines_multi(mexc_sym)
+    klines_1m   = klines_all["klines_1m"]
+    klines_5m   = klines_all["klines_5m"]
+    klines_15m  = klines_all["klines_15m"]
+    closes      = klines_1m["closes"]
+
+    rsi = calculate_rsi(closes) if closes else None
+    if rsi is None:
+        vals = [p for _, p in price_history[sym][-120:]]
+        rsi  = calculate_rsi(vals)
+
+    # ════════════════════════════════════════════════════════════
+    #  БЛОК 1: РАЗВОРОТ НА ШОРТ
+    #  Условие: пиковый рост за REVERSAL_WINDOW_SEC >= REVERSAL_GROWTH_MIN_PCT
+    #  Фильтр дублей: кулдаун + смена цены + рост скора
+    # ════════════════════════════════════════════════════════════
+    peak_growth = get_peak_growth(sym, price, REVERSAL_WINDOW_SEC)
+    if peak_growth >= REVERSAL_GROWTH_MIN_PCT or growth >= REVERSAL_GROWTH_MIN_PCT:
+        last_rev_ts = _reversal_cooldown.get(sym, 0)
+        if now - last_rev_ts >= REVERSAL_COOLDOWN_SEC:
+            rsi_reversal_val = await get_rsi_for_tf(mexc_sym, RSI_REVERSAL_TF)
+            rev = detect_short_reversal(
+                sym, price, klines_1m, klines_5m, klines_15m,
+                recent, growth, rsi, REVERSAL_MIN_SCORE,
+                rsi_reversal_tf=rsi_reversal_val,
+                rsi_reversal_tf_label=RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF),
+            )
+            if rev["triggered"]:
+                # ── Умный фильтр повторов ───────────────────────
+                last_info = _reversal_last.get(sym)
+                if last_info:
+                    price_change = abs(price - last_info["price"]) / last_info["price"] * 100
+                    score_delta  = rev["score"] - last_info["score"]
+                    # Пропускаем если: цена почти не изменилась И скор не вырос значительно
+                    if (price_change < REVERSAL_REPEAT_PRICE_PCT
+                            and score_delta < REVERSAL_REPEAT_SCORE_DELTA):
+                        log.debug(
+                            "REVERSAL skip %s: price_chg=%.2f%% score_delta=%d",
+                            sym, price_change, score_delta,
+                        )
+                        return
+                # ── Отправляем сигнал ───────────────────────────
+                duration = calculate_growth_duration(recent)
+                rev_text = format_reversal_alert(
+                    sym, price, max(growth, peak_growth), source, rev,
+                    duration_sec=duration,
+                    window_sec=REVERSAL_WINDOW_SEC,
+                )
+                _reversal_cooldown[sym] = now
+                _reversal_last[sym] = {"price": price, "score": rev["score"], "ts": now}
+                db_save_reversal(
+                    sym, price, rev["score"], rev["factors"],
+                    rev["rsi"], rev["macd_hist"],
+                    rev["stoch_rsi"], rev["bb_pct"],
+                    rev["atr"], rev["target1"], rev["target2"], source,
+                )
+                await broadcast(rev_text)
+                reversal_count += 1
+                if PROM_AVAILABLE:
+                    PROM_REVERSALS.inc()
+                log.info("REVERSAL %s score=%d/20 peak=%.2f%% price_chg=%.2f%%",
+                         sym, rev["score"], peak_growth,
+                         abs(price - last_info["price"]) / last_info["price"] * 100 if last_info else 0.0)
+                return  # не дублируем обычным алертом
+
+    # ════════════════════════════════════════════════════════════
+    #  БЛОК 1.5: УВЕДОМЛЕНИЕ О БОЛЬШОМ РОСТЕ / ПАДЕНИИ (15% и т.п.)
+    # ════════════════════════════════════════════════════════════
+    if NOTIFY_BIG_MOVE_PCT > 0 and abs(growth) >= NOTIFY_BIG_MOVE_PCT:
+        last_notif = _notify_cooldown.get(sym, 0)
+        if now - last_notif >= NOTIFY_BIG_MOVE_COOLDOWN_SEC:
+            direction_emoji = "🚀" if growth > 0 else "📉"
+            move_label = "РОСТ" if growth > 0 else "ПАДЕНИЕ"
+            rsi_str = f"{rsi:.1f}" if rsi is not None else "—"
+            dur_str = _fmt_dur(calculate_growth_duration(recent))
+            notif_text = (
+                f"🔔 <b>КРУПНОЕ ДВИЖЕНИЕ — {move_label}</b>\n\n"
+                f"🪙 <b>{sym}</b>  [{source}]\n"
+                f"💵 Цена: <code>{price}</code>\n"
+                f"{direction_emoji} {move_label}: <b>{growth:+.2f}%</b> "
+                f"за {dur_str}\n"
+                f"📊 RSI: <code>{rsi_str}</code>\n\n"
+                f"📋 <code>{sym}</code> #большое_движение"
+            )
+            _notify_cooldown[sym] = now
+            await broadcast(notif_text)
+            log.info("BigMove notify: %s %+.2f%%", sym, growth)
+
+    # ════════════════════════════════════════════════════════════
+    #  БЛОК 2: ОБЫЧНЫЕ АЛЕРТЫ (РОСТ / ПАДЕНИЕ)
+    # ════════════════════════════════════════════════════════════
+    if abs(growth) < current_percent:
+        level = _cache_get_level(sym)
+        if level and level["direction"] != direction:
+            _cache_clear_level(sym)
+        return
+
+    # RSI-фильтр направления (настраиваемый ТФ и порог "не меньше" через кнопки)
+    rsi_filter_val = rsi if RSI_SIGNAL_TF == "Min1" else await get_rsi_for_tf(mexc_sym, RSI_SIGNAL_TF)
+    if rsi_filter_val is not None:
+        if direction == 1 and rsi_filter_val < RSI_SIGNAL_LEVEL:
+            return
+        if direction == -1 and rsi_filter_val > (100 - RSI_SIGNAL_LEVEL):
+            return
+
+    last_sent = _alert_cooldown.get(sym, 0)
+    if now - last_sent < ALERT_COOLDOWN_SEC:
+        return
+
+    level = _cache_get_level(sym)
+    if level:
+        prev_price = level["alert_price"]
+        prev_dir   = level["direction"]
+        if prev_dir == direction:
+            if abs(price - prev_price) / prev_price * 100 < current_percent:
+                return
+
+    vals      = [p for _, p in price_history[sym][-120:]]
+    macd_data = calculate_macd_full(vals)
+    macd      = macd_data["histogram"]
+    # RSI-тренд из уже загруженных свечей — не делаем лишний HTTP запрос
+    rsi_trend = calculate_rsi_trend(closes) if len(closes) >= 17 else None
+    accel     = calculate_acceleration(recent)
+    duration  = calculate_growth_duration(recent)
+    breakout  = check_24h_breakout(sym, price)
+    day_ctx   = get_24h_context(sym, price)
+
+    rsi_tf_label_show = RSI_TF_LABELS.get(RSI_SIGNAL_TF) if RSI_SIGNAL_TF != "Min1" else None
+    if direction == 1:
+        text = format_growth_alert(
+            sym, price, growth, rsi, macd, source,
+            rsi_trend=rsi_trend, accel=accel,
+            duration_sec=duration, breakout=breakout, day_context=day_ctx,
+            rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
+            rsi_tf_level=RSI_SIGNAL_LEVEL if rsi_tf_label_show else None,
+        )
+    else:
+        text = format_drop_alert(
+            sym, price, growth, rsi, macd, source,
+            rsi_trend=rsi_trend, duration_sec=duration,
+            breakout=breakout, day_context=day_ctx,
+            rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
+            rsi_tf_level=RSI_SIGNAL_LEVEL if rsi_tf_label_show else None,
+        )
+
+    _cache_set_level(sym, price, direction)
+    _alert_cooldown[sym] = now
+    db_save_alert(sym, price, growth, rsi, macd, source)
+    await broadcast(text)
+    signals_count += 1
+
+    if PROM_AVAILABLE:
+        PROM_SIGNALS.inc()
+
+    log.info("Signal: %s %+.2f%% [%s]", sym, growth, source)
+
+
 async def monitor():
     global current_percent, current_window, signals_count, reversal_count, checks_count, last_check_time
     global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT
@@ -1883,178 +2167,27 @@ async def monitor():
 
             prices, sources = await get_prices(symbols)
 
-            for sym, price in prices.items():
-                await asyncio.sleep(0)
+            # ── Конкурентная обработка монет ───────────────────────────────
+            # Раньше монеты проверялись строго последовательно (await за
+            # await на каждую), из-за чего при сотнях монет уведомление по
+            # 50-й монете могло прийти на десятки секунд позже, чем по 1-й,
+            # а вся следующая итерация мониторинга начиналась ещё позже.
+            # Теперь все монеты обрабатываются параллельно (с ограничением
+            # MONITOR_CONCURRENCY одновременных запросов к MEXC), и каждое
+            # уведомление отправляется сразу же, как только готово —
+            # не дожидаясь обработки остальных монет.
+            sem = asyncio.Semaphore(MONITOR_CONCURRENCY)
 
-                if price <= 0:
-                    continue
+            async def _bounded(sym: str, price: float) -> None:
+                async with sem:
+                    try:
+                        await _process_one_symbol(sym, price, now, sources.get(sym, "UNKNOWN"))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        log.exception("process_symbol %s: %s", sym, e)
 
-                hist = price_history.setdefault(sym, [])
-                hist.append((now, price))
-                cutoff = max(current_window * 2, 86400)
-                price_history[sym] = [(t, p) for t, p in hist if now - t <= cutoff]
-
-                recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
-                source = sources.get(sym, "UNKNOWN")
-
-                if len(recent) < MIN_SAMPLES:
-                    continue
-
-                old_price = recent[0][1]
-                if old_price <= 0:
-                    continue
-
-                growth    = (price - old_price) / old_price * 100
-                direction = 1 if growth > 0 else -1
-
-                # ── Свечи MEXC: 3 таймфрейма параллельно ──────────────────────
-                mexc_sym    = _to_mexc_symbol(sym)
-                klines_all  = await get_mexc_klines_multi(mexc_sym)
-                klines_1m   = klines_all["klines_1m"]
-                klines_5m   = klines_all["klines_5m"]
-                klines_15m  = klines_all["klines_15m"]
-                closes      = klines_1m["closes"]
-
-                rsi = calculate_rsi(closes) if closes else None
-                if rsi is None:
-                    vals = [p for _, p in price_history[sym][-120:]]
-                    rsi  = calculate_rsi(vals)
-
-                # ════════════════════════════════════════════════════════════
-                #  БЛОК 1: РАЗВОРОТ НА ШОРТ
-                #  Условие: пиковый рост за REVERSAL_WINDOW_SEC >= REVERSAL_GROWTH_MIN_PCT
-                #  Фильтр дублей: кулдаун + смена цены + рост скора
-                # ════════════════════════════════════════════════════════════
-                peak_growth = get_peak_growth(sym, price, REVERSAL_WINDOW_SEC)
-                if peak_growth >= REVERSAL_GROWTH_MIN_PCT or growth >= REVERSAL_GROWTH_MIN_PCT:
-                    last_rev_ts = _reversal_cooldown.get(sym, 0)
-                    if now - last_rev_ts >= REVERSAL_COOLDOWN_SEC:
-                        rev = detect_short_reversal(
-                            sym, price, klines_1m, klines_5m, klines_15m,
-                            recent, growth, rsi, REVERSAL_MIN_SCORE
-                        )
-                        if rev["triggered"]:
-                            # ── Умный фильтр повторов ───────────────────────
-                            last_info = _reversal_last.get(sym)
-                            if last_info:
-                                price_change = abs(price - last_info["price"]) / last_info["price"] * 100
-                                score_delta  = rev["score"] - last_info["score"]
-                                # Пропускаем если: цена почти не изменилась И скор не вырос значительно
-                                if (price_change < REVERSAL_REPEAT_PRICE_PCT
-                                        and score_delta < REVERSAL_REPEAT_SCORE_DELTA):
-                                    log.debug(
-                                        "REVERSAL skip %s: price_chg=%.2f%% score_delta=%d",
-                                        sym, price_change, score_delta,
-                                    )
-                                    continue
-                            # ── Отправляем сигнал ───────────────────────────
-                            duration = calculate_growth_duration(recent)
-                            rev_text = format_reversal_alert(
-                                sym, price, max(growth, peak_growth), source, rev,
-                                duration_sec=duration,
-                                window_sec=REVERSAL_WINDOW_SEC,
-                            )
-                            _reversal_cooldown[sym] = now
-                            _reversal_last[sym] = {"price": price, "score": rev["score"], "ts": now}
-                            db_save_reversal(
-                                sym, price, rev["score"], rev["factors"],
-                                rev["rsi"], rev["macd_hist"],
-                                rev["stoch_rsi"], rev["bb_pct"],
-                                rev["atr"], rev["target1"], rev["target2"], source,
-                            )
-                            await broadcast(rev_text)
-                            reversal_count += 1
-                            if PROM_AVAILABLE:
-                                PROM_REVERSALS.inc()
-                            log.info("REVERSAL %s score=%d/20 peak=%.2f%% price_chg=%.2f%%",
-                                     sym, rev["score"], peak_growth,
-                                     abs(price - last_info["price"]) / last_info["price"] * 100 if last_info else 0.0)
-                            continue  # не дублируем обычным алертом
-
-                # ════════════════════════════════════════════════════════════
-                #  БЛОК 1.5: УВЕДОМЛЕНИЕ О БОЛЬШОМ РОСТЕ / ПАДЕНИИ (15% и т.п.)
-                # ════════════════════════════════════════════════════════════
-                if NOTIFY_BIG_MOVE_PCT > 0 and abs(growth) >= NOTIFY_BIG_MOVE_PCT:
-                    last_notif = _notify_cooldown.get(sym, 0)
-                    if now - last_notif >= NOTIFY_BIG_MOVE_COOLDOWN_SEC:
-                        direction_emoji = "🚀" if growth > 0 else "📉"
-                        move_label = "РОСТ" if growth > 0 else "ПАДЕНИЕ"
-                        rsi_str = f"{rsi:.1f}" if rsi is not None else "—"
-                        dur_str = _fmt_dur(calculate_growth_duration(recent))
-                        notif_text = (
-                            f"🔔 <b>КРУПНОЕ ДВИЖЕНИЕ — {move_label}</b>\n\n"
-                            f"🪙 <b>{sym}</b>  [{source}]\n"
-                            f"💵 Цена: <code>{price}</code>\n"
-                            f"{direction_emoji} {move_label}: <b>{growth:+.2f}%</b> "
-                            f"за {dur_str}\n"
-                            f"📊 RSI: <code>{rsi_str}</code>\n\n"
-                            f"📋 <code>{sym}</code> #большое_движение"
-                        )
-                        _notify_cooldown[sym] = now
-                        await broadcast(notif_text)
-                        log.info("BigMove notify: %s %+.2f%%", sym, growth)
-
-                # ════════════════════════════════════════════════════════════
-                #  БЛОК 2: ОБЫЧНЫЕ АЛЕРТЫ (РОСТ / ПАДЕНИЕ)
-                # ════════════════════════════════════════════════════════════
-                if abs(growth) < current_percent:
-                    level = _cache_get_level(sym)
-                    if level and level["direction"] != direction:
-                        _cache_clear_level(sym)
-                    continue
-
-                # RSI-фильтр направления
-                if rsi is not None:
-                    if direction == 1 and rsi < 50:
-                        continue
-                    if direction == -1 and rsi > 50:
-                        continue
-
-                last_sent = _alert_cooldown.get(sym, 0)
-                if now - last_sent < ALERT_COOLDOWN_SEC:
-                    continue
-
-                level = _cache_get_level(sym)
-                if level:
-                    prev_price = level["alert_price"]
-                    prev_dir   = level["direction"]
-                    if prev_dir == direction:
-                        if abs(price - prev_price) / prev_price * 100 < current_percent:
-                            continue
-
-                vals      = [p for _, p in price_history[sym][-120:]]
-                macd_data = calculate_macd_full(vals)
-                macd      = macd_data["histogram"]
-                # RSI-тренд из уже загруженных свечей — не делаем лишний HTTP запрос
-                rsi_trend = calculate_rsi_trend(closes) if len(closes) >= 17 else None
-                accel     = calculate_acceleration(recent)
-                duration  = calculate_growth_duration(recent)
-                breakout  = check_24h_breakout(sym, price)
-                day_ctx   = get_24h_context(sym, price)
-
-                if direction == 1:
-                    text = format_growth_alert(
-                        sym, price, growth, rsi, macd, source,
-                        rsi_trend=rsi_trend, accel=accel,
-                        duration_sec=duration, breakout=breakout, day_context=day_ctx,
-                    )
-                else:
-                    text = format_drop_alert(
-                        sym, price, growth, rsi, macd, source,
-                        rsi_trend=rsi_trend, duration_sec=duration,
-                        breakout=breakout, day_context=day_ctx,
-                    )
-
-                _cache_set_level(sym, price, direction)
-                _alert_cooldown[sym] = now
-                db_save_alert(sym, price, growth, rsi, macd, source)
-                await broadcast(text)
-                signals_count += 1
-
-                if PROM_AVAILABLE:
-                    PROM_SIGNALS.inc()
-
-                log.info("Signal: %s %+.2f%% [%s]", sym, growth, source)
+            await asyncio.gather(*(_bounded(sym, price) for sym, price in prices.items()))
 
             await asyncio.sleep(config.INTERVAL)
 
@@ -2093,6 +2226,7 @@ async def handle_message(msg: dict):
     global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC, REVERSAL_ATR_MULT, REVERSAL_VOL_RATIO
     global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT, REVERSAL_WINDOW_SEC
     global REVERSAL_REPEAT_PRICE_PCT, REVERSAL_REPEAT_SCORE_DELTA
+    global RSI_SIGNAL_TF, RSI_SIGNAL_LEVEL, RSI_REVERSAL_TF
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -2121,6 +2255,8 @@ async def handle_message(msg: dict):
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
             f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b> за <b>{_fmt_dur(REVERSAL_WINDOW_SEC)}</b>\n"
             f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
+            f"📊 RSI-фильтр сигналов: ТФ <b>{RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)}</b>, порог ≥<b>{RSI_SIGNAL_LEVEL}</b>\n"
+            f"🔄📊 RSI-фильтр разворота: ТФ <b>{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}</b>, порог &gt;<b>{REVERSAL_RSI_OB}</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
@@ -2128,6 +2264,10 @@ async def handle_message(msg: dict):
             f"  🕐 Разворот 5м-1д — период расчёта роста разворота\n"
             f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна алертов\n"
             f"  🎚 Порог 3-12/20 — чувствительность (кол-во факторов)\n"
+            f"  📊 RSI ТФ 5м-1д — таймфрейм RSI для сигналов роста/падения\n"
+            f"  📊 RSI ≥50-95 — порог RSI для сигналов роста/падения\n"
+            f"  🔄📊 RSI ТФ 5м-1д — таймфрейм RSI для разворотного сигнала\n"
+            f"  🔄📊 RSI ≥50-95 — порог RSI для разворотного сигнала\n"
             f"  ⚙️ Настройки разворота — все параметры\n"
             f"  🔄 Полный перезапуск — перезапуск без потери данных\n"
             f"  🆘 Помощь — краткая справка\n\n"
@@ -2179,13 +2319,17 @@ async def handle_message(msg: dict):
             f"🚀 <b>Crypto Alert Bot v19 — справка</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
-            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n\n"
+            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
+            f"📊 RSI сигналов: ТФ <b>{RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)}</b>, ≥<b>{RSI_SIGNAL_LEVEL}</b>\n"
+            f"🔄📊 RSI разворота: ТФ <b>{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}</b>, &gt;<b>{REVERSAL_RSI_OB}</b>\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
             f"  📉 Разворот 1-25% — мин. рост для шорт-разворота\n"
             f"  🕐 Разворот 5м-1д — период расчёта роста разворота\n"
             f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна алертов\n"
             f"  🎚 Порог 3-12/20 — чувствительность разворота\n"
+            f"  📊 RSI ТФ / RSI ≥ — таймфрейм и порог RSI для роста/падения\n"
+            f"  🔄📊 RSI ТФ / RSI ≥ — таймфрейм и порог RSI для разворота\n"
             f"  ⚙️ Настройки разворота — все параметры детально\n"
             f"  🔄 Полный перезапуск — перезапуск процесса без потери данных\n\n"
             f"Полный список команд: /menu",
@@ -2222,6 +2366,8 @@ async def handle_message(msg: dict):
             f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/20\n"
             f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}% за {_fmt_dur(REVERSAL_WINDOW_SEC)}\n"
             f"🔔 Уведомление движения: {NOTIFY_BIG_MOVE_PCT}%\n"
+            f"📊 RSI сигналов: ТФ {RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)}, порог ≥{RSI_SIGNAL_LEVEL}\n"
+            f"🔄📊 RSI разворота: ТФ {RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}, порог >{REVERSAL_RSI_OB}\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
             f"📈 Порог роста: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n"
@@ -2421,10 +2567,82 @@ async def handle_message(msg: dict):
         )
         return
 
+    # ── RSI-фильтр обычных сигналов роста/падения: таймфрейм ──────────────────
+    _rsi_signal_tf_map = {
+        "📊 RSI ТФ 5м":  "Min5",
+        "📊 RSI ТФ 15м": "Min15",
+        "📊 RSI ТФ 1ч":  "Min60",
+        "📊 RSI ТФ 4ч":  "Hour4",
+        "📊 RSI ТФ 12ч": "Hour12",
+        "📊 RSI ТФ 1д":  "Day1",
+    }
+    if text in _rsi_signal_tf_map:
+        RSI_SIGNAL_TF = _rsi_signal_tf_map[text]
+        lbl = RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)
+        await send_message(
+            f"✅ RSI-фильтр сигналов роста/падения: ТФ <b>{lbl}</b>\n"
+            f"ℹ️ Данные берутся напрямую с MEXC (точный RSI по выбранному ТФ).\n"
+            f"Текущий порог: ≥{RSI_SIGNAL_LEVEL}",
+            chat_id,
+        )
+        return
+
+    # ── RSI-фильтр обычных сигналов роста/падения: порог "не меньше" ──────────
+    _rsi_signal_lvl_map = {
+        "📊 RSI ≥50": 50.0, "📊 RSI ≥60": 60.0, "📊 RSI ≥70": 70.0,
+        "📊 RSI ≥80": 80.0, "📊 RSI ≥90": 90.0, "📊 RSI ≥95": 95.0,
+    }
+    if text in _rsi_signal_lvl_map:
+        RSI_SIGNAL_LEVEL = _rsi_signal_lvl_map[text]
+        await send_message(
+            f"✅ RSI-порог сигналов: <b>≥{RSI_SIGNAL_LEVEL}</b>\n"
+            f"ℹ️ Сигнал РОСТА проходит только если RSI ≥ {RSI_SIGNAL_LEVEL}.\n"
+            f"Сигнал ПАДЕНИЯ проходит только если RSI ≤ {100 - RSI_SIGNAL_LEVEL}.\n"
+            f"Работает вместе с фильтром роста/падения на текущем ТФ "
+            f"({RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)}).",
+            chat_id,
+        )
+        return
+
+    # ── RSI-фильтр РАЗВОРОТА: таймфрейм (отдельно от обычных сигналов) ────────
+    _rsi_rev_tf_map = {
+        "🔄📊 RSI ТФ 5м":  "Min5",
+        "🔄📊 RSI ТФ 15м": "Min15",
+        "🔄📊 RSI ТФ 1ч":  "Min60",
+        "🔄📊 RSI ТФ 4ч":  "Hour4",
+        "🔄📊 RSI ТФ 12ч": "Hour12",
+        "🔄📊 RSI ТФ 1д":  "Day1",
+    }
+    if text in _rsi_rev_tf_map:
+        RSI_REVERSAL_TF = _rsi_rev_tf_map[text]
+        lbl = RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)
+        await send_message(
+            f"✅ RSI для разворотного сигнала: ТФ <b>{lbl}</b>\n"
+            f"ℹ️ Используется в факторе 15/20 («старший ТФ перекуплен»).\n"
+            f"Текущий порог: >{REVERSAL_RSI_OB}",
+            chat_id,
+        )
+        return
+
+    # ── RSI-фильтр РАЗВОРОТА: порог "не меньше" ────────────────────────────────
+    _rsi_rev_lvl_map = {
+        "🔄📊 RSI ≥50": 50.0, "🔄📊 RSI ≥60": 60.0, "🔄📊 RSI ≥70": 70.0,
+        "🔄📊 RSI ≥80": 80.0, "🔄📊 RSI ≥90": 90.0, "🔄📊 RSI ≥95": 95.0,
+    }
+    if text in _rsi_rev_lvl_map:
+        REVERSAL_RSI_OB = _rsi_rev_lvl_map[text]  # global объявлен выше — OK
+        await send_message(
+            f"✅ RSI-порог разворота: <b>&gt;{REVERSAL_RSI_OB}</b>\n"
+            f"ℹ️ Применяется к фактору 1 (Min1) и фактору 15 (ТФ "
+            f"{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}).",
+            chat_id,
+        )
+        return
+
     # ── Команды настройки разворота ───────────────────────────────────────────
     _rev_cmds = {
         "/rev_score":    ("REVERSAL_MIN_SCORE",   int,   1,    20,    "Порог факторов",           "/20"),
-        "/rev_rsi":      ("REVERSAL_RSI_OB",      float, 50,   90,    "RSI перекупленность",      ""),
+        "/rev_rsi":      ("REVERSAL_RSI_OB",      float, 50,   95,    "RSI перекупленность",      ""),
         "/rev_stoch":    ("REVERSAL_STOCH_OB",    float, 0.5,  1.0,   "StochRSI порог",           ""),
         "/rev_bb":       ("REVERSAL_BB_OB",       float, 0.8,  1.5,   "Боллинджер %B порог",      ""),
         "/rev_accel":    ("REVERSAL_ACCEL",       float, 0.1,  1.0,   "Порог замедления",         ""),
@@ -2551,8 +2769,9 @@ async def _cmd_reversal_settings(chat_id):
         f"<b>Скоринг:</b>\n"
         f"  Порог:         <code>{REVERSAL_MIN_SCORE}/20</code>  → /rev_score 5\n\n"
         f"<b>Пороги факторов:</b>\n"
-        f"  RSI OB (1m):   <code>&gt; {REVERSAL_RSI_OB}</code>     → /rev_rsi 70\n"
-        f"  RSI OB (15m):  <code>&gt; 75</code>          (фиксировано)\n"
+        f"  RSI OB (1m):   <code>&gt; {REVERSAL_RSI_OB}</code>     → /rev_rsi 70 (или кнопки 🔄📊 RSI ≥)\n"
+        f"  RSI OB (старший ТФ): <code>&gt; {REVERSAL_RSI_OB}</code> на ТФ "
+        f"<code>{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}</code>  → кнопки 🔄📊 RSI ТФ\n"
         f"  StochRSI:      <code>&gt; {REVERSAL_STOCH_OB}</code>   → /rev_stoch 0.80\n"
         f"  Боллинджер:    <code>&gt; {REVERSAL_BB_OB}</code>      → /rev_bb 1.0\n"
         f"  Замедление:    <code>&lt; {REVERSAL_ACCEL}</code>      → /rev_accel 0.5\n"
@@ -2564,7 +2783,7 @@ async def _cmd_reversal_settings(chat_id):
         f"<b>Факторы 13-16:</b>\n"
         f"  13. OBV-дивергенция (Min15, цена↑ OBV↓)\n"
         f"  14. Wick Rejection Ratio &gt;0.55 (Min1)\n"
-        f"  15. RSI 15m &gt;75 (старший таймфрейм)\n"
+        f"  15. RSI {RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)} &gt;{REVERSAL_RSI_OB} (настраиваемый старший таймфрейм)\n"
         f"  16. Lower Highs (Min5, 3+ убывающих хая)\n\n"
         f"<b>Факторы 17-20:</b>\n"
         f"  17. MACD гистограмма падает (Min1)\n"
