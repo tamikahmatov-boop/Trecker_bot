@@ -1,7 +1,31 @@
 """
-Crypto Alert Bot — v20
-Полный аудит файла от начала до конца. Исправлен корень проблемы 409 Conflict
-на Railway, перекалиброваны уровни уверенности под 20 факторов.
+Crypto Alert Bot — v21
+Добавлена кнопка полного вкл/выкл RSI-фильтра (порог + ТФ) для сигналов
+роста/падения. Исправлены забытые хардкоды версии (v17/v19 → v21).
+
+═══════════════════════════════════════════════════════
+ НОВОЕ v21
+═══════════════════════════════════════════════════════
+• 🚦 RSI-фильтр ВЫКЛ / 🚦 RSI-фильтр ВКЛ — новая пара кнопок (и флаг
+  RSI_SIGNAL_FILTER_ENABLED) для сигналов роста/падения. ВЫКЛ полностью
+  отключает проверку RSI: алерты идут только по порогу % (current_percent),
+  ТФ/уровень RSI (кнопки 📊 RSI ТФ / RSI ≥) при этом сохраняются в памяти,
+  но не применяются — повторное нажатие ВКЛ возвращает их в работу без
+  необходимости настраивать заново. Не путать с 🔄📊 RSI-гейтом разворота
+  (REVERSAL_RSI_OB / RSI_REVERSAL_TF) — это отдельный, самостоятельный фильтр.
+• Оптимизация: при выключенном RSI-фильтре пропускается сам HTTP-запрос
+  get_rsi_for_tf() за RSI на отдельном таймфрейме (когда RSI_SIGNAL_TF
+  отличается от Min1) — раньше запрос уходил всегда, даже если порог
+  фактически не использовался для фильтрации падения.
+• format_growth_alert/format_drop_alert: строка "📊 RSI {ТФ}: ..." в самих
+  алертах теперь не показывается, пока фильтр выключен — меньше шума в
+  сообщении, раз показатель в этот момент ни на что не влияет.
+• _rsi_signal_status_line(): вынесена общая функция формирования текста
+  "ТФ X, порог ≥Y / ВЫКЛЮЧЕН" — раньше одна и та же условная строка была
+  продублирована в /menu, 🆘 Помощь и 📊 Статус по отдельности (DRY).
+• Хардкоженные версии бота в текстах ("v19" в /start, /menu, 🆘 Помощь и
+  "v17" в стартовом broadcast monitor()) не были обновлены при переходе на
+  v20 — приведены к единому виду.
 
 ═══════════════════════════════════════════════════════
  НОВОЕ v20 — ПОЛНЫЙ АУДИТ
@@ -629,6 +653,10 @@ REVERSAL_VOL_RATIO:   float = getattr(config, "REVERSAL_VOL_RATIO",   0.7)    # 
 # Для обычных сигналов роста/падения:
 RSI_SIGNAL_TF:    str   = getattr(config, "RSI_SIGNAL_TF",    "Min1")   # ТФ: Min1/Min5/Min15/Min60/Hour4/Hour12/Day1
 RSI_SIGNAL_LEVEL: float = getattr(config, "RSI_SIGNAL_LEVEL", 50.0)     # "не меньше": 50/60/70/80/90/95
+# Вкл/выкл RSI-фильтра для сигналов роста/падения (кнопка 🚦). Когда выключен —
+# алерты роста/падения работают только по % (current_percent), без проверки RSI
+# и без доп. HTTP-запроса за RSI на отдельном ТФ (если RSI_SIGNAL_TF != Min1).
+RSI_SIGNAL_FILTER_ENABLED: bool = getattr(config, "RSI_SIGNAL_FILTER_ENABLED", True)
 # Для разворотных сигналов (фактор 15 + переопределяет REVERSAL_RSI_OB по выбранному ТФ):
 RSI_REVERSAL_TF:  str   = getattr(config, "RSI_REVERSAL_TF",  "Min15")
 
@@ -1613,6 +1641,20 @@ async def broadcast(text: str, reply_markup=None):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _rsi_signal_status_line(bold: bool = True) -> str:
+    """
+    Человекочитаемое описание текущего состояния RSI-фильтра роста/падения
+    (вынесено в одну функцию, чтобы /menu, 🆘 Помощь и 📊 Статус не дублировали
+    одну и ту же условную логику трижды).
+    """
+    if not RSI_SIGNAL_FILTER_ENABLED:
+        return "<b>ВЫКЛЮЧЕН</b>" if bold else "ВЫКЛЮЧЕН"
+    tf = RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)
+    if bold:
+        return f"ТФ <b>{tf}</b>, порог ≥<b>{RSI_SIGNAL_LEVEL}</b>"
+    return f"ТФ {tf}, порог ≥{RSI_SIGNAL_LEVEL}"
+
+
 def reply_keyboard():
     return {
         "keyboard": [
@@ -1635,13 +1677,15 @@ def reply_keyboard():
             ["🕐 Разворот 5м", "🕐 Разворот 30м", "🕐 Разворот 1ч", "🕐 Разворот 4ч", "🕐 Разворот 1д"],
             # Строка 9 — Управление процессом
             ["🔄 Полный перезапуск", "🆘 Помощь"],
-            # Строка 10 — RSI-фильтр обычных сигналов: таймфрейм
+            # Строка 10 — RSI-фильтр обычных сигналов роста/падения: вкл/выкл
+            ["🚦 RSI-фильтр ВЫКЛ", "🚦 RSI-фильтр ВКЛ"],
+            # Строка 11 — RSI-фильтр обычных сигналов: таймфрейм
             ["📊 RSI ТФ 5м", "📊 RSI ТФ 15м", "📊 RSI ТФ 1ч", "📊 RSI ТФ 4ч", "📊 RSI ТФ 12ч", "📊 RSI ТФ 1д"],
-            # Строка 11 — RSI-фильтр обычных сигналов: порог "не меньше"
+            # Строка 12 — RSI-фильтр обычных сигналов: порог "не меньше"
             ["📊 RSI ≥50", "📊 RSI ≥60", "📊 RSI ≥70", "📊 RSI ≥80", "📊 RSI ≥90", "📊 RSI ≥95"],
-            # Строка 12 — RSI разворота: таймфрейм (отдельно от сигналов роста/падения)
+            # Строка 13 — RSI разворота: таймфрейм (отдельно от сигналов роста/падения)
             ["🔄📊 RSI ТФ 5м", "🔄📊 RSI ТФ 15м", "🔄📊 RSI ТФ 1ч", "🔄📊 RSI ТФ 4ч", "🔄📊 RSI ТФ 12ч", "🔄📊 RSI ТФ 1д"],
-            # Строка 13 — RSI разворота: порог "не меньше"
+            # Строка 14 — RSI разворота: порог "не меньше"
             ["🔄📊 RSI ≥50", "🔄📊 RSI ≥60", "🔄📊 RSI ≥70", "🔄📊 RSI ≥80", "🔄📊 RSI ≥90", "🔄📊 RSI ≥95"],
         ],
         "resize_keyboard": True,
@@ -1950,7 +1994,7 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    await broadcast("✅ <b>Бот запущен</b> (v17 — 20-факторный разворот)")
+    await broadcast("✅ <b>Бот запущен</b> (v21 — 20-факторный разворот)")
 
     while True:
         if monitor_paused:
@@ -2111,13 +2155,18 @@ async def monitor():
                         _cache_clear_level(sym)
                     continue
 
-                # RSI-фильтр направления (настраиваемый ТФ и порог через кнопки)
+                # RSI-фильтр направления (настраиваемый ТФ и порог через кнопки,
+                # можно полностью отключить кнопкой 🚦 RSI-фильтр ВЫКЛ).
                 # РОСТ:    уведомление приходит только если RSI >= RSI_SIGNAL_LEVEL.
-                # ПАДЕНИЕ: порог больше НЕ применяется — сигнал не блокируется по RSI,
-                #          значение RSI лишь показывается в тексте сообщения.
-                rsi_filter_val = rsi if RSI_SIGNAL_TF == "Min1" else await get_rsi_for_tf(mexc_sym, RSI_SIGNAL_TF)
-                if direction == 1 and rsi_filter_val is not None and rsi_filter_val < RSI_SIGNAL_LEVEL:
-                    continue
+                # ПАДЕНИЕ: порог никогда не блокирует сигнал — значение RSI лишь
+                #          показывается в тексте сообщения.
+                # Когда фильтр выключен — пропускаем сам HTTP-запрос за RSI на
+                # отдельном ТФ (если RSI_SIGNAL_TF != Min1), а не только проверку.
+                rsi_filter_val = None
+                if RSI_SIGNAL_FILTER_ENABLED:
+                    rsi_filter_val = rsi if RSI_SIGNAL_TF == "Min1" else await get_rsi_for_tf(mexc_sym, RSI_SIGNAL_TF)
+                    if direction == 1 and rsi_filter_val is not None and rsi_filter_val < RSI_SIGNAL_LEVEL:
+                        continue
 
                 last_sent = _alert_cooldown.get(sym, 0)
                 if now - last_sent < ALERT_COOLDOWN_SEC:
@@ -2141,7 +2190,11 @@ async def monitor():
                 breakout  = check_24h_breakout(sym, price)
                 day_ctx   = get_24h_context(sym, price)
 
-                rsi_tf_label_show = RSI_TF_LABELS.get(RSI_SIGNAL_TF) if RSI_SIGNAL_TF != "Min1" else None
+                rsi_tf_label_show = (
+                    RSI_TF_LABELS.get(RSI_SIGNAL_TF)
+                    if RSI_SIGNAL_FILTER_ENABLED and RSI_SIGNAL_TF != "Min1"
+                    else None
+                )
                 if direction == 1:
                     text = format_growth_alert(
                         sym, price, growth, rsi, macd, source,
@@ -2207,7 +2260,7 @@ async def handle_message(msg: dict):
     global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC, REVERSAL_ATR_MULT, REVERSAL_VOL_RATIO
     global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT, REVERSAL_WINDOW_SEC
     global REVERSAL_REPEAT_PRICE_PCT, REVERSAL_REPEAT_SCORE_DELTA
-    global RSI_SIGNAL_TF, RSI_SIGNAL_LEVEL, RSI_REVERSAL_TF
+    global RSI_SIGNAL_TF, RSI_SIGNAL_LEVEL, RSI_REVERSAL_TF, RSI_SIGNAL_FILTER_ENABLED
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -2216,7 +2269,7 @@ async def handle_message(msg: dict):
         if text in ("/start", "/subscribe"):
             db_add_subscriber(chat_id)
             await send_message(
-                "🚀 <b>Crypto Alert Bot v19</b>\n\n"
+                "🚀 <b>Crypto Alert Bot v21</b>\n\n"
                 "✅ Вы подписаны на сигналы.\n"
                 "Для отписки: /unsubscribe",
                 chat_id,
@@ -2230,13 +2283,13 @@ async def handle_message(msg: dict):
 
     if text in ("/start", "/menu"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v19</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v21</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
             f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b> за <b>{_fmt_dur(REVERSAL_WINDOW_SEC)}</b>\n"
             f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
-            f"📊 RSI-фильтр РОСТА: ТФ <b>{RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)}</b>, порог ≥<b>{RSI_SIGNAL_LEVEL}</b> (падение — без порога, только значение)\n"
+            f"📊 RSI-фильтр РОСТА: {_rsi_signal_status_line()} (падение — без порога, только значение)\n"
             f"🔄📊 RSI-гейт разворота: ТФ <b>{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}</b>, порог ≥<b>{REVERSAL_RSI_OB}</b> (не зависит от 20 факторов)\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
             f"<b>Кнопки управления:</b>\n"
@@ -2245,6 +2298,8 @@ async def handle_message(msg: dict):
             f"  🕐 Разворот 5м-1д — период расчёта роста разворота\n"
             f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна алертов\n"
             f"  🎚 Порог 3-12/20 — чувствительность (кол-во факторов)\n"
+            f"  🚦 RSI-фильтр ВЫКЛ/ВКЛ — полностью отключить/включить проверку "
+            f"RSI (и её ТФ) для сигналов роста/падения\n"
             f"  📊 RSI ТФ 5м-1д — таймфрейм RSI для сигнала РОСТА\n"
             f"  📊 RSI ≥50-95 — порог RSI: уведомление о РОСТЕ только если RSI ≥ порога. "
             f"На ПАДЕНИЕ порог не действует — RSI просто показывается в сообщении\n"
@@ -2300,11 +2355,11 @@ async def handle_message(msg: dict):
 
     if text in ("🆘 Помощь", "/help"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v19 — справка</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v21 — справка</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
-            f"📊 RSI РОСТА: ТФ <b>{RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)}</b>, ≥<b>{RSI_SIGNAL_LEVEL}</b> (падение — без порога)\n"
+            f"📊 RSI РОСТА: {_rsi_signal_status_line()} (падение — без порога)\n"
             f"🔄📊 RSI-гейт разворота: ТФ <b>{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}</b>, ≥<b>{REVERSAL_RSI_OB}</b> (вне факторов)\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
@@ -2312,6 +2367,7 @@ async def handle_message(msg: dict):
             f"  🕐 Разворот 5м-1д — период расчёта роста разворота\n"
             f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна алертов\n"
             f"  🎚 Порог 3-12/20 — чувствительность разворота\n"
+            f"  🚦 RSI-фильтр ВЫКЛ/ВКЛ — отключить/включить RSI-проверку роста/падения\n"
             f"  📊 RSI ТФ / RSI ≥ — таймфрейм и порог RSI для РОСТА (на падение не влияет)\n"
             f"  🔄📊 RSI ТФ / RSI ≥ — таймфрейм и порог жёсткого RSI-гейта разворота\n"
             f"  ⚙️ Настройки разворота — все параметры детально\n"
@@ -2350,7 +2406,7 @@ async def handle_message(msg: dict):
             f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/20\n"
             f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}% за {_fmt_dur(REVERSAL_WINDOW_SEC)}\n"
             f"🔔 Уведомление движения: {NOTIFY_BIG_MOVE_PCT}%\n"
-            f"📊 RSI сигналов: ТФ {RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)}, порог ≥{RSI_SIGNAL_LEVEL}\n"
+            f"📊 RSI сигналов: {_rsi_signal_status_line(bold=False)}\n"
             f"🔄📊 RSI разворота: ТФ {RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}, порог >{REVERSAL_RSI_OB}\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
             f"📈 Порог роста: {current_percent}%\n"
@@ -2551,6 +2607,28 @@ async def handle_message(msg: dict):
         )
         return
 
+    # ── RSI-фильтр обычных сигналов роста/падения: вкл/выкл ────────────────────
+    if text == "🚦 RSI-фильтр ВЫКЛ":
+        RSI_SIGNAL_FILTER_ENABLED = False
+        await send_message(
+            "✅ RSI-фильтр РОСТА/ПАДЕНИЯ: <b>ВЫКЛЮЧЕН</b>\n"
+            "ℹ️ Алерты теперь идут только по порогу % (кнопки 📈) — RSI и его ТФ "
+            "больше не проверяются и не запрашиваются (доп. запрос к бирже за RSI "
+            "пропускается, если ТФ не Min1).",
+            chat_id,
+        )
+        return
+
+    if text == "🚦 RSI-фильтр ВКЛ":
+        RSI_SIGNAL_FILTER_ENABLED = True
+        await send_message(
+            f"✅ RSI-фильтр РОСТА/ПАДЕНИЯ: <b>ВКЛЮЧЕН</b>\n"
+            f"ℹ️ {_rsi_signal_status_line()} (действует только на сигналы РОСТА; "
+            f"на ПАДЕНИЕ порог не влияет — RSI лишь показывается в сообщении).",
+            chat_id,
+        )
+        return
+
     # ── RSI-фильтр обычных сигналов роста/падения: таймфрейм ──────────────────
     _rsi_signal_tf_map = {
         "📊 RSI ТФ 5м":  "Min5",
@@ -2563,11 +2641,13 @@ async def handle_message(msg: dict):
     if text in _rsi_signal_tf_map:
         RSI_SIGNAL_TF = _rsi_signal_tf_map[text]
         lbl = RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)
+        off_hint = "\n⚠️ Фильтр сейчас ВЫКЛЮЧЕН (🚦) — ТФ сохранён, но не применяется." \
+            if not RSI_SIGNAL_FILTER_ENABLED else ""
         await send_message(
             f"✅ RSI-фильтр РОСТА: ТФ <b>{lbl}</b>\n"
             f"ℹ️ Действует только на сигналы РОСТА. Данные берутся напрямую "
             f"с MEXC (точный RSI по выбранному ТФ).\n"
-            f"Текущий порог: ≥{RSI_SIGNAL_LEVEL}",
+            f"Текущий порог: ≥{RSI_SIGNAL_LEVEL}{off_hint}",
             chat_id,
         )
         return
@@ -2579,12 +2659,14 @@ async def handle_message(msg: dict):
     }
     if text in _rsi_signal_lvl_map:
         RSI_SIGNAL_LEVEL = _rsi_signal_lvl_map[text]
+        off_hint = "\n⚠️ Фильтр сейчас ВЫКЛЮЧЕН (🚦) — порог сохранён, но не применяется." \
+            if not RSI_SIGNAL_FILTER_ENABLED else ""
         await send_message(
             f"✅ RSI-порог РОСТА: <b>≥{RSI_SIGNAL_LEVEL}</b>\n"
             f"ℹ️ Уведомление о РОСТЕ проходит только если RSI ≥ {RSI_SIGNAL_LEVEL}.\n"
             f"На ПАДЕНИЕ этот порог больше не действует — уведомления о падении "
             f"приходят без фильтра по RSI, значение RSI просто показывается в сообщении.\n"
-            f"Работает на ТФ {RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)}.",
+            f"Работает на ТФ {RSI_TF_LABELS.get(RSI_SIGNAL_TF, RSI_SIGNAL_TF)}.{off_hint}",
             chat_id,
         )
         return
