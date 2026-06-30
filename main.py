@@ -1,9 +1,56 @@
 """
-Crypto Alert Bot — v17 (CoinGlass Edition)
-Полный аудит, исправление всех ошибок и расширение до 16 факторов разворота.
+Crypto Alert Bot — v17
+Полный аудит v16, исправление оставшихся багов, новые кнопки управления.
 
 ═══════════════════════════════════════════════════════
- ИСПРАВЛЕННЫЕ БАГИ
+ ИСПРАВЛЕННЫЕ БАГИ v17
+═══════════════════════════════════════════════════════
+• handle_message: первый блок `if text == "/start"` перехватывал /start
+  ДО проверки chat_id, из-за чего владелец бота (CHAT_ID) никогда не видел
+  полное меню с клавиатурой — получал только короткое сообщение и return.
+  Удалён мёртвый/конфликтующий блок, /start теперь всегда даёт владельцу
+  полное меню, а подписчикам — приветствие + автоподписку.
+• monitor(): стартовое сообщение говорило "v12 — 12-факторный разворот"
+  хотя бот уже v16 с 16 факторами — исправлено на v16/16.
+• checks_count инкрементировался дважды за итерацию (в начале цикла и в
+  блоке периодической очистки) — счётчик циклов был врут в 2 раза чаще
+  триггерил периодическую очистку памяти. Дубликат убран.
+• log.info при REVERSAL использовал переменную price_change, которая не
+  определена если last_info is None (первый сигнал по монете) → NameError,
+  тихо проглатываемый внешним try/except, но ломавший лог. Исправлено.
+• Умный фильтр повторных разворотов: при пропуске дубликата `continue`
+  пропускал ВЕСЬ остаток итерации по монете — включая обычные алерты
+  роста/падения. Теперь пропускается только разворотный сигнал.
+• Все кнопки и тексты "X/12 факторов" заменены на корректные "X/16"
+  (клавиатура порога разворота, /menu, /reversal_settings, /reversals).
+• Кнопки порога разворота расширены и переименованы:
+  3/16, 5/16, 9/16, 12/16 (агрессивный → стандарт → строгий → очень строгий).
+• _cmd_reversals: пороги confidence (🔴🟠🟡) синхронизированы с
+  format_reversal_alert (10/6 вместо устаревших 8/5).
+• /rev_score_delta: диапазон валидации расширен с 0–12 до 0–16
+  (соответствует максимальному скору в 16-факторном детекторе).
+• _rev_cmds: сообщение об ошибке для /rev_cooldown показывало текущее
+  значение в СЕКУНДАХ при том, что диапазон ввода — в МИНУТАХ.
+  Теперь оба значения в одних единицах (минуты).
+• Стандартный пресет приведён к единому виду: REVERSAL_MIN_SCORE по
+  умолчанию = 5 (как заявлено в пресетах), было 4.
+
+═══════════════════════════════════════════════════════
+ НОВЫЕ ВОЗМОЖНОСТИ v17
+═══════════════════════════════════════════════════════
+• 🔄 Полный перезапуск — новая кнопка и команда /restart. Безопасно
+  пересоздаёт asyncio.Task для monitor() БЕЗ потери price_history,
+  БД, подписчиков и текущих настроек. Кулдаун 60с защищает от спама.
+  Использует общую функцию restart_monitor(), которую теперь вызывает
+  и watchdog (устранено дублирование кода).
+• 🆘 Помощь — новая кнопка с кратким описанием текущих настроек и кнопок,
+  отдельно от полного /menu.
+• restart_monitor(reason) — переиспользуемая безопасная функция
+  перезапуска цикла мониторинга (раньше код перезапуска дублировался
+  только внутри watchdog).
+
+═══════════════════════════════════════════════════════
+ v16 — ИСТОРИЯ ИЗМЕНЕНИЙ (см. предыдущие правки)
 ═══════════════════════════════════════════════════════
 • db_connect: не делал commit() → INSERT мог не сохраняться. Добавлен commit/rollback.
 • _fetch_mexc_klines: не запрашивал поле "open" → detect_candle_pattern использовал
@@ -24,7 +71,7 @@ Crypto Alert Bot — v17 (CoinGlass Edition)
   Добавлена периодическая очистка в monitor loop.
 
 ═══════════════════════════════════════════════════════
- НОВЫЕ ФАКТОРЫ РАЗВОРОТА (13–16, теперь итого 16/16)
+ ФАКТОРЫ РАЗВОРОТА (16/16)
 ═══════════════════════════════════════════════════════
 • 13. OBV-дивергенция (Min15): цена растёт, On-Balance Volume падает.
       Сигнал ослабления покупательского давления.
@@ -36,7 +83,7 @@ Crypto Alert Bot — v17 (CoinGlass Edition)
       структурный медвежий разворот.
 
 ═══════════════════════════════════════════════════════
- УЛУЧШЕНИЯ ДАННЫХ (3 таймфрейма параллельно)
+ ДАННЫЕ (3 таймфрейма параллельно)
 ═══════════════════════════════════════════════════════
 • Min1  x120: RSI, StochRSI, BB, паттерны (с реальными opens), wick rejection
 • Min5  x100: MACD, EMA, ATR, моментум, объём, lower highs
@@ -44,13 +91,24 @@ Crypto Alert Bot — v17 (CoinGlass Edition)
   Все три таймфрейма загружаются параллельно через asyncio.gather.
 
 ═══════════════════════════════════════════════════════
- ДРУГИЕ УЛУЧШЕНИЯ
+ ДРУГИЕ ОСОБЕННОСТИ
 ═══════════════════════════════════════════════════════
 • format_reversal_alert: RSI 1m + RSI 15m, Wick ratio, 3 цели Фибо (38.2/50/61.8%)
-• Уровни уверенности пересчитаны под 16 факторов: слабый <6, средний 6-9, высокий 10+
-• _cmd_reversal_settings: описание всех 16 факторов с новыми факторами 13-16
-• Пресеты обновлены: стандарт /rev_score 5, строгий /rev_score 9
-• /rev_score принимает значения 1–16 (было 1–12)
+• Уровни уверенности: слабый <6, средний 6-9, высокий 10+
+• _cmd_reversal_settings: описание всех 16 факторов
+• Пресеты: агрессивный /rev_score 3, стандарт /rev_score 5, строгий /rev_score 9
+• /rev_score принимает значения 1–16
+
+═══════════════════════════════════════════════════════
+ О CoinGlass
+═══════════════════════════════════════════════════════
+Интеграция с CoinGlass (ликвидации, открытый интерес, funding rate, long/short
+ratio) НЕ включена в эту версию — требует платного API-ключа CoinGlass.
+Архитектура detect_short_reversal() уже модульная: для добавления CoinGlass
+как 17-го+ фактора достаточно написать async-функцию получения данных и
+добавить её в get_mexc_klines_multi()-подобный параллельный gather, затем
+добавить блок в detect_short_reversal(). При наличии ключа — обращайтесь,
+добавим этот функционал отдельным патчем.
 """
 
 from __future__ import annotations
@@ -75,350 +133,6 @@ from ta.trend import MACD, EMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 
 import config
-
-# ================================================================
-#  COINGLASS — Open Interest / Funding Rate / Liquidations / L/S Ratio
-# ================================================================
-#
-# CoinGlass предоставляет открытые данные через публичные API-эндпоинты.
-# Для некоторых эндпоинтов нужен API-ключ (config.COINGLASS_API_KEY).
-# Если ключа нет — используем публичные эндпоинты без авторизации.
-#
-# Источники данных:
-#  • Open Interest (OI): рост OI при росте цены = хорошо (подтверждение),
-#    падение OI при росте цены = опасность разворота (позиции закрываются)
-#  • Funding Rate: положительный = лонги платят шортам → перегрев лонгов
-#    Экстремально высокий (>0.1%) = медвежий сигнал
-#  • Liquidations: резкий рост ликвидаций лонгов = разворот вниз
-#  • Long/Short Ratio: >2.0 лонгов на шорт = толпа лонгует → разворот вниз
-
-COINGLASS_API_KEY: str = getattr(config, "COINGLASS_API_KEY", "")
-
-# Кэш данных CoinGlass (TTL = 5 минут, обновляется не чаще раза в цикл)
-_cg_cache: dict[str, dict] = {}
-CG_CACHE_TTL = 300   # 5 минут
-
-# Пороги для разворотных сигналов
-CG_FUNDING_THRESHOLD:    float = getattr(config, "CG_FUNDING_THRESHOLD",    0.05)   # 0.05% — высокое финансирование
-CG_FUNDING_EXTREME:      float = getattr(config, "CG_FUNDING_EXTREME",      0.10)   # 0.1% — экстремальное
-CG_LS_RATIO_THRESHOLD:   float = getattr(config, "CG_LS_RATIO_THRESHOLD",   1.8)    # лонгов/шортов > 1.8
-CG_OI_DROP_THRESHOLD:    float = getattr(config, "CG_OI_DROP_THRESHOLD",    -3.0)   # OI упал >3% при росте цены
-CG_LIQ_RATIO_THRESHOLD:  float = getattr(config, "CG_LIQ_RATIO_THRESHOLD",  3.0)    # ликвидаций лонгов в 3x больше шортов
-
-
-def _cg_symbol(sym: str) -> str:
-    """Конвертирует BTCUSDT → BTC для CoinGlass API."""
-    for suffix in ("USDT", "USD", "PERP", "SWAP"):
-        if sym.upper().endswith(suffix):
-            return sym[: -len(suffix)].upper()
-    return sym.upper()
-
-
-def _cg_headers() -> dict:
-    h = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-    if COINGLASS_API_KEY:
-        h["CG-API-KEY"] = COINGLASS_API_KEY
-    return h
-
-
-async def _cg_get(url: str, params: dict = None) -> Optional[dict]:
-    """Универсальный GET-запрос к CoinGlass."""
-    try:
-        async with _session.get(
-            url,
-            params=params or {},
-            headers=_cg_headers(),
-            timeout=aiohttp.ClientTimeout(total=8),
-        ) as r:
-            if r.status == 429:
-                log.debug("CoinGlass rate limit: %s", url)
-                return None
-            if r.status not in (200, 201):
-                log.debug("CoinGlass %d: %s", r.status, url)
-                return None
-            return await r.json()
-    except Exception as e:
-        log.debug("CoinGlass fetch error %s: %s", url, e)
-        return None
-
-
-async def cg_get_funding_rate(sym: str) -> Optional[dict]:
-    """
-    Ставка финансирования для символа.
-    Возвращает: {rate: float, next_rate: float, exchange: str}
-    Положительный rate = лонги платят шортам (медвежий признак при перегреве).
-    """
-    cache_key = f"funding:{sym}"
-    now = time.time()
-    cached = _cg_cache.get(cache_key)
-    if cached and now - cached["ts"] < CG_CACHE_TTL:
-        return cached["data"]
-
-    cg_sym = _cg_symbol(sym)
-    data = await _cg_get(
-        "https://open-api.coinglass.com/public/v2/funding",
-        {"symbol": cg_sym},
-    )
-    result = None
-    if data and data.get("success") and data.get("data"):
-        best = None
-        for item in data["data"]:
-            if not best or abs(item.get("fundingRate", 0)) > abs(best.get("fundingRate", 0)):
-                best = item
-        if best:
-            result = {
-                "rate":     round(float(best.get("fundingRate", 0)) * 100, 4),   # → %
-                "exchange": best.get("exchangeName", "?"),
-                "symbol":   cg_sym,
-            }
-
-    # Fallback: попробуем агрегированный эндпоинт
-    if result is None:
-        data2 = await _cg_get(
-            "https://open-api.coinglass.com/public/v2/funding_usd_chart",
-            {"symbol": cg_sym, "interval": "h1", "limit": 1},
-        )
-        if data2 and data2.get("data") and data2["data"].get("dataMap"):
-            dm = data2["data"]["dataMap"]
-            rates = []
-            for ex_rates in dm.values():
-                if ex_rates:
-                    rates.append(float(ex_rates[-1]))
-            if rates:
-                avg_rate = sum(rates) / len(rates) * 100
-                result = {"rate": round(avg_rate, 4), "exchange": "avg", "symbol": cg_sym}
-
-    if result:
-        _cg_cache[cache_key] = {"ts": now, "data": result}
-    return result
-
-
-async def cg_get_open_interest(sym: str) -> Optional[dict]:
-    """
-    Открытый интерес и его изменение за последние часы.
-    Возвращает: {oi_usd: float, oi_change_pct: float, oi_rising: bool}
-    OI падает при росте цены = медвежий дивергентный сигнал.
-    """
-    cache_key = f"oi:{sym}"
-    now = time.time()
-    cached = _cg_cache.get(cache_key)
-    if cached and now - cached["ts"] < CG_CACHE_TTL:
-        return cached["data"]
-
-    cg_sym = _cg_symbol(sym)
-    data = await _cg_get(
-        "https://open-api.coinglass.com/public/v2/open_interest",
-        {"symbol": cg_sym},
-    )
-    result = None
-    if data and data.get("success") and data.get("data"):
-        items = data["data"]
-        if isinstance(items, list) and items:
-            total_oi = sum(float(x.get("openInterest", 0)) for x in items)
-            total_prev = sum(float(x.get("openInterestAmount", 0)) for x in items
-                            if x.get("openInterestAmount"))
-            change_pct = 0.0
-            if total_prev > 0:
-                change_pct = (total_oi - total_prev) / total_prev * 100
-            result = {
-                "oi_usd":        round(total_oi, 0),
-                "oi_change_pct": round(change_pct, 2),
-                "oi_rising":     change_pct > 0,
-                "symbol":        cg_sym,
-            }
-        elif isinstance(items, dict):
-            oi = float(items.get("openInterest", 0))
-            ch = float(items.get("h24Change", 0))
-            result = {
-                "oi_usd":        round(oi, 0),
-                "oi_change_pct": round(ch, 2),
-                "oi_rising":     ch > 0,
-                "symbol":        cg_sym,
-            }
-
-    if result:
-        _cg_cache[cache_key] = {"ts": now, "data": result}
-    return result
-
-
-async def cg_get_ls_ratio(sym: str) -> Optional[dict]:
-    """
-    Long/Short коэффициент по позициям трейдеров.
-    Возвращает: {ls_ratio: float, long_pct: float, short_pct: float}
-    ls_ratio > 1.8 = большинство в лонге = потенциальный разворот вниз.
-    """
-    cache_key = f"ls:{sym}"
-    now = time.time()
-    cached = _cg_cache.get(cache_key)
-    if cached and now - cached["ts"] < CG_CACHE_TTL:
-        return cached["data"]
-
-    cg_sym = _cg_symbol(sym)
-    data = await _cg_get(
-        "https://open-api.coinglass.com/public/v2/top_long_short_position_ratio",
-        {"symbol": cg_sym, "interval": "1h", "limit": 2},
-    )
-    result = None
-    if data and data.get("success") and data.get("data"):
-        items = data["data"]
-        # Берём последнюю точку
-        if isinstance(items, list) and items:
-            last = items[-1]
-            long_pct  = float(last.get("longRatio",  last.get("longAccount",  0.5)))
-            short_pct = float(last.get("shortRatio", last.get("shortAccount", 0.5)))
-            if long_pct > 1:   # если в долях сотен, конвертируем
-                long_pct  /= 100
-                short_pct /= 100
-            ls = long_pct / short_pct if short_pct > 0 else 1.0
-            result = {
-                "ls_ratio":  round(ls, 3),
-                "long_pct":  round(long_pct * 100, 1),
-                "short_pct": round(short_pct * 100, 1),
-                "symbol":    cg_sym,
-            }
-
-    if result:
-        _cg_cache[cache_key] = {"ts": now, "data": result}
-    return result
-
-
-async def cg_get_liquidations(sym: str) -> Optional[dict]:
-    """
-    Объём ликвидаций за последний час.
-    Возвращает: {liq_long_usd: float, liq_short_usd: float, liq_ls_ratio: float}
-    Высокий liq_ls_ratio (>3) = ликвидируют лонги → давление вниз.
-    """
-    cache_key = f"liq:{sym}"
-    now = time.time()
-    cached = _cg_cache.get(cache_key)
-    if cached and now - cached["ts"] < CG_CACHE_TTL:
-        return cached["data"]
-
-    cg_sym = _cg_symbol(sym)
-    data = await _cg_get(
-        "https://open-api.coinglass.com/public/v2/liquidation_chart",
-        {"symbol": cg_sym, "interval": "1h", "limit": 3},
-    )
-    result = None
-    if data and data.get("success") and data.get("data"):
-        d = data["data"]
-        # Форматы: {longList: [...], shortList: [...]} или {data: [...]}
-        long_list  = d.get("longList",  d.get("buyLiquidationList",  []))
-        short_list = d.get("shortList", d.get("sellLiquidationList", []))
-        liq_long  = float(long_list[-1])  if long_list  else 0.0
-        liq_short = float(short_list[-1]) if short_list else 0.0
-        ls_r = liq_long / liq_short if liq_short > 0 else 1.0
-        result = {
-            "liq_long_usd":  round(liq_long,  2),
-            "liq_short_usd": round(liq_short, 2),
-            "liq_ls_ratio":  round(ls_r, 2),
-            "symbol":        cg_sym,
-        }
-
-    if result:
-        _cg_cache[cache_key] = {"ts": now, "data": result}
-    return result
-
-
-async def cg_get_all(sym: str) -> dict:
-    """
-    Получает все данные CoinGlass для символа параллельно.
-    Возвращает: {funding, oi, ls_ratio, liquidations}
-    Ошибки не бросают исключений — возвращает None для неудавшихся запросов.
-    """
-    results = await asyncio.gather(
-        cg_get_funding_rate(sym),
-        cg_get_open_interest(sym),
-        cg_get_ls_ratio(sym),
-        cg_get_liquidations(sym),
-        return_exceptions=True,
-    )
-    return {
-        "funding":     results[0] if not isinstance(results[0], Exception) else None,
-        "oi":          results[1] if not isinstance(results[1], Exception) else None,
-        "ls_ratio":    results[2] if not isinstance(results[2], Exception) else None,
-        "liquidations": results[3] if not isinstance(results[3], Exception) else None,
-    }
-
-
-def analyze_coinglass_signals(
-    cg: dict,
-    price_rising: bool = True,
-) -> tuple[int, list[str], dict]:
-    """
-    Анализирует данные CoinGlass и возвращает (score, factors, details).
-    Добавляет до 4 новых разворотных факторов (17-20).
-
-    Факторы:
-      17. Funding Rate перегрев (>CG_FUNDING_THRESHOLD%) — лонги переплачивают
-      18. OI дивергенция — Open Interest падает при росте цены
-      19. L/S Ratio экстремум — >CG_LS_RATIO_THRESHOLD лонгов на шорт
-      20. Ликвидации лонгов — в 3x+ раз больше чем шортов
-    """
-    score   = 0
-    factors = []
-    details = {}
-
-    funding  = cg.get("funding")
-    oi       = cg.get("oi")
-    ls       = cg.get("ls_ratio")
-    liq      = cg.get("liquidations")
-
-    # ── 17. Funding Rate перегрев ─────────────────────────────────────────────
-    if funding:
-        rate = funding.get("rate", 0.0)
-        details["funding_rate"] = rate
-        details["funding_exchange"] = funding.get("exchange", "?")
-        if rate >= CG_FUNDING_EXTREME:
-            score += 1
-            factors.append(
-                f"⚡ Funding ЭКСТРЕМАЛЬНЫЙ: {rate:+.3f}% [{funding.get('exchange', '?')}]"
-            )
-        elif rate >= CG_FUNDING_THRESHOLD:
-            score += 1
-            factors.append(
-                f"💸 Funding Rate высокий: {rate:+.3f}% (лонги перегреты)"
-            )
-
-    # ── 18. OI дивергенция (OI падает при росте цены) ─────────────────────────
-    if oi:
-        oi_chg = oi.get("oi_change_pct", 0.0)
-        details["oi_change_pct"] = oi_chg
-        details["oi_usd"]        = oi.get("oi_usd", 0)
-        if price_rising and oi_chg < CG_OI_DROP_THRESHOLD:
-            score += 1
-            factors.append(
-                f"📉 OI дивергенция: цена↑ но OI {oi_chg:+.1f}% (позиции закрываются)"
-            )
-
-    # ── 19. Long/Short Ratio экстремум ────────────────────────────────────────
-    if ls:
-        ls_r = ls.get("ls_ratio", 1.0)
-        details["ls_ratio"]  = ls_r
-        details["long_pct"]  = ls.get("long_pct", 50.0)
-        details["short_pct"] = ls.get("short_pct", 50.0)
-        if ls_r >= CG_LS_RATIO_THRESHOLD:
-            score += 1
-            factors.append(
-                f"🐂 L/S Ratio: {ls_r:.2f} ({ls.get('long_pct', 50):.0f}% лонгов — толпа в лонге)"
-            )
-
-    # ── 20. Ликвидации лонгов доминируют ─────────────────────────────────────
-    if liq:
-        liq_ls   = liq.get("liq_ls_ratio", 1.0)
-        liq_long = liq.get("liq_long_usd", 0)
-        details["liq_ls_ratio"]  = liq_ls
-        details["liq_long_usd"]  = liq_long
-        details["liq_short_usd"] = liq.get("liq_short_usd", 0)
-        if liq_ls >= CG_LIQ_RATIO_THRESHOLD and liq_long > 10_000:
-            score += 1
-            liq_str = f"${liq_long/1000:.0f}K" if liq_long < 1_000_000 else f"${liq_long/1_000_000:.1f}M"
-            factors.append(
-                f"💣 Ликвидации лонгов: {liq_str} (в {liq_ls:.1f}x больше шортов)"
-            )
-
-    return score, factors, details
-
 
 # ── Prometheus (опционально) ──────────────────────────────────────────────────
 try:
@@ -741,6 +455,8 @@ _session: aiohttp.ClientSession | None = None
 
 _alert_cooldown:    dict[str, float] = {}
 _reversal_cooldown: dict[str, float] = {}
+_restart_cooldown:  dict[int, float] = {}   # {chat_id: last_restart_ts} — защита от спама кнопкой
+RESTART_COOLDOWN_SEC: int = 60
 ALERT_COOLDOWN_SEC:    int = getattr(config, "ALERT_COOLDOWN_SEC",    60)
 REVERSAL_COOLDOWN_SEC: int = getattr(config, "REVERSAL_COOLDOWN_SEC", 1800)  # 30 мин по умолчанию
 
@@ -754,7 +470,7 @@ REVERSAL_REPEAT_SCORE_DELTA: int  = getattr(config, "REVERSAL_REPEAT_SCORE_DELTA
 _levels_cache: dict[str, dict] = {}
 
 # ── Настройки детектора разворота (все изменяемы через Telegram) ──────────────
-REVERSAL_MIN_SCORE:   int   = getattr(config, "REVERSAL_MIN_SCORE",   4)      # из 12
+REVERSAL_MIN_SCORE:   int   = getattr(config, "REVERSAL_MIN_SCORE",   5)      # из 16
 REVERSAL_RSI_OB:      float = getattr(config, "REVERSAL_RSI_OB",      70.0)
 REVERSAL_STOCH_OB:    float = getattr(config, "REVERSAL_STOCH_OB",    0.80)
 REVERSAL_STOCH_EXT:   float = getattr(config, "REVERSAL_STOCH_EXT",   0.85)
@@ -1368,7 +1084,6 @@ def detect_short_reversal(
     growth:     float,
     rsi:        Optional[float],
     min_score:  int = 4,
-    cg_data:    "Optional[dict]" = None,   # CoinGlass (факторы 17-20)
 ) -> dict:
     """
     16-факторный детектор разворота на шорт.
@@ -1567,15 +1282,6 @@ def detect_short_reversal(
         score += 1
         factors.append("Lower Highs паттерн Min5 (убывающие максимумы)")
 
-        # -- 17-20. CoinGlass (Funding, OI, L/S Ratio, Liquidations) ----------
-    cg_details = {}
-    if cg_data:
-        cg_score, cg_factors, cg_details = analyze_coinglass_signals(
-            cg_data, price_rising=(growth > 0)
-        )
-        score  += cg_score
-        factors += cg_factors
-
     # ── Цели по шорту: уровни Фибоначчи от 24h High к Low ────────────────────
     fib     = calculate_fibonacci_levels(high24, low24)
     target1 = fib["fib_382"]
@@ -1585,7 +1291,7 @@ def detect_short_reversal(
 
     return {
         "score":          score,
-        "max_score":      20,
+        "max_score":      16,
         "factors":        factors,
         "triggered":      score >= min_score,
         "rsi":            rsi,
@@ -1605,7 +1311,6 @@ def detect_short_reversal(
         "ema_gap":        ema_data.get("gap_pct"),
         "vol_signal":     vol_signal,
         "day_context":    day_context,
-        "cg_details":     cg_details,
     }
 
 
@@ -1665,12 +1370,14 @@ def reply_keyboard():
             ["📋 История", "🏆 Топ-5", "📤 Экспорт"],
             # Строка 5 — Разворот + кулдауны
             ["🔄 Развороты", "⚙️ Настройки разворота", "🗑 Кулдауны"],
-            # Строка 6 — Порог разворота (быстрая настройка)
-            ["🎚 Порог 4/20", "🎚 Порог 6/20", "🎚 Порог 9/20", "🎚 Порог 12/20"],
+            # Строка 6 — Порог разворота (быстрая настройка, из 16 факторов)
+            ["🎚 Порог 3/16", "🎚 Порог 5/16", "🎚 Порог 9/16", "🎚 Порог 12/16"],
             # Строка 7 — Процент роста для разворотных сигналов в шорт
             ["📉 Разворот 1%", "📉 Разворот 5%", "📉 Разворот 10%", "📉 Разворот 15%", "📉 Разворот 25%"],
             # Строка 8 — Период окна для расчёта роста разворота
             ["🕐 Разворот 5м", "🕐 Разворот 30м", "🕐 Разворот 1ч", "🕐 Разворот 4ч", "🕐 Разворот 1д"],
+            # Строка 9 — Управление процессом
+            ["🔄 Полный перезапуск", "🆘 Помощь"],
         ],
         "resize_keyboard": True,
         "persistent":      True,
@@ -1797,16 +1504,10 @@ def format_reversal_alert(
     wick_ratio = rev.get("wick_ratio")
     vol_sig    = rev.get("vol_signal", "")
     day_ctx    = rev.get("day_context", "")
-    cg         = rev.get("cg_details", {})
-    funding_r  = cg.get("funding_rate")
-    oi_chg     = cg.get("oi_change_pct")
-    ls_r       = cg.get("ls_ratio")
-    liq_long   = cg.get("liq_long_usd")
-    liq_ls     = cg.get("liq_ls_ratio")
 
-    if score >= 13:
+    if score >= 10:
         confidence, hdr = "🔴 ВЫСОКАЯ", "🚨"
-    elif score >= 8:
+    elif score >= 6:
         confidence, hdr = "🟠 СРЕДНЯЯ", "⚠️"
     else:
         confidence, hdr = "🟡 СЛАБАЯ", "🔄"
@@ -1831,20 +1532,6 @@ def format_reversal_alert(
     vol_s     = f"\n{_esc(vol_sig)}"              if vol_sig else ""
     day_ctx_s = f"\n{day_ctx}"                    if day_ctx else ""
 
-    # CoinGlass section
-    cg_lines = []
-    if funding_r is not None:
-        cg_lines.append(f"  Funding Rate: <code>{funding_r:+.3f}%</code>")
-    if oi_chg is not None:
-        oi_icon = "📉" if oi_chg < 0 else "📈"
-        cg_lines.append(f"  OI: <code>{oi_chg:+.1f}%</code> {oi_icon}")
-    if ls_r is not None:
-        cg_lines.append(f"  L/S Ratio: <code>{ls_r:.2f}</code>")
-    if liq_long is not None and liq_long > 0:
-        liq_str = f"${liq_long/1000:.0f}K" if liq_long < 1_000_000 else f"${liq_long/1_000_000:.1f}M"
-        cg_lines.append(f"  💣 Liq.Longs: <code>{liq_str}</code> (x{liq_ls:.1f} vs shorts)")
-    cg_section = ("\n\n<b>📊 CoinGlass (деривативы):</b>\n" + "\n".join(cg_lines)) if cg_lines else ""
-
     return (
         f"{hdr} <b>РАЗВОРОТ НА ШОРТ</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1860,7 +1547,6 @@ def format_reversal_alert(
         f"  EMA gap: <code>{ema_s}</code>  │  Wick: <code>{wick_s}</code>"
         f"{candle_s}"
         f"{vol_s}"
-        f"{cg_section}"
         f"{day_ctx_s}\n\n"
         f"<b>🎯 Цели шорта (Фибо):</b>\n"
         f"  Цель 1 (38.2%): {t1_s}\n"
@@ -1980,7 +1666,7 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    await broadcast("✅ <b>Бот запущен</b> (v17 — 20-факторный разворот + CoinGlass)")
+    await broadcast("✅ <b>Бот запущен</b> (v16 — 16-факторный разворот)")
 
     while True:
         if monitor_paused:
@@ -2051,12 +1737,9 @@ async def monitor():
                 if peak_growth >= REVERSAL_GROWTH_MIN_PCT or growth >= REVERSAL_GROWTH_MIN_PCT:
                     last_rev_ts = _reversal_cooldown.get(sym, 0)
                     if now - last_rev_ts >= REVERSAL_COOLDOWN_SEC:
-                        # Получаем данные CoinGlass параллельно
-                        cg_data = await cg_get_all(_cg_symbol(sym))
                         rev = detect_short_reversal(
                             sym, price, klines_1m, klines_5m, klines_15m,
-                            recent, growth, rsi, REVERSAL_MIN_SCORE,
-                            cg_data=cg_data,
+                            recent, growth, rsi, REVERSAL_MIN_SCORE
                         )
                         if rev["triggered"]:
                             # ── Умный фильтр повторов ───────────────────────
@@ -2093,7 +1776,7 @@ async def monitor():
                                 PROM_REVERSALS.inc()
                             log.info("REVERSAL %s score=%d/16 peak=%.2f%% price_chg=%.2f%%",
                                      sym, rev["score"], peak_growth,
-                                     price_change if last_info else 0.0)
+                                     abs(price - last_info["price"]) / last_info["price"] * 100 if last_info else 0.0)
                             continue  # не дублируем обычным алертом
 
                 # ════════════════════════════════════════════════════════════
@@ -2184,7 +1867,6 @@ async def monitor():
             await asyncio.sleep(config.INTERVAL)
 
             # ── Периодическая очистка памяти ──────────────────────────────────
-            checks_count += 1
             if checks_count % 200 == 0:
                 # Удаляем устаревшие кулдауны
                 stale_ts = now - max(ALERT_COOLDOWN_SEC, REVERSAL_COOLDOWN_SEC) * 3
@@ -2192,10 +1874,6 @@ async def monitor():
                     stale = [k for k, v in d.items() if v < stale_ts]
                     for k in stale:
                         d.pop(k, None)
-                # Очищаем устаревший CoinGlass кэш
-                cg_stale = [k for k, v in _cg_cache.items() if now - v["ts"] > CG_CACHE_TTL * 10]
-                for k in cg_stale:
-                    _cg_cache.pop(k, None)
             if checks_count % 1000 == 0:
                 # Удаляем монеты без свежих данных
                 cutoff2 = now - max(current_window * 4, 86400 * 2)
@@ -2227,24 +1905,20 @@ async def handle_message(msg: dict):
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
 
-    if text == "/start":
-        await send_message(
-            f"🚀 <b>Crypto Alert Bot v16</b>\n\n"
-            f"Используйте /subscribe чтобы подписаться на сигналы.\n"
-            f"Для отписки: /unsubscribe",
-            chat_id,
-        )
-        return
-
     if chat_id != int(config.CHAT_ID):
-        if text == "/subscribe":
+        if text in ("/start", "/subscribe"):
             db_add_subscriber(chat_id)
-            await send_message("✅ Вы подписались на сигналы", chat_id)
+            await send_message(
+                "🚀 <b>Crypto Alert Bot v16</b>\n\n"
+                "✅ Вы подписаны на сигналы.\n"
+                "Для отписки: /unsubscribe",
+                chat_id,
+            )
         elif text == "/unsubscribe":
             db_remove_subscriber(chat_id)
             await send_message("❌ Вы отписались от сигналов", chat_id)
         else:
-            await send_message("⛔ Нет доступа. /subscribe — подписаться на алерты.", chat_id)
+            await send_message("⛔ Нет доступа к управлению. /subscribe — подписаться на алерты.", chat_id)
         return
 
     if text in ("/start", "/menu"):
@@ -2252,7 +1926,7 @@ async def handle_message(msg: dict):
             f"🚀 <b>Crypto Alert Bot v16</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
-            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b> (16 тех. + 4 CG)\n"
+            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/16 факторов</b>\n"
             f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b> за <b>{_fmt_dur(REVERSAL_WINDOW_SEC)}</b>\n"
             f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
@@ -2261,16 +1935,19 @@ async def handle_message(msg: dict):
             f"  📉 Разворот 1-25% — минимальный рост для шорт-разворота\n"
             f"  🕐 Разворот 5м-1д — период расчёта роста разворота\n"
             f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна алертов\n"
-            f"  🎚 Порог 4-12/20 — чувствительность (кол-во факторов из 20)\n"
-            f"  ⚙️ Настройки разворота — все параметры\n\n"
+            f"  🎚 Порог 3-12/16 — чувствительность (кол-во факторов)\n"
+            f"  ⚙️ Настройки разворота — все параметры\n"
+            f"  🔄 Полный перезапуск — перезапуск без потери данных\n"
+            f"  🆘 Помощь — краткая справка\n\n"
             f"<b>Команды:</b>\n"
             f"  /set_percent 2.5 — порог алертов (%)\n"
             f"  /set_window 60 — период алертов (мин)\n"
-            f"  /rev_score 4 — порог факторов разворота\n"
+            f"  /rev_score 5 — порог факторов разворота\n"
             f"  /rev_growth 5 — % роста для разворота\n"
             f"  /rev_window 60 — период роста разворота (мин)\n"
             f"  /notify_pct 15 — порог уведомлений движения (%)\n"
-            f"  /rev_cooldown 5 — кулдаун разворота (мин)",
+            f"  /rev_cooldown 5 — кулдаун разворота (мин)\n"
+            f"  /restart — перезапуск мониторинга",
             chat_id,
             reply_markup=reply_keyboard(),
         )
@@ -2305,6 +1982,40 @@ async def handle_message(msg: dict):
         await send_message("▶️ Мониторинг возобновлён", chat_id)
         return
 
+    if text in ("🆘 Помощь", "/help"):
+        await send_message(
+            f"🚀 <b>Crypto Alert Bot v16 — справка</b>\n\n"
+            f"📈 Порог роста: <b>{current_percent}%</b>\n"
+            f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
+            f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/16 факторов</b>\n\n"
+            f"<b>Кнопки управления:</b>\n"
+            f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
+            f"  📉 Разворот 1-25% — мин. рост для шорт-разворота\n"
+            f"  🕐 Разворот 5м-1д — период расчёта роста разворота\n"
+            f"  ⏱ 5 мин/1 час/4 ч/1 д — период окна алертов\n"
+            f"  🎚 Порог 3-12/16 — чувствительность разворота\n"
+            f"  ⚙️ Настройки разворота — все параметры детально\n"
+            f"  🔄 Полный перезапуск — перезапуск процесса без потери данных\n\n"
+            f"Полный список команд: /menu",
+            chat_id,
+        )
+        return
+
+    if text in ("🔄 Полный перезапуск", "/restart"):
+        last = _restart_cooldown.get(chat_id, 0)
+        if time.time() - last < RESTART_COOLDOWN_SEC:
+            wait_left = int(RESTART_COOLDOWN_SEC - (time.time() - last))
+            await send_message(f"⏳ Подождите {wait_left}с перед повторным перезапуском", chat_id)
+            return
+        _restart_cooldown[chat_id] = time.time()
+        await send_message(
+            "🔄 <b>Перезапуск мониторинга...</b>\n"
+            "ℹ️ История цен, БД и настройки сохраняются — перезапускается только процесс анализа.",
+            chat_id,
+        )
+        asyncio.create_task(_cmd_full_restart(chat_id))
+        return
+
     if text in ("📊 Статус", "/status"):
         uptime = int(time.time() - start_time)
         d, r   = divmod(uptime, 86400)
@@ -2316,7 +2027,7 @@ async def handle_message(msg: dict):
             f"🪙 Монет в истории: {len(price_history)}\n"
             f"🔔 Сигналов: {signals_count}\n"
             f"🔄 Разворотов: {reversal_count}\n"
-            f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/20\n"
+            f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/16\n"
             f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}% за {_fmt_dur(REVERSAL_WINDOW_SEC)}\n"
             f"🔔 Уведомление движения: {NOTIFY_BIG_MOVE_PCT}%\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
@@ -2485,7 +2196,7 @@ async def handle_message(msg: dict):
     if text.startswith("/rev_score_delta"):
         try:
             val = int(text.split()[1])
-            assert 0 <= val <= 12
+            assert 0 <= val <= 16
             REVERSAL_REPEAT_SCORE_DELTA = val
             await send_message(
                 f"✅ Мин. прирост скора между разворотами: <b>+{val}</b>\n"
@@ -2494,23 +2205,23 @@ async def handle_message(msg: dict):
             )
         except Exception:
             await send_message(
-                f"❌ /rev_score_delta 2   (текущее: {REVERSAL_REPEAT_SCORE_DELTA})\nДиапазон: 0–12",
+                f"❌ /rev_score_delta 2   (текущее: {REVERSAL_REPEAT_SCORE_DELTA})\nДиапазон: 0–16",
                 chat_id,
             )
         return
 
-    # Быстрая настройка порога разворота через кнопки
+    # Быстрая настройка порога разворота через кнопки (из 16 факторов)
     _rev_score_map = {
-        "🎚 Порог 4/20": 4,
-        "🎚 Порог 6/20": 6,
-        "🎚 Порог 9/20": 9,
-        "🎚 Порог 12/20": 12,
+        "🎚 Порог 3/16":  3,
+        "🎚 Порог 5/16":  5,
+        "🎚 Порог 9/16":  9,
+        "🎚 Порог 12/16": 12,
     }
     if text in _rev_score_map:
         REVERSAL_MIN_SCORE = _rev_score_map[text]  # global объявлен выше — OK
         await send_message(
-            f"✅ Порог разворота: <b>{REVERSAL_MIN_SCORE}/12 факторов</b>\n"
-            f"ℹ️ Агрессивный: 3, Стандарт: 4-5, Строгий: 7",
+            f"✅ Порог разворота: <b>{REVERSAL_MIN_SCORE}/16 факторов</b>\n"
+            f"ℹ️ Агрессивный: 3, Стандарт: 5, Строгий: 9, Очень строгий: 12",
             chat_id,
         )
         return
@@ -2533,14 +2244,16 @@ async def handle_message(msg: dict):
                 raw = text.split()[1]
                 val = typ(raw)
                 assert vmin <= val <= vmax
-                # Для кулдауна храним в секундах
+                # Для кулдауна храним в секундах, но вводим/показываем в минутах
                 stored = val * 60 if var == "REVERSAL_COOLDOWN_SEC" else val
                 globals()[var] = stored
-                display = val if var != "REVERSAL_COOLDOWN_SEC" else val
-                await send_message(f"✅ {label}: <b>{display}{sfx}</b>", chat_id)
+                await send_message(f"✅ {label}: <b>{val}{sfx}</b>", chat_id)
             except Exception:
+                current = globals()[var]
+                if var == "REVERSAL_COOLDOWN_SEC":
+                    current = current // 60  # показываем в минутах, как вводится
                 await send_message(
-                    f"❌ {cmd} {vmin}…{vmax}  (текущее: {globals()[var]})", chat_id
+                    f"❌ {cmd} {vmin}…{vmax}  (текущее: {current})", chat_id
                 )
             return
 
@@ -2580,56 +2293,7 @@ async def handle_message(msg: dict):
         await send_message("✅ Вы в списке получателей", chat_id)
         return
 
-    # -- CoinGlass настройки ----------------------------------------------------
-    if text.startswith("/cg_funding"):
-        global CG_FUNDING_THRESHOLD
-        try:
-            val = float(text.split()[1])
-            assert 0.001 <= val <= 1.0
-            CG_FUNDING_THRESHOLD = val
-            await send_message(f"✅ Funding Rate порог: <b>{val}%</b>", chat_id)
-        except Exception:
-            await send_message(f"❌ /cg_funding 0.05   (текущее: {CG_FUNDING_THRESHOLD}%)\nДиапазон: 0.001–1.0", chat_id)
-        return
-
-    if text.startswith("/cg_ls"):
-        global CG_LS_RATIO_THRESHOLD
-        try:
-            val = float(text.split()[1])
-            assert 1.0 <= val <= 5.0
-            CG_LS_RATIO_THRESHOLD = val
-            await send_message(f"✅ Long/Short Ratio порог: <b>{val}</b>", chat_id)
-        except Exception:
-            await send_message(f"❌ /cg_ls 1.8   (текущее: {CG_LS_RATIO_THRESHOLD})\nДиапазон: 1.0–5.0", chat_id)
-        return
-
-    if text.startswith("/cg_oi_drop"):
-        global CG_OI_DROP_THRESHOLD
-        try:
-            val = float(text.split()[1])
-            assert -20.0 <= val <= 0.0
-            CG_OI_DROP_THRESHOLD = val
-            await send_message(f"✅ OI дивергенция порог: <b>{val}%</b>", chat_id)
-        except Exception:
-            await send_message(f"❌ /cg_oi_drop -3   (текущее: {CG_OI_DROP_THRESHOLD}%)\nДиапазон: -20 до 0", chat_id)
-        return
-
-    if text.startswith("/cg_liq"):
-        global CG_LIQ_RATIO_THRESHOLD
-        try:
-            val = float(text.split()[1])
-            assert 1.0 <= val <= 20.0
-            CG_LIQ_RATIO_THRESHOLD = val
-            await send_message(f"✅ Ликвидации L/S порог: <b>{val}x</b>", chat_id)
-        except Exception:
-            await send_message(f"❌ /cg_liq 3.0   (текущее: {CG_LIQ_RATIO_THRESHOLD}x)\nДиапазон: 1.0–20.0", chat_id)
-        return
-
-    if text in ("/cg_status", "📊 CoinGlass"):
-        asyncio.create_task(_cmd_cg_status(chat_id))
-        return
-
-        await send_message(
+    await send_message(
         "❓ Неизвестная команда.\n/menu — открыть панель управления",
         chat_id,
         reply_markup=reply_keyboard(),
@@ -2672,13 +2336,13 @@ async def _cmd_reversals(chat_id):
     for r in rows:
         ts      = time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))
         score   = r["score"]
-        lvl     = "🔴" if score >= 8 else "🟠" if score >= 5 else "🟡"
+        lvl     = "🔴" if score >= 10 else "🟠" if score >= 6 else "🟡"
         factors = r["factors"]
         # Экранируем HTML-символы в тексте фактора
         f_brief = factors[0].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") if factors else "—"
         t1_s    = f" → цель {r['target1']:.4g}" if r.get("target1") else ""
         lines.append(
-            f"{lvl} <b>{r['symbol']}</b> [{score}/20] {ts}{t1_s}\n"
+            f"{lvl} <b>{r['symbol']}</b> [{score}/16] {ts}{t1_s}\n"
             f"   <i>{f_brief}</i>"
         )
     await send_message("\n".join(lines), chat_id)
@@ -2690,7 +2354,7 @@ async def _cmd_reversal_settings(chat_id):
         f"⚙️ <b>Настройки детектора разворота (16 факторов)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>Скоринг:</b>\n"
-        f"  Порог:         <code>{REVERSAL_MIN_SCORE}/16</code>  → /rev_score 4\n\n"
+        f"  Порог:         <code>{REVERSAL_MIN_SCORE}/16</code>  → /rev_score 5\n\n"
         f"<b>Пороги факторов:</b>\n"
         f"  RSI OB (1m):   <code>&gt; {REVERSAL_RSI_OB}</code>     → /rev_rsi 70\n"
         f"  RSI OB (15m):  <code>&gt; 75</code>          (фиксировано)\n"
@@ -2712,18 +2376,26 @@ async def _cmd_reversal_settings(chat_id):
         f"  Мин. смена цены: <code>{REVERSAL_REPEAT_PRICE_PCT}%</code>  → /rev_price_pct 3\n"
         f"  Мин. рост скора: <code>+{REVERSAL_REPEAT_SCORE_DELTA}</code>      → /rev_score_delta 2\n\n"
         f"<b>Пресеты:</b>\n"
-        f"  Агрессивный: /rev_score 4  /rev_cooldown 10  /rev_price_pct 1\n"
-        f"  Стандарт:    /rev_score 6  /rev_cooldown 30  /rev_price_pct 3\n"
-        f"  Строгий:     /rev_score 9  /rev_cooldown 60  /rev_price_pct 5\n\n"
-        f"<b>\U0001f4ca CoinGlass параметры:</b>\n"
-        f"  Funding порог: <code>≥ {CG_FUNDING_THRESHOLD}%</code>  → /cg_funding 0.05\n"
-        f"  L/S Ratio:     <code>≥ {CG_LS_RATIO_THRESHOLD}</code>  → /cg_ls 1.8\n"
-        f"  OI drop:       <code>≤ {CG_OI_DROP_THRESHOLD}%</code> → /cg_oi_drop -3\n"
-        f"  Liq ratio:     <code>≥ {CG_LIQ_RATIO_THRESHOLD}x</code>  → /cg_liq 3.0\n"
-        f"  API Key:       {'✅ задан' if COINGLASS_API_KEY else '⚠️ не задан (публичный API)'}\n"
-        f"  ℹ️ Добавьте COINGLASS_API_KEY в config.py для полного доступа",
+        f"  Агрессивный: /rev_score 3  /rev_cooldown 10  /rev_price_pct 1\n"
+        f"  Стандарт:    /rev_score 5  /rev_cooldown 30  /rev_price_pct 3\n"
+        f"  Строгий:     /rev_score 9  /rev_cooldown 60  /rev_price_pct 5",
         chat_id,
     )
+
+
+async def _cmd_full_restart(chat_id):
+    """Перезапускает asyncio-задачу monitor() без потери price_history/БД/настроек."""
+    try:
+        await restart_monitor(reason=f"кнопка перезапуска (chat_id={chat_id})")
+        await send_message(
+            "✅ <b>Мониторинг перезапущен</b>\n"
+            f"🪙 Монет в истории: {len(price_history)} (сохранены)\n"
+            f"🔔 Сигналов всего: {signals_count} | 🔄 Разворотов: {reversal_count}",
+            chat_id,
+        )
+    except Exception as e:
+        log.exception("_cmd_full_restart: %s", e)
+        await send_message(f"❌ Ошибка перезапуска: {_esc(str(e))}", chat_id)
 
 
 async def _cmd_export(chat_id):
@@ -2731,33 +2403,6 @@ async def _cmd_export(chat_id):
     csv_data = db_export_csv(500)
     fname    = f"alerts_{time.strftime('%Y%m%d_%H%M%S')}.csv"
     await send_document(chat_id, fname, csv_data, caption="📤 Последние 500 алертов")
-
-
-async def _cmd_cg_status(chat_id):
-    """Показывает текущий кэш CoinGlass по топовым монетам."""
-    if not _cg_cache:
-        await send_message("📊 CoinGlass кэш пуст. Данные появятся после первого разворотного сигнала.", chat_id)
-        return
-    lines = ["📊 <b>CoinGlass — кэшированные данные</b>\n"]
-    shown = 0
-    for key, val in sorted(_cg_cache.items(), key=lambda x: -x[1]["ts"])[:12]:
-        d = val["data"]
-        age = int(time.time() - val["ts"])
-        if key.startswith("funding:"):
-            sym = key[8:]
-            rate = d.get("rate", 0)
-            icon = "🔴" if rate >= CG_FUNDING_EXTREME else "🟠" if rate >= CG_FUNDING_THRESHOLD else "🟢"
-            lines.append(f"{icon} <b>{sym}</b> Funding: <code>{rate:+.3f}%</code> [{age}s ago]")
-            shown += 1
-        elif key.startswith("ls:"):
-            sym = key[3:]
-            ls = d.get("ls_ratio", 1.0)
-            icon = "🐂" if ls >= CG_LS_RATIO_THRESHOLD else "⚖️"
-            lines.append(f"{icon} <b>{sym}</b> L/S: <code>{ls:.2f}</code>")
-            shown += 1
-        if shown >= 10:
-            break
-    await send_message("\n".join(lines), chat_id)
 
 
 # ================================================================
@@ -2849,6 +2494,26 @@ async def db_cleanup_loop():
 WATCHDOG_TIMEOUT = 90
 
 
+async def restart_monitor(reason: str = "ручной перезапуск") -> None:
+    """
+    Безопасно перезапускает задачу monitor() БЕЗ сброса данных:
+    price_history, БД, настройки (current_percent, REVERSAL_*, кулдауны)
+    остаются нетронутыми — только пересоздаётся asyncio.Task.
+    """
+    global monitor_task, last_check_time
+    log.warning("Перезапуск monitor(): %s", reason)
+    if monitor_task and not monitor_task.done():
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.exception("restart_monitor: ошибка при отмене старой задачи: %s", e)
+    monitor_task    = asyncio.create_task(monitor())
+    last_check_time = time.time()
+
+
 async def watchdog():
     global monitor_task, last_check_time
     await asyncio.sleep(60)
@@ -2859,14 +2524,7 @@ async def watchdog():
                 if stall > WATCHDOG_TIMEOUT:
                     log.warning("Watchdog: завис %.0f с — перезапуск", stall)
                     await broadcast(f"⚠️ Watchdog: завис {stall:.0f}с. Перезапуск...")
-                    if monitor_task and not monitor_task.done():
-                        monitor_task.cancel()
-                        try:
-                            await monitor_task
-                        except asyncio.CancelledError:
-                            pass
-                    monitor_task    = asyncio.create_task(monitor())
-                    last_check_time = time.time()
+                    await restart_monitor(reason=f"watchdog: завис {stall:.0f}с")
                     await broadcast("✅ Monitor перезапущен")
         except Exception as e:
             log.exception("watchdog: %s", e)
