@@ -1,9 +1,52 @@
 """
-Crypto Alert Bot — v19
-Защита от двойного запуска (409 Conflict).
+Crypto Alert Bot — v20
+Полный аудит файла от начала до конца. Исправлен корень проблемы 409 Conflict
+на Railway, перекалиброваны уровни уверенности под 20 факторов.
 
 ═══════════════════════════════════════════════════════
- НОВОЕ v19
+ НОВОЕ v20 — ПОЛНЫЙ АУДИТ
+═══════════════════════════════════════════════════════
+• telegram_loop(): ГЛАВНЫЙ ФИКС. При ошибке getUpdates (в т.ч. 409 Conflict)
+  бот раньше повторял запрос немедленно — пауза была всего 0.2с независимо
+  от результата. При конфликте двух инстансов (например, во время
+  Railway-редеплоя, когда старый и новый контейнер на короткое время
+  работают одновременно) это означало ~5 запросов/сек к getUpdates,
+  что НЕ давало конфликту разрешиться и забивало логи бесконечными 409.
+  Теперь при ошибке включается экспоненциальный backoff: 1с → 2с → 4с →
+  ... → потолок 30с. Как только Telegram снова отвечает ok=true — backoff
+  сразу сбрасывается на 1с. Это не убирает 409 полностью (если второй
+  процесс реально жив), но даёт системе шанс на саморазрешение и не
+  усугубляет конфликт активным спамом запросов.
+• telegram_loop(): после 10 ошибок подряд бот один раз (не на каждую
+  ошибку) шлёт владельцу предупреждение через sendMessage — этот метод
+  НЕ конфликтует с getUpdates, поэтому сообщение дойдёт даже во время
+  активного 409-конфликта на long-polling. Текст прямо объясняет, что
+  нужно искать второй процесс с тем же BOT_TOKEN (другой сервер/
+  Railway-сервис/локальный запуск), а не молча копить ошибки в логах.
+• ВАЖНО про single-instance lock (bot.lock, добавлен в v19): этот лок
+  на уровне ОС защищает только от двух процессов В ОДНОМ контейнере/
+  файловой системе. На Railway каждый деплой — это отдельный контейнер
+  с собственным диском, поэтому bot.lock одного контейнера НЕ видит
+  bot.lock другого. Если 409 идёт постоянно (не только в момент
+  редеплоя) — следует искать дублирующий Railway-сервис/проект или
+  локально запущенный процесс с тем же токеном, lock здесь не поможет
+  и не должен восприниматься как полная защита от cross-container
+  конфликтов.
+• format_reversal_alert и _cmd_reversals: уровни уверенности (🔴🟠🟡)
+  были откалиброваны под старый максимум в 16 факторов (10/16≈62%,
+  6/16≈37%) и не пересчитаны при добавлении факторов 17-20 в v18.
+  Из-за этого 10/20 (всего 50% сработавших факторов) ошибочно
+  показывалось как "ВЫСОКАЯ" уверенность. Пересчитано пропорционально
+  под 20: высокая ≥12 (60%), средняя ≥7 (35%), слабая <7.
+• handle_message: версия бота в приветственных сообщениях (/menu,
+  /help, автоподписка для не-владельца) была захардкожена как "v16"
+  ещё с ранних версий и не обновлялась — исправлено на v19/v20 по месту.
+• detect_short_reversal: убрана мёртвая инициализация stoch_rsi_val=None
+  в начале фактора 1, которая немедленно перезаписывалась в факторе 2 —
+  не баг, но лишний код, могущий ввести в заблуждение при чтении.
+
+═══════════════════════════════════════════════════════
+ v19 — ИСТОРИЯ ИЗМЕНЕНИЙ
 ═══════════════════════════════════════════════════════
 • Single-instance lock через fcntl.flock на файл bot.lock (путь
   настраивается через config.LOCK_FILE). Раньше при случайном запуске
@@ -1240,7 +1283,6 @@ def detect_short_reversal(
     prices_15m = closes_15m if len(closes_15m) >= 20 else prices_5m
 
     # ── 1. RSI перекупленность (Min1) ──────────────────────────────────────────
-    stoch_rsi_val = None
     if rsi is not None and rsi > REVERSAL_RSI_OB:
         score += 1
         factors.append(f"RSI перекуплен ({rsi:.1f} &gt; {REVERSAL_RSI_OB}) Min1")
@@ -1655,9 +1697,9 @@ def format_reversal_alert(
     vol_sig    = rev.get("vol_signal", "")
     day_ctx    = rev.get("day_context", "")
 
-    if score >= 10:
+    if score >= 12:
         confidence, hdr = "🔴 ВЫСОКАЯ", "🚨"
-    elif score >= 6:
+    elif score >= 7:
         confidence, hdr = "🟠 СРЕДНЯЯ", "⚠️"
     else:
         confidence, hdr = "🟡 СЛАБАЯ", "🔄"
@@ -2059,7 +2101,7 @@ async def handle_message(msg: dict):
         if text in ("/start", "/subscribe"):
             db_add_subscriber(chat_id)
             await send_message(
-                "🚀 <b>Crypto Alert Bot v16</b>\n\n"
+                "🚀 <b>Crypto Alert Bot v19</b>\n\n"
                 "✅ Вы подписаны на сигналы.\n"
                 "Для отписки: /unsubscribe",
                 chat_id,
@@ -2073,7 +2115,7 @@ async def handle_message(msg: dict):
 
     if text in ("/start", "/menu"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v16</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v19</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
@@ -2134,7 +2176,7 @@ async def handle_message(msg: dict):
 
     if text in ("🆘 Помощь", "/help"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v16 — справка</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v19 — справка</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n\n"
@@ -2489,7 +2531,7 @@ async def _cmd_reversals(chat_id):
     for r in rows:
         ts      = time.strftime("%d.%m %H:%M", time.localtime(r["ts"]))
         score   = r["score"]
-        lvl     = "🔴" if score >= 10 else "🟠" if score >= 6 else "🟡"
+        lvl     = "🔴" if score >= 12 else "🟠" if score >= 7 else "🟡"
         factors = r["factors"]
         # Экранируем HTML-символы в тексте фактора
         f_brief = factors[0].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") if factors else "—"
@@ -2567,7 +2609,8 @@ async def _cmd_export(chat_id):
 #  TELEGRAM LOOP
 # ================================================================
 
-async def get_updates() -> list:
+async def get_updates() -> tuple[list, bool]:
+    """Возвращает (updates, ok). ok=False при ошибке (включая 409 Conflict)."""
     global offset
     try:
         async with _session.get(
@@ -2580,29 +2623,64 @@ async def get_updates() -> list:
             results = data["result"]
             if results:
                 log.info("get_updates: получено %d обновлений, offset=%s", len(results), offset)
-            return results
+            return results, True
         else:
             log.warning("get_updates not ok: %s", data)
+            return [], False
     except Exception as e:
         log.error("get_updates: %s", e)
-    return []
+        return [], False
 
 
 async def telegram_loop():
     global offset
+    # При ошибках (включая 409 Conflict) делаем экспоненциальный backoff,
+    # вместо мгновенного повтора каждые 0.2с. Без этого бот при конфликте
+    # двух инстансов бомбардирует Telegram запросами ~5 раз в секунду,
+    # что не даёт конфликту разрешиться и забивает логи.
+    backoff_sec      = 1.0
+    BACKOFF_MAX      = 30.0
+    consecutive_409  = 0
+    CONFLICT_WARN_EVERY = 10  # предупреждать в чат не на каждой ошибке, а раз в N подряд
+
     while True:
         try:
-            updates = await get_updates()
-            for update in updates:
-                offset = update["update_id"] + 1
-                log.info("UPDATE: %s", update)
-                if "message" in update:
-                    asyncio.create_task(handle_message(update["message"]))
-                elif "callback_query" in update:
-                    asyncio.create_task(handle_message(update["callback_query"]["message"]))
+            updates, ok = await get_updates()
+            if ok:
+                if backoff_sec != 1.0 or consecutive_409 > 0:
+                    log.info("get_updates восстановлен после %d ошибок подряд", consecutive_409)
+                backoff_sec     = 1.0
+                consecutive_409 = 0
+                for update in updates:
+                    offset = update["update_id"] + 1
+                    log.info("UPDATE: %s", update)
+                    if "message" in update:
+                        asyncio.create_task(handle_message(update["message"]))
+                    elif "callback_query" in update:
+                        asyncio.create_task(handle_message(update["callback_query"]["message"]))
+                await asyncio.sleep(0.2)
+            else:
+                consecutive_409 += 1
+                if consecutive_409 == CONFLICT_WARN_EVERY:
+                    # Шлём владельцу предупреждение один раз, не на каждую ошибку,
+                    # чтобы не заспамить чат при длительном конфликте инстансов.
+                    try:
+                        await send_message(
+                            "⚠️ <b>Постоянный 409 Conflict от Telegram</b>\n"
+                            f"Уже {consecutive_409} ошибок подряд.\n"
+                            "Похоже, где-то ещё запущен второй процесс этого бота "
+                            "с тем же токеном (другой сервер/Railway-сервис/локальный запуск). "
+                            "Найдите и остановите дублирующий инстанс.",
+                            int(config.CHAT_ID),
+                        )
+                    except Exception:
+                        pass  # если и эта отправка не проходит — не критично, увидим в логах
+                await asyncio.sleep(backoff_sec)
+                backoff_sec = min(BACKOFF_MAX, backoff_sec * 2)
         except Exception as e:
             log.exception("telegram_loop: %s", e)
-        await asyncio.sleep(0.2)
+            await asyncio.sleep(backoff_sec)
+            backoff_sec = min(BACKOFF_MAX, backoff_sec * 2)
 
 
 # ================================================================
