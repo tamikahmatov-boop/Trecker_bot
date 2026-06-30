@@ -696,6 +696,12 @@ async def _fetch_mexc_klines(symbol: str, interval: str = "Min1", limit: int = K
             params={"symbol": symbol, "interval": interval, "limit": limit},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
+            if r.content_type != "application/json":
+                log.debug(
+                    "MEXC kline %s %s: unexpected content-type %s (status %s)",
+                    symbol, interval, r.content_type, r.status,
+                )
+                return empty
             data = await r.json()
         if data.get("success") and data.get("data"):
             d = data["data"]
@@ -1897,6 +1903,13 @@ async def _fetch_mexc(norm: dict) -> tuple[dict, dict]:
             "https://contract.mexc.com/api/v1/contract/ticker",
             timeout=aiohttp.ClientTimeout(total=5),
         ) as r:
+            if r.content_type != "application/json":
+                body = await r.text()
+                log.error(
+                    "MEXC: unexpected content-type %s (status %s), body[:200]=%r",
+                    r.content_type, r.status, body[:200],
+                )
+                return prices, sources
             data = await r.json()
         if data.get("success"):
             for item in data["data"]:
@@ -3031,7 +3044,15 @@ async def main():
             log.warning("Prometheus failed: %s", e)
 
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    default_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+    }
+    async with aiohttp.ClientSession(connector=connector, headers=default_headers) as session:
         _session     = session
         monitor_task = asyncio.create_task(monitor())
 
