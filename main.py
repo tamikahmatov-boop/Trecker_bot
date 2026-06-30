@@ -696,12 +696,6 @@ async def _fetch_mexc_klines(symbol: str, interval: str = "Min1", limit: int = K
             params={"symbol": symbol, "interval": interval, "limit": limit},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
-            if r.content_type != "application/json":
-                log.debug(
-                    "MEXC kline %s %s: unexpected content-type %s (status %s)",
-                    symbol, interval, r.content_type, r.status,
-                )
-                return empty
             data = await r.json()
         if data.get("success") and data.get("data"):
             d = data["data"]
@@ -1903,13 +1897,6 @@ async def _fetch_mexc(norm: dict) -> tuple[dict, dict]:
             "https://contract.mexc.com/api/v1/contract/ticker",
             timeout=aiohttp.ClientTimeout(total=5),
         ) as r:
-            if r.content_type != "application/json":
-                body = await r.text()
-                log.error(
-                    "MEXC: unexpected content-type %s (status %s), body[:200]=%r",
-                    r.content_type, r.status, body[:200],
-                )
-                return prices, sources
             data = await r.json()
         if data.get("success"):
             for item in data["data"]:
@@ -1955,198 +1942,6 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
 #  MONITOR
 # ================================================================
 
-# ================================================================
-#  ОБРАБОТКА ОДНОЙ МОНЕТЫ (вынесено для конкурентной обработки —
-#  чтобы уведомления слались сразу по готовности, не дожидаясь
-#  последовательного перебора всех остальных монет)
-# ================================================================
-
-# Сколько монет обрабатываем одновременно (ограничивает параллельные HTTP-запросы к MEXC)
-MONITOR_CONCURRENCY: int = getattr(config, "MONITOR_CONCURRENCY", 25)
-
-
-async def _process_one_symbol(sym: str, price: float, now: float, source: str) -> None:
-    global signals_count, reversal_count
-
-    if price <= 0:
-        return
-
-    hist = price_history.setdefault(sym, [])
-    hist.append((now, price))
-    cutoff = max(current_window * 2, 86400)
-    price_history[sym] = [(t, p) for t, p in hist if now - t <= cutoff]
-
-    recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
-
-    if len(recent) < MIN_SAMPLES:
-        return
-
-    old_price = recent[0][1]
-    if old_price <= 0:
-        return
-
-    growth    = (price - old_price) / old_price * 100
-    direction = 1 if growth > 0 else -1
-
-    # ── Свечи MEXC: 3 таймфрейма параллельно ──────────────────────
-    mexc_sym    = _to_mexc_symbol(sym)
-    klines_all  = await get_mexc_klines_multi(mexc_sym)
-    klines_1m   = klines_all["klines_1m"]
-    klines_5m   = klines_all["klines_5m"]
-    klines_15m  = klines_all["klines_15m"]
-    closes      = klines_1m["closes"]
-
-    rsi = calculate_rsi(closes) if closes else None
-    if rsi is None:
-        vals = [p for _, p in price_history[sym][-120:]]
-        rsi  = calculate_rsi(vals)
-
-    # ════════════════════════════════════════════════════════════
-    #  БЛОК 1: РАЗВОРОТ НА ШОРТ
-    #  Условие: пиковый рост за REVERSAL_WINDOW_SEC >= REVERSAL_GROWTH_MIN_PCT
-    #  Фильтр дублей: кулдаун + смена цены + рост скора
-    # ════════════════════════════════════════════════════════════
-    peak_growth = get_peak_growth(sym, price, REVERSAL_WINDOW_SEC)
-    if peak_growth >= REVERSAL_GROWTH_MIN_PCT or growth >= REVERSAL_GROWTH_MIN_PCT:
-        last_rev_ts = _reversal_cooldown.get(sym, 0)
-        if now - last_rev_ts >= REVERSAL_COOLDOWN_SEC:
-            rsi_reversal_val = await get_rsi_for_tf(mexc_sym, RSI_REVERSAL_TF)
-            rev = detect_short_reversal(
-                sym, price, klines_1m, klines_5m, klines_15m,
-                recent, growth, rsi, REVERSAL_MIN_SCORE,
-                rsi_reversal_tf=rsi_reversal_val,
-                rsi_reversal_tf_label=RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF),
-            )
-            if rev["triggered"]:
-                # ── Умный фильтр повторов ───────────────────────
-                last_info = _reversal_last.get(sym)
-                if last_info:
-                    price_change = abs(price - last_info["price"]) / last_info["price"] * 100
-                    score_delta  = rev["score"] - last_info["score"]
-                    # Пропускаем если: цена почти не изменилась И скор не вырос значительно
-                    if (price_change < REVERSAL_REPEAT_PRICE_PCT
-                            and score_delta < REVERSAL_REPEAT_SCORE_DELTA):
-                        log.debug(
-                            "REVERSAL skip %s: price_chg=%.2f%% score_delta=%d",
-                            sym, price_change, score_delta,
-                        )
-                        return
-                # ── Отправляем сигнал ───────────────────────────
-                duration = calculate_growth_duration(recent)
-                rev_text = format_reversal_alert(
-                    sym, price, max(growth, peak_growth), source, rev,
-                    duration_sec=duration,
-                    window_sec=REVERSAL_WINDOW_SEC,
-                )
-                _reversal_cooldown[sym] = now
-                _reversal_last[sym] = {"price": price, "score": rev["score"], "ts": now}
-                db_save_reversal(
-                    sym, price, rev["score"], rev["factors"],
-                    rev["rsi"], rev["macd_hist"],
-                    rev["stoch_rsi"], rev["bb_pct"],
-                    rev["atr"], rev["target1"], rev["target2"], source,
-                )
-                await broadcast(rev_text)
-                reversal_count += 1
-                if PROM_AVAILABLE:
-                    PROM_REVERSALS.inc()
-                log.info("REVERSAL %s score=%d/20 peak=%.2f%% price_chg=%.2f%%",
-                         sym, rev["score"], peak_growth,
-                         abs(price - last_info["price"]) / last_info["price"] * 100 if last_info else 0.0)
-                return  # не дублируем обычным алертом
-
-    # ════════════════════════════════════════════════════════════
-    #  БЛОК 1.5: УВЕДОМЛЕНИЕ О БОЛЬШОМ РОСТЕ / ПАДЕНИИ (15% и т.п.)
-    # ════════════════════════════════════════════════════════════
-    if NOTIFY_BIG_MOVE_PCT > 0 and abs(growth) >= NOTIFY_BIG_MOVE_PCT:
-        last_notif = _notify_cooldown.get(sym, 0)
-        if now - last_notif >= NOTIFY_BIG_MOVE_COOLDOWN_SEC:
-            direction_emoji = "🚀" if growth > 0 else "📉"
-            move_label = "РОСТ" if growth > 0 else "ПАДЕНИЕ"
-            rsi_str = f"{rsi:.1f}" if rsi is not None else "—"
-            dur_str = _fmt_dur(calculate_growth_duration(recent))
-            notif_text = (
-                f"🔔 <b>КРУПНОЕ ДВИЖЕНИЕ — {move_label}</b>\n\n"
-                f"🪙 <b>{sym}</b>  [{source}]\n"
-                f"💵 Цена: <code>{price}</code>\n"
-                f"{direction_emoji} {move_label}: <b>{growth:+.2f}%</b> "
-                f"за {dur_str}\n"
-                f"📊 RSI: <code>{rsi_str}</code>\n\n"
-                f"📋 <code>{sym}</code> #большое_движение"
-            )
-            _notify_cooldown[sym] = now
-            await broadcast(notif_text)
-            log.info("BigMove notify: %s %+.2f%%", sym, growth)
-
-    # ════════════════════════════════════════════════════════════
-    #  БЛОК 2: ОБЫЧНЫЕ АЛЕРТЫ (РОСТ / ПАДЕНИЕ)
-    # ════════════════════════════════════════════════════════════
-    if abs(growth) < current_percent:
-        level = _cache_get_level(sym)
-        if level and level["direction"] != direction:
-            _cache_clear_level(sym)
-        return
-
-    # RSI-фильтр направления (настраиваемый ТФ и порог "не меньше" через кнопки)
-    rsi_filter_val = rsi if RSI_SIGNAL_TF == "Min1" else await get_rsi_for_tf(mexc_sym, RSI_SIGNAL_TF)
-    if rsi_filter_val is not None:
-        if direction == 1 and rsi_filter_val < RSI_SIGNAL_LEVEL:
-            return
-        if direction == -1 and rsi_filter_val > (100 - RSI_SIGNAL_LEVEL):
-            return
-
-    last_sent = _alert_cooldown.get(sym, 0)
-    if now - last_sent < ALERT_COOLDOWN_SEC:
-        return
-
-    level = _cache_get_level(sym)
-    if level:
-        prev_price = level["alert_price"]
-        prev_dir   = level["direction"]
-        if prev_dir == direction:
-            if abs(price - prev_price) / prev_price * 100 < current_percent:
-                return
-
-    vals      = [p for _, p in price_history[sym][-120:]]
-    macd_data = calculate_macd_full(vals)
-    macd      = macd_data["histogram"]
-    # RSI-тренд из уже загруженных свечей — не делаем лишний HTTP запрос
-    rsi_trend = calculate_rsi_trend(closes) if len(closes) >= 17 else None
-    accel     = calculate_acceleration(recent)
-    duration  = calculate_growth_duration(recent)
-    breakout  = check_24h_breakout(sym, price)
-    day_ctx   = get_24h_context(sym, price)
-
-    rsi_tf_label_show = RSI_TF_LABELS.get(RSI_SIGNAL_TF) if RSI_SIGNAL_TF != "Min1" else None
-    if direction == 1:
-        text = format_growth_alert(
-            sym, price, growth, rsi, macd, source,
-            rsi_trend=rsi_trend, accel=accel,
-            duration_sec=duration, breakout=breakout, day_context=day_ctx,
-            rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
-            rsi_tf_level=RSI_SIGNAL_LEVEL if rsi_tf_label_show else None,
-        )
-    else:
-        text = format_drop_alert(
-            sym, price, growth, rsi, macd, source,
-            rsi_trend=rsi_trend, duration_sec=duration,
-            breakout=breakout, day_context=day_ctx,
-            rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
-            rsi_tf_level=RSI_SIGNAL_LEVEL if rsi_tf_label_show else None,
-        )
-
-    _cache_set_level(sym, price, direction)
-    _alert_cooldown[sym] = now
-    db_save_alert(sym, price, growth, rsi, macd, source)
-    await broadcast(text)
-    signals_count += 1
-
-    if PROM_AVAILABLE:
-        PROM_SIGNALS.inc()
-
-    log.info("Signal: %s %+.2f%% [%s]", sym, growth, source)
-
-
 async def monitor():
     global current_percent, current_window, signals_count, reversal_count, checks_count, last_check_time
     global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT
@@ -2180,27 +1975,187 @@ async def monitor():
 
             prices, sources = await get_prices(symbols)
 
-            # ── Конкурентная обработка монет ───────────────────────────────
-            # Раньше монеты проверялись строго последовательно (await за
-            # await на каждую), из-за чего при сотнях монет уведомление по
-            # 50-й монете могло прийти на десятки секунд позже, чем по 1-й,
-            # а вся следующая итерация мониторинга начиналась ещё позже.
-            # Теперь все монеты обрабатываются параллельно (с ограничением
-            # MONITOR_CONCURRENCY одновременных запросов к MEXC), и каждое
-            # уведомление отправляется сразу же, как только готово —
-            # не дожидаясь обработки остальных монет.
-            sem = asyncio.Semaphore(MONITOR_CONCURRENCY)
+            for sym, price in prices.items():
+                await asyncio.sleep(0)
 
-            async def _bounded(sym: str, price: float) -> None:
-                async with sem:
-                    try:
-                        await _process_one_symbol(sym, price, now, sources.get(sym, "UNKNOWN"))
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        log.exception("process_symbol %s: %s", sym, e)
+                if price <= 0:
+                    continue
 
-            await asyncio.gather(*(_bounded(sym, price) for sym, price in prices.items()))
+                hist = price_history.setdefault(sym, [])
+                hist.append((now, price))
+                cutoff = max(current_window * 2, 86400)
+                price_history[sym] = [(t, p) for t, p in hist if now - t <= cutoff]
+
+                recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
+                source = sources.get(sym, "UNKNOWN")
+
+                if len(recent) < MIN_SAMPLES:
+                    continue
+
+                old_price = recent[0][1]
+                if old_price <= 0:
+                    continue
+
+                growth    = (price - old_price) / old_price * 100
+                direction = 1 if growth > 0 else -1
+
+                # ── Свечи MEXC: 3 таймфрейма параллельно ──────────────────────
+                mexc_sym    = _to_mexc_symbol(sym)
+                klines_all  = await get_mexc_klines_multi(mexc_sym)
+                klines_1m   = klines_all["klines_1m"]
+                klines_5m   = klines_all["klines_5m"]
+                klines_15m  = klines_all["klines_15m"]
+                closes      = klines_1m["closes"]
+
+                rsi = calculate_rsi(closes) if closes else None
+                if rsi is None:
+                    vals = [p for _, p in price_history[sym][-120:]]
+                    rsi  = calculate_rsi(vals)
+
+                # ════════════════════════════════════════════════════════════
+                #  БЛОК 1: РАЗВОРОТ НА ШОРТ
+                #  Условие: пиковый рост за REVERSAL_WINDOW_SEC >= REVERSAL_GROWTH_MIN_PCT
+                #  Фильтр дублей: кулдаун + смена цены + рост скора
+                # ════════════════════════════════════════════════════════════
+                peak_growth = get_peak_growth(sym, price, REVERSAL_WINDOW_SEC)
+                if peak_growth >= REVERSAL_GROWTH_MIN_PCT or growth >= REVERSAL_GROWTH_MIN_PCT:
+                    last_rev_ts = _reversal_cooldown.get(sym, 0)
+                    if now - last_rev_ts >= REVERSAL_COOLDOWN_SEC:
+                        rsi_reversal_val = await get_rsi_for_tf(mexc_sym, RSI_REVERSAL_TF)
+                        rev = detect_short_reversal(
+                            sym, price, klines_1m, klines_5m, klines_15m,
+                            recent, growth, rsi, REVERSAL_MIN_SCORE,
+                            rsi_reversal_tf=rsi_reversal_val,
+                            rsi_reversal_tf_label=RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF),
+                        )
+                        if rev["triggered"]:
+                            # ── Умный фильтр повторов ───────────────────────
+                            last_info = _reversal_last.get(sym)
+                            if last_info:
+                                price_change = abs(price - last_info["price"]) / last_info["price"] * 100
+                                score_delta  = rev["score"] - last_info["score"]
+                                # Пропускаем если: цена почти не изменилась И скор не вырос значительно
+                                if (price_change < REVERSAL_REPEAT_PRICE_PCT
+                                        and score_delta < REVERSAL_REPEAT_SCORE_DELTA):
+                                    log.debug(
+                                        "REVERSAL skip %s: price_chg=%.2f%% score_delta=%d",
+                                        sym, price_change, score_delta,
+                                    )
+                                    continue
+                            # ── Отправляем сигнал ───────────────────────────
+                            duration = calculate_growth_duration(recent)
+                            rev_text = format_reversal_alert(
+                                sym, price, max(growth, peak_growth), source, rev,
+                                duration_sec=duration,
+                                window_sec=REVERSAL_WINDOW_SEC,
+                            )
+                            _reversal_cooldown[sym] = now
+                            _reversal_last[sym] = {"price": price, "score": rev["score"], "ts": now}
+                            db_save_reversal(
+                                sym, price, rev["score"], rev["factors"],
+                                rev["rsi"], rev["macd_hist"],
+                                rev["stoch_rsi"], rev["bb_pct"],
+                                rev["atr"], rev["target1"], rev["target2"], source,
+                            )
+                            await broadcast(rev_text)
+                            reversal_count += 1
+                            if PROM_AVAILABLE:
+                                PROM_REVERSALS.inc()
+                            log.info("REVERSAL %s score=%d/20 peak=%.2f%% price_chg=%.2f%%",
+                                     sym, rev["score"], peak_growth,
+                                     abs(price - last_info["price"]) / last_info["price"] * 100 if last_info else 0.0)
+                            continue  # не дублируем обычным алертом
+
+                # ════════════════════════════════════════════════════════════
+                #  БЛОК 1.5: УВЕДОМЛЕНИЕ О БОЛЬШОМ РОСТЕ / ПАДЕНИИ (15% и т.п.)
+                # ════════════════════════════════════════════════════════════
+                if NOTIFY_BIG_MOVE_PCT > 0 and abs(growth) >= NOTIFY_BIG_MOVE_PCT:
+                    last_notif = _notify_cooldown.get(sym, 0)
+                    if now - last_notif >= NOTIFY_BIG_MOVE_COOLDOWN_SEC:
+                        direction_emoji = "🚀" if growth > 0 else "📉"
+                        move_label = "РОСТ" if growth > 0 else "ПАДЕНИЕ"
+                        rsi_str = f"{rsi:.1f}" if rsi is not None else "—"
+                        dur_str = _fmt_dur(calculate_growth_duration(recent))
+                        notif_text = (
+                            f"🔔 <b>КРУПНОЕ ДВИЖЕНИЕ — {move_label}</b>\n\n"
+                            f"🪙 <b>{sym}</b>  [{source}]\n"
+                            f"💵 Цена: <code>{price}</code>\n"
+                            f"{direction_emoji} {move_label}: <b>{growth:+.2f}%</b> "
+                            f"за {dur_str}\n"
+                            f"📊 RSI: <code>{rsi_str}</code>\n\n"
+                            f"📋 <code>{sym}</code> #большое_движение"
+                        )
+                        _notify_cooldown[sym] = now
+                        await broadcast(notif_text)
+                        log.info("BigMove notify: %s %+.2f%%", sym, growth)
+
+                # ════════════════════════════════════════════════════════════
+                #  БЛОК 2: ОБЫЧНЫЕ АЛЕРТЫ (РОСТ / ПАДЕНИЕ)
+                # ════════════════════════════════════════════════════════════
+                if abs(growth) < current_percent:
+                    level = _cache_get_level(sym)
+                    if level and level["direction"] != direction:
+                        _cache_clear_level(sym)
+                    continue
+
+                # RSI-фильтр направления (настраиваемый ТФ и порог "не меньше" через кнопки)
+                rsi_filter_val = rsi if RSI_SIGNAL_TF == "Min1" else await get_rsi_for_tf(mexc_sym, RSI_SIGNAL_TF)
+                if rsi_filter_val is not None:
+                    if direction == 1 and rsi_filter_val < RSI_SIGNAL_LEVEL:
+                        continue
+                    if direction == -1 and rsi_filter_val > (100 - RSI_SIGNAL_LEVEL):
+                        continue
+
+                last_sent = _alert_cooldown.get(sym, 0)
+                if now - last_sent < ALERT_COOLDOWN_SEC:
+                    continue
+
+                level = _cache_get_level(sym)
+                if level:
+                    prev_price = level["alert_price"]
+                    prev_dir   = level["direction"]
+                    if prev_dir == direction:
+                        if abs(price - prev_price) / prev_price * 100 < current_percent:
+                            continue
+
+                vals      = [p for _, p in price_history[sym][-120:]]
+                macd_data = calculate_macd_full(vals)
+                macd      = macd_data["histogram"]
+                # RSI-тренд из уже загруженных свечей — не делаем лишний HTTP запрос
+                rsi_trend = calculate_rsi_trend(closes) if len(closes) >= 17 else None
+                accel     = calculate_acceleration(recent)
+                duration  = calculate_growth_duration(recent)
+                breakout  = check_24h_breakout(sym, price)
+                day_ctx   = get_24h_context(sym, price)
+
+                rsi_tf_label_show = RSI_TF_LABELS.get(RSI_SIGNAL_TF) if RSI_SIGNAL_TF != "Min1" else None
+                if direction == 1:
+                    text = format_growth_alert(
+                        sym, price, growth, rsi, macd, source,
+                        rsi_trend=rsi_trend, accel=accel,
+                        duration_sec=duration, breakout=breakout, day_context=day_ctx,
+                        rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
+                        rsi_tf_level=RSI_SIGNAL_LEVEL if rsi_tf_label_show else None,
+                    )
+                else:
+                    text = format_drop_alert(
+                        sym, price, growth, rsi, macd, source,
+                        rsi_trend=rsi_trend, duration_sec=duration,
+                        breakout=breakout, day_context=day_ctx,
+                        rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
+                        rsi_tf_level=RSI_SIGNAL_LEVEL if rsi_tf_label_show else None,
+                    )
+
+                _cache_set_level(sym, price, direction)
+                _alert_cooldown[sym] = now
+                db_save_alert(sym, price, growth, rsi, macd, source)
+                await broadcast(text)
+                signals_count += 1
+
+                if PROM_AVAILABLE:
+                    PROM_SIGNALS.inc()
+
+                log.info("Signal: %s %+.2f%% [%s]", sym, growth, source)
 
             await asyncio.sleep(config.INTERVAL)
 
@@ -3044,15 +2999,7 @@ async def main():
             log.warning("Prometheus failed: %s", e)
 
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
-    default_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-    }
-    async with aiohttp.ClientSession(connector=connector, headers=default_headers) as session:
+    async with aiohttp.ClientSession(connector=connector) as session:
         _session     = session
         monitor_task = asyncio.create_task(monitor())
 
