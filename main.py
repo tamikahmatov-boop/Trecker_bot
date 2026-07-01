@@ -1,7 +1,36 @@
 """
-Crypto Alert Bot — v22
-Оптимизация слоя БД: переиспользуемое SQLite-соединение вместо
-открытия/закрытия нового на каждый запрос.
+Crypto Alert Bot — v23
+Добавлена кнопка полного вкл/выкл жёсткого RSI-гейта (порог + ТФ) для
+разворотных сигналов. Полный построчный аудит файла, исправлена
+мёртвая/некорректная формула в алерте падения.
+
+═══════════════════════════════════════════════════════
+ НОВОЕ v23
+═══════════════════════════════════════════════════════
+• 🔄🚦 RSI разворота ВЫКЛ / 🔄🚦 RSI разворота ВКЛ — новая пара кнопок (флаг
+  RSI_REVERSAL_FILTER_ENABLED). До этого REVERSAL_RSI_OB/RSI_REVERSAL_TF были
+  ЖЁСТКИМ гейтом: разворотный сигнал не проверялся вообще (даже 20 факторов
+  не считались), пока RSI на выбранном ТФ не достигал порога — независимо от
+  score. Кнопка ВЫКЛ полностью снимает это условие: решение принимает только
+  REVERSAL_MIN_SCORE из факторов.
+• При выключенном гейте пропускается доп. HTTP-запрос get_rsi_for_tf() на
+  RSI_REVERSAL_TF (экономия сети на каждой проверке потенциального
+  разворота). Фактор 15 (один из 20) при этом не исчезает — падает на
+  встроенный fallback (RSI по Min15 из уже загруженных klines_15m).
+• _rsi_reversal_status_line(): аналог _rsi_signal_status_line, но для
+  гейта разворота — используется в /menu, 🆘 Помощь, /status и
+  ⚙️ Настройки разворота вместо дублирования условной логики.
+• БАГ: format_drop_alert() показывал для алертов ПАДЕНИЯ строку
+  "(порог ≤100-уровень)" — формула, не отражающая никакую реальную логику
+  фильтрации (RSI-порог в принципе не применяется к падению, только к
+  росту). На практике не проявлялся, т.к. вызывающий код всегда передавал
+  rsi_tf_level=None, но формула оставалась мёртвым и вводящим в заблуждение
+  кодом. Убрана — теперь для падения показывается только значение RSI, без
+  придуманного порога.
+• Полный построчный аудит файла (все ~50 функций) на предмет багов —
+  новых проблем, помимо вышеуказанной, не найдено; логика инициализации
+  БД/кэша, cooldown-фильтров, очистки памяти и обработки сигналов
+  подтверждена корректной.
 
 ═══════════════════════════════════════════════════════
  НОВОЕ v22
@@ -713,6 +742,14 @@ RSI_SIGNAL_LEVEL: float = getattr(config, "RSI_SIGNAL_LEVEL", 50.0)     # "не 
 RSI_SIGNAL_FILTER_ENABLED: bool = getattr(config, "RSI_SIGNAL_FILTER_ENABLED", True)
 # Для разворотных сигналов (фактор 15 + переопределяет REVERSAL_RSI_OB по выбранному ТФ):
 RSI_REVERSAL_TF:  str   = getattr(config, "RSI_REVERSAL_TF",  "Min15")
+# Вкл/выкл жёсткого RSI-гейта разворота (кнопка 🔄🚦). Когда выключен —
+# реверсивный сигнал больше не блокируется требованием "RSI на выбранном ТФ
+# >= REVERSAL_RSI_OB перед тем, как вообще считать 20 факторов": решение
+# принимается только по REVERSAL_MIN_SCORE из самих факторов. Также пропускает
+# доп. HTTP-запрос get_rsi_for_tf() на RSI_REVERSAL_TF — фактор 15 при этом не
+# исчезает, а падает на свой встроенный fallback (RSI по Min15 из уже
+# загруженных klines_15m, без сети).
+RSI_REVERSAL_FILTER_ENABLED: bool = getattr(config, "RSI_REVERSAL_FILTER_ENABLED", True)
 
 # Минимальный % роста за период для проверки разворота на шорт (кнопки 1/5/10/15/25%)
 REVERSAL_GROWTH_MIN_PCT: float = getattr(config, "REVERSAL_GROWTH_MIN_PCT", 5.0)
@@ -1709,6 +1746,16 @@ def _rsi_signal_status_line(bold: bool = True) -> str:
     return f"ТФ {tf}, порог ≥{RSI_SIGNAL_LEVEL}"
 
 
+def _rsi_reversal_status_line(bold: bool = True) -> str:
+    """То же самое, но для жёсткого RSI-гейта разворота (RSI_REVERSAL_TF / REVERSAL_RSI_OB)."""
+    if not RSI_REVERSAL_FILTER_ENABLED:
+        return "<b>ВЫКЛЮЧЕН</b>" if bold else "ВЫКЛЮЧЕН"
+    tf = RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)
+    if bold:
+        return f"ТФ <b>{tf}</b>, порог ≥<b>{REVERSAL_RSI_OB}</b>"
+    return f"ТФ {tf}, порог ≥{REVERSAL_RSI_OB}"
+
+
 def reply_keyboard():
     return {
         "keyboard": [
@@ -1741,6 +1788,8 @@ def reply_keyboard():
             ["🔄📊 RSI ТФ 5м", "🔄📊 RSI ТФ 15м", "🔄📊 RSI ТФ 1ч", "🔄📊 RSI ТФ 4ч", "🔄📊 RSI ТФ 12ч", "🔄📊 RSI ТФ 1д"],
             # Строка 14 — RSI разворота: порог "не меньше"
             ["🔄📊 RSI ≥50", "🔄📊 RSI ≥60", "🔄📊 RSI ≥70", "🔄📊 RSI ≥80", "🔄📊 RSI ≥90", "🔄📊 RSI ≥95"],
+            # Строка 15 — RSI-гейт разворота: вкл/выкл (полностью отключает порог+ТФ)
+            ["🔄🚦 RSI разворота ВЫКЛ", "🔄🚦 RSI разворота ВКЛ"],
         ],
         "resize_keyboard": True,
         "persistent":      True,
@@ -1843,8 +1892,11 @@ def format_drop_alert(
 
     rsi_tf_s = ""
     if rsi_tf_label and rsi_tf_val is not None:
-        lvl_s = f" (порог ≤{100 - rsi_tf_level:g})" if rsi_tf_level is not None else ""
-        rsi_tf_s = f"\n📊 RSI {rsi_tf_label}: <code>{rsi_tf_val:.1f}</code>{lvl_s}"
+        # Для падения порога RSI не существует в принципе (фильтр действует
+        # только на рост) — показываем чистое значение без "порога", без
+        # придуманной формулы "100 - уровень", которая раньше тут стояла и
+        # никогда не отражала реальную логику фильтрации.
+        rsi_tf_s = f"\n📊 RSI {rsi_tf_label}: <code>{rsi_tf_val:.1f}</code>"
 
     return (
         f"{emoji} <b>ПАДЕНИЕ</b>\n\n"
@@ -2048,7 +2100,7 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    await broadcast("✅ <b>Бот запущен</b> (v22 — 20-факторный разворот)")
+    await broadcast("✅ <b>Бот запущен</b> (v23 — 20-факторный разворот)")
 
     while True:
         if monitor_paused:
@@ -2119,18 +2171,26 @@ async def monitor():
                 if peak_growth >= REVERSAL_GROWTH_MIN_PCT or growth >= REVERSAL_GROWTH_MIN_PCT:
                     last_rev_ts = _reversal_cooldown.get(sym, 0)
                     if now - last_rev_ts >= REVERSAL_COOLDOWN_SEC:
-                        rsi_reversal_val = await get_rsi_for_tf(mexc_sym, RSI_REVERSAL_TF)
-
-                        # ── Жёсткий гейт по RSI разворота (кнопки 🔄📊) ──────────
+                        # ── Жёсткий гейт по RSI разворота (кнопки 🔄📊 / 🔄🚦) ──
                         # Полностью НЕЗАВИСИМ от 20-факторной системы score:
                         # разворотный сигнал в принципе не рассматривается, пока
                         # RSI на выбранном таймфрейме не достигнет порога (>=).
                         # Это доп. условие, а не замена факторам — сами factors
                         # по-прежнему считаются и влияют на confidence/REVERSAL_MIN_SCORE.
-                        rsi_reversal_gate = (
-                            rsi_reversal_val is not None
-                            and rsi_reversal_val >= REVERSAL_RSI_OB
-                        )
+                        # Если гейт выключен кнопкой 🔄🚦 — пропускаем сам HTTP-запрос
+                        # за RSI на RSI_REVERSAL_TF (экономия сети) и не блокируем
+                        # сигнал; фактор 15 внутри detect_short_reversal при этом не
+                        # исчезает — падает на встроенный fallback (RSI по Min15 из
+                        # уже загруженных klines_15m, без доп. сети).
+                        if RSI_REVERSAL_FILTER_ENABLED:
+                            rsi_reversal_val = await get_rsi_for_tf(mexc_sym, RSI_REVERSAL_TF)
+                            rsi_reversal_gate = (
+                                rsi_reversal_val is not None
+                                and rsi_reversal_val >= REVERSAL_RSI_OB
+                            )
+                        else:
+                            rsi_reversal_val = None
+                            rsi_reversal_gate = True
 
                         rev = detect_short_reversal(
                             sym, price, klines_1m, klines_5m, klines_15m,
@@ -2315,6 +2375,7 @@ async def handle_message(msg: dict):
     global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT, REVERSAL_WINDOW_SEC
     global REVERSAL_REPEAT_PRICE_PCT, REVERSAL_REPEAT_SCORE_DELTA
     global RSI_SIGNAL_TF, RSI_SIGNAL_LEVEL, RSI_REVERSAL_TF, RSI_SIGNAL_FILTER_ENABLED
+    global RSI_REVERSAL_FILTER_ENABLED
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -2323,7 +2384,7 @@ async def handle_message(msg: dict):
         if text in ("/start", "/subscribe"):
             db_add_subscriber(chat_id)
             await send_message(
-                "🚀 <b>Crypto Alert Bot v22</b>\n\n"
+                "🚀 <b>Crypto Alert Bot v23</b>\n\n"
                 "✅ Вы подписаны на сигналы.\n"
                 "Для отписки: /unsubscribe",
                 chat_id,
@@ -2337,14 +2398,14 @@ async def handle_message(msg: dict):
 
     if text in ("/start", "/menu"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v22</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v23</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
             f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b> за <b>{_fmt_dur(REVERSAL_WINDOW_SEC)}</b>\n"
             f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
             f"📊 RSI-фильтр РОСТА: {_rsi_signal_status_line()} (падение — без порога, только значение)\n"
-            f"🔄📊 RSI-гейт разворота: ТФ <b>{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}</b>, порог ≥<b>{REVERSAL_RSI_OB}</b> (не зависит от 20 факторов)\n"
+            f"🔄📊 RSI-гейт разворота: {_rsi_reversal_status_line()} (не зависит от 20 факторов)\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
@@ -2357,6 +2418,8 @@ async def handle_message(msg: dict):
             f"  📊 RSI ТФ 5м-1д — таймфрейм RSI для сигнала РОСТА\n"
             f"  📊 RSI ≥50-95 — порог RSI: уведомление о РОСТЕ только если RSI ≥ порога. "
             f"На ПАДЕНИЕ порог не действует — RSI просто показывается в сообщении\n"
+            f"  🔄🚦 RSI разворота ВЫКЛ/ВКЛ — полностью отключить/включить "
+            f"жёсткий RSI-гейт разворота (порог и его ТФ)\n"
             f"  🔄📊 RSI ТФ 5м-1д — таймфрейм RSI-гейта разворота\n"
             f"  🔄📊 RSI ≥50-95 — порог RSI-гейта разворота: уведомление о развороте "
             f"приходит, только если RSI на выбранном ТФ ≥ порога — НЕЗАВИСИМО от "
@@ -2409,12 +2472,12 @@ async def handle_message(msg: dict):
 
     if text in ("🆘 Помощь", "/help"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v22 — справка</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v23 — справка</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
             f"📊 RSI РОСТА: {_rsi_signal_status_line()} (падение — без порога)\n"
-            f"🔄📊 RSI-гейт разворота: ТФ <b>{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}</b>, ≥<b>{REVERSAL_RSI_OB}</b> (вне факторов)\n\n"
+            f"🔄📊 RSI-гейт разворота: {_rsi_reversal_status_line()} (вне факторов)\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
             f"  📉 Разворот 1-25% — мин. рост для шорт-разворота\n"
@@ -2423,6 +2486,7 @@ async def handle_message(msg: dict):
             f"  🎚 Порог 3-12/20 — чувствительность разворота\n"
             f"  🚦 RSI-фильтр ВЫКЛ/ВКЛ — отключить/включить RSI-проверку роста/падения\n"
             f"  📊 RSI ТФ / RSI ≥ — таймфрейм и порог RSI для РОСТА (на падение не влияет)\n"
+            f"  🔄🚦 RSI разворота ВЫКЛ/ВКЛ — отключить/включить жёсткий RSI-гейт разворота\n"
             f"  🔄📊 RSI ТФ / RSI ≥ — таймфрейм и порог жёсткого RSI-гейта разворота\n"
             f"  ⚙️ Настройки разворота — все параметры детально\n"
             f"  🔄 Полный перезапуск — перезапуск процесса без потери данных\n\n"
@@ -2461,7 +2525,7 @@ async def handle_message(msg: dict):
             f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}% за {_fmt_dur(REVERSAL_WINDOW_SEC)}\n"
             f"🔔 Уведомление движения: {NOTIFY_BIG_MOVE_PCT}%\n"
             f"📊 RSI сигналов: {_rsi_signal_status_line(bold=False)}\n"
-            f"🔄📊 RSI разворота: ТФ {RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}, порог >{REVERSAL_RSI_OB}\n"
+            f"🔄📊 RSI разворота: {_rsi_reversal_status_line(bold=False)}\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
             f"📈 Порог роста: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n"
@@ -2725,6 +2789,32 @@ async def handle_message(msg: dict):
         )
         return
 
+    # ── RSI-гейт РАЗВОРОТА: вкл/выкл ────────────────────────────────────────────
+    if text == "🔄🚦 RSI разворота ВЫКЛ":
+        RSI_REVERSAL_FILTER_ENABLED = False
+        await send_message(
+            "✅ RSI-гейт РАЗВОРОТА: <b>ВЫКЛЮЧЕН</b>\n"
+            "ℹ️ Разворотный сигнал больше не блокируется требованием "
+            "\"RSI на выбранном ТФ ≥ порога\" — решение принимает только "
+            "REVERSAL_MIN_SCORE из 20 факторов. Доп. запрос к бирже за RSI на "
+            "отдельном ТФ теперь пропускается; фактор 15 при этом не исчезает — "
+            "использует свой запасной расчёт RSI по Min15 из уже загруженных "
+            "данных (без сети).",
+            chat_id,
+        )
+        return
+
+    if text == "🔄🚦 RSI разворота ВКЛ":
+        RSI_REVERSAL_FILTER_ENABLED = True
+        await send_message(
+            f"✅ RSI-гейт РАЗВОРОТА: <b>ВКЛЮЧЕН</b>\n"
+            f"ℹ️ {_rsi_reversal_status_line()} — жёсткое условие, независимое "
+            f"от 20 факторов: разворот проверяется, только если RSI на "
+            f"выбранном ТФ достиг порога.",
+            chat_id,
+        )
+        return
+
     # ── RSI-фильтр РАЗВОРОТА: таймфрейм (отдельно от обычных сигналов) ────────
     _rsi_rev_tf_map = {
         "🔄📊 RSI ТФ 5м":  "Min5",
@@ -2737,13 +2827,15 @@ async def handle_message(msg: dict):
     if text in _rsi_rev_tf_map:
         RSI_REVERSAL_TF = _rsi_rev_tf_map[text]
         lbl = RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)
+        off_hint = ("\n⚠️ Гейт сейчас ВЫКЛЮЧЕН (🔄🚦) — ТФ сохранён, но не применяется."
+                    if not RSI_REVERSAL_FILTER_ENABLED else "")
         await send_message(
             f"✅ ТФ RSI-гейта разворота: <b>{lbl}</b>\n"
             f"ℹ️ Это жёсткое условие, НЕЗАВИСИМОЕ от 20 факторов разворота: "
             f"уведомление о развороте отправляется, только если RSI на ТФ {lbl} "
             f"≥ порога. Если условие не выполнено — разворот не проверяется вообще, "
             f"даже если факторы набрали высокий score.\n"
-            f"Текущий порог: ≥{REVERSAL_RSI_OB}",
+            f"Текущий порог: ≥{REVERSAL_RSI_OB}{off_hint}",
             chat_id,
         )
         return
@@ -2755,13 +2847,15 @@ async def handle_message(msg: dict):
     }
     if text in _rsi_rev_lvl_map:
         REVERSAL_RSI_OB = _rsi_rev_lvl_map[text]  # global объявлен выше — OK
+        off_hint = ("\n⚠️ Гейт сейчас ВЫКЛЮЧЕН (🔄🚦) — порог сохранён, но не применяется."
+                    if not RSI_REVERSAL_FILTER_ENABLED else "")
         await send_message(
             f"✅ Порог RSI-гейта разворота: <b>≥{REVERSAL_RSI_OB}</b>\n"
             f"ℹ️ Жёсткое условие, независимое от 20 факторов: уведомление о "
             f"развороте приходит, только если RSI на ТФ "
             f"{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)} ≥ {REVERSAL_RSI_OB}. "
             f"Также по-прежнему влияет на факторы 1 (Min1) и 15 (старший ТФ) "
-            f"внутри 20-факторного score.",
+            f"внутри 20-факторного score.{off_hint}",
             chat_id,
         )
         return
@@ -2895,11 +2989,13 @@ async def _cmd_reversal_settings(chat_id):
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<b>Скоринг:</b>\n"
         f"  Порог:         <code>{REVERSAL_MIN_SCORE}/20</code>  → /rev_score 5\n\n"
-        f"<b>RSI-гейт разворота (НЕЗАВИСИМ от факторов, обязателен):</b>\n"
-        f"  Порог:  <code>≥ {REVERSAL_RSI_OB}</code> на ТФ "
-        f"<code>{RSI_TF_LABELS.get(RSI_REVERSAL_TF, RSI_REVERSAL_TF)}</code>  → кнопки 🔄📊 RSI ТФ / RSI ≥\n"
-        f"  Без выполнения этого условия разворотный сигнал не отправляется, "
-        f"даже при высоком score.\n\n"
+        f"<b>RSI-гейт разворота (НЕЗАВИСИМ от факторов):</b>\n"
+        f"  Статус: {_rsi_reversal_status_line()}  → кнопки 🔄🚦 RSI разворота ВЫКЛ/ВКЛ\n"
+        f"  ТФ и порог:  → кнопки 🔄📊 RSI ТФ / RSI ≥\n"
+        f"  Пока гейт включён — без выполнения этого условия разворотный сигнал "
+        f"не отправляется, даже при высоком score. Кнопкой 🔄🚦 можно полностью "
+        f"отключить проверку и порог/ТФ — тогда решение принимают только "
+        f"20 факторов.\n\n"
         f"<b>Пороги факторов:</b>\n"
         f"  RSI OB (1m):   <code>&gt; {REVERSAL_RSI_OB}</code>     → /rev_rsi 70\n"
         f"  StochRSI:      <code>&gt; {REVERSAL_STOCH_OB}</code>   → /rev_stoch 0.80\n"
