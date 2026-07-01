@@ -3132,6 +3132,7 @@ async def main():
         except Exception as e:
             log.warning("Не удалось отправить стартовое сообщение: %s", e)
 
+        shutdown_task = asyncio.create_task(_shutdown_event.wait())
         tasks = [
             monitor_task,
             asyncio.create_task(telegram_loop()),
@@ -3139,10 +3140,41 @@ async def main():
             asyncio.create_task(save_state_loop()),
             asyncio.create_task(db_cleanup_loop()),
             asyncio.create_task(watchdog()),
-            asyncio.create_task(_shutdown_event.wait()),
+            shutdown_task,
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        # graceful=True  → завершение запросил SIGTERM/SIGINT (штатная остановка/
+        #                   редеплой на Railway) — внешний while True не должен
+        #                   перезапускать процесс, иначе SIGTERM никогда не даст
+        #                   контейнеру закрыться чисто и Railway придётся его
+        #                   убивать по SIGKILL после таймаута.
+        # graceful=False → завершился один из фоновых тасков сам по себе — это
+        #                   НЕНОРМАЛЬНО (раньше падало молча: asyncio.wait не
+        #                   поднимает исключение из done-таска, если его явно не
+        #                   проверить, поэтому monitor()/telegram_loop() и т.п.
+        #                   могли упасть, всё тихо сворачивалось и стартовало
+        #                   заново без единой строки в логах и без паузы —
+        #                   именно так бот мог выглядеть как "не работает
+        #                   постоянно" / "засыпает" при частых сбоях).
+        graceful = shutdown_task in done
+        if not graceful:
+            for t in done:
+                if t is shutdown_task:
+                    continue
+                if t.cancelled():
+                    continue
+                exc = t.exception()
+                if exc:
+                    log.error("Фоновый таск упал с исключением — это и есть причина внезапного рестарта:", exc_info=exc)
+                else:
+                    log.error("Фоновый таск завершился сам по себе (return вместо бесконечного цикла) — тоже приводит к рестарту всего бота")
+            try:
+                await broadcast("⚠️ Один из фоновых процессов упал — бот перезапускается автоматически.")
+            except Exception:
+                pass
+
         log.info("Завершение...")
         for t in pending:
             if not t.done():
@@ -3150,6 +3182,7 @@ async def main():
         await asyncio.gather(*pending, return_exceptions=True)
 
     log.info("Бот остановлен")
+    return graceful
 
 
 # ── Захватываем single-instance lock ОДИН раз на весь процесс, ДО входа
@@ -3160,7 +3193,19 @@ acquire_single_instance_lock()
 try:
     while True:
         try:
-            asyncio.run(main())
+            graceful = asyncio.run(main())
+            if graceful:
+                # Штатная остановка по SIGTERM/SIGINT (например, редеплой или
+                # ручная остановка на Railway) — процесс должен реально
+                # завершиться, а не запускаться заново сам на себя.
+                log.info("Штатная остановка — процесс завершается")
+                break
+            # Один из фоновых тасков упал/вышел неожиданно (см. лог выше) —
+            # ведём себя так же, как при необработанном исключении: пауза,
+            # чтобы не уйти в горячий цикл рестартов, если сбой повторяется
+            # на каждой итерации (например, сразу после старта).
+            log.warning("Внутренний перезапуск после сбоя фонового таска — пауза 10с")
+            time.sleep(10)
         except KeyboardInterrupt:
             break
         except Exception as e:
