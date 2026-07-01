@@ -1,7 +1,27 @@
 """
-Crypto Alert Bot — v21
-Добавлена кнопка полного вкл/выкл RSI-фильтра (порог + ТФ) для сигналов
-роста/падения. Исправлены забытые хардкоды версии (v17/v19 → v21).
+Crypto Alert Bot — v22
+Оптимизация слоя БД: переиспользуемое SQLite-соединение вместо
+открытия/закрытия нового на каждый запрос.
+
+═══════════════════════════════════════════════════════
+ НОВОЕ v22
+═══════════════════════════════════════════════════════
+• db_connect(): раньше открывал НОВОЕ sqlite3-соединение (+ заново выставлял
+  PRAGMA journal_mode/synchronous) на КАЖДЫЙ вызов — db_save_alert,
+  db_get_alert_level, db_set_alert_level и т.д. Теперь используется одно
+  переиспользуемое соединение (_get_shared_db_conn), которое открывается
+  один раз и живёт всё время работы процесса — меньше файлового I/O на
+  каждую операцию с БД, особенно заметно при частых алертах/разворотах.
+• db_vacuum() сознательно НЕ переиспользует общее соединение: она
+  выполняется в отдельном потоке через run_in_executor, и делить один
+  sqlite3.Connection между этим потоком и основным event-loop потоком
+  небезопасно — у неё теперь своё независимое короткоживущее соединение.
+• db_close(): новая функция, закрывает общее соединение (сбрасывает WAL на
+  диск) при штатной остановке процесса — вызывается в finally-блоке рядом
+  с release_single_instance_lock().
+• Логика проверена изолированными функциональными тестами (переиспользование
+  соединения, commit/rollback, параллельный VACUUM, close/reopen) — все
+  сценарии отработали корректно.
 
 ═══════════════════════════════════════════════════════
  НОВОЕ v21
@@ -329,21 +349,47 @@ def release_single_instance_lock() -> None:
 
 DB_FILE = "alerts.db"
 
+# Единое переиспользуемое соединение для всех обращений из основного
+# event-loop потока. Раньше db_connect() открывал НОВОЕ соединение (+ заново
+# выставлял PRAGMA) на каждый вызов db_save_alert/db_get_alert_level/...,
+# хотя вызовы идут последовательно из одного и того же потока — соединение
+# можно спокойно переиспользовать. db_vacuum() сюда сознательно НЕ входит:
+# она выполняется в отдельном потоке через run_in_executor и открывает
+# отдельное соединение, чтобы не делить один sqlite3.Connection между двумя
+# потоками одновременно.
+_db_conn: sqlite3.Connection | None = None
+
+
+def _get_shared_db_conn() -> sqlite3.Connection:
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=10)
+        _db_conn.row_factory = sqlite3.Row
+        _db_conn.execute("PRAGMA journal_mode=WAL")
+        _db_conn.execute("PRAGMA synchronous=NORMAL")
+    return _db_conn
+
 
 @contextmanager
 def db_connect():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn = _get_shared_db_conn()
     try:
         yield conn
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    finally:
-        conn.close()
+
+
+def db_close():
+    """Закрывает общее соединение при штатной остановке процесса (сбрасывает WAL)."""
+    global _db_conn
+    if _db_conn is not None:
+        try:
+            _db_conn.close()
+        except Exception as e:
+            log.warning("db_close: %s", e)
+        _db_conn = None
 
 
 def db_init():
@@ -490,8 +536,16 @@ def db_cleanup() -> dict:
 
 
 def db_vacuum():
-    with db_connect() as conn:
+    # Намеренно НЕ использует общее соединение (_get_shared_db_conn): эта
+    # функция вызывается через run_in_executor в отдельном потоке, и делить
+    # один sqlite3.Connection между этим потоком и основным event-loop
+    # потоком, которые могут работать параллельно, небезопасно.
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    try:
         conn.execute("VACUUM")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def db_size_mb() -> float:
@@ -1994,7 +2048,7 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    await broadcast("✅ <b>Бот запущен</b> (v21 — 20-факторный разворот)")
+    await broadcast("✅ <b>Бот запущен</b> (v22 — 20-факторный разворот)")
 
     while True:
         if monitor_paused:
@@ -2269,7 +2323,7 @@ async def handle_message(msg: dict):
         if text in ("/start", "/subscribe"):
             db_add_subscriber(chat_id)
             await send_message(
-                "🚀 <b>Crypto Alert Bot v21</b>\n\n"
+                "🚀 <b>Crypto Alert Bot v22</b>\n\n"
                 "✅ Вы подписаны на сигналы.\n"
                 "Для отписки: /unsubscribe",
                 chat_id,
@@ -2283,7 +2337,7 @@ async def handle_message(msg: dict):
 
     if text in ("/start", "/menu"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v21</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v22</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
@@ -2355,7 +2409,7 @@ async def handle_message(msg: dict):
 
     if text in ("🆘 Помощь", "/help"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v21 — справка</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v22 — справка</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
@@ -3212,4 +3266,5 @@ try:
             log.exception("Критическая ошибка: %s", e)
             time.sleep(10)
 finally:
+    db_close()
     release_single_instance_lock()
