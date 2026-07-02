@@ -1,7 +1,43 @@
 """
-Crypto Alert Bot — v24
+Crypto Alert Bot — v25
 Полный переход на Bybit (бессрочные USDT-фьючерсы, category=linear) как
 ЕДИНСТВЕННЫЙ источник данных. MEXC и OKX полностью удалены из кода.
+
+═══════════════════════════════════════════════════════
+ НОВОЕ v25 — СКРИНШОТ ГРАФИКА + РЕГУЛИРОВКА ПО 24Ч
+═══════════════════════════════════════════════════════
+• 🖼 Скриншот графика в сигналах: к сигналам РОСТА, ПАДЕНИЯ и РАЗВОРОТА теперь
+  прикладывается PNG-график (свечи 1H, ~72 последних часа — таймфрейм 1ч,
+  как на самом Bybit), генерируется прямо в Python (matplotlib) в реальном
+  времени по свежим свечам с GET /v5/market/kline?interval=60. Тёмная тема,
+  зелёные/красные свечи — визуально похоже на сам Bybit. Если matplotlib
+  недоступен или график не построился — бот НЕ падает и НЕ теряет сигнал:
+  автоматически шлётся обычное текстовое сообщение (полный fallback).
+  Если текст алерта длиннее лимита Telegram на подпись к фото (1024
+  символа, актуально для разворотов с длинным списком факторов) — фото
+  уходит без подписи, а следом отдельным сообщением полный текст.
+• 🖼 График ВЫКЛ / 🖼 График ВКЛ — новая пара кнопок (флаг CHART_ENABLED,
+  по умолчанию включено), полностью отключает/включает прикладывание
+  скриншота ко всем сигналам (не трогая остальную логику самих сигналов).
+• 🌐 Изменение за 24ч (как на Bybit): get_prices() теперь дополнительно
+  разбирает поле price24hPcnt из того же тикера Bybit (без единого лишнего
+  HTTP-запроса — оно приходит в том же ответе, что и цена) и добавляет
+  строку "🌐 24ч: +X.XX% (Bybit)" в сигналы РОСТА, ПАДЕНИЯ и РАЗВОРОТА —
+  показывается ВСЕГДА, независимо от состояния регулировки ниже.
+• 📈 Свой % (24ч) — новая кнопка: нажатие переводит бота в режим ожидания
+  числа, следующим сообщением просто вводится процент от 1 до 500 (без
+  команды) — устанавливается порог CUSTOM_PCT_24H, по которому (при
+  включённой регулировке) фильтруются обычные сигналы роста/падения —
+  теперь не по внутреннему окну (current_percent/current_window), а по
+  готовому 24ч-изменению цены с Bybit (price24hPcnt), точно как на самой
+  бирже. Доступна и команда /set_pct24h 12.5.
+• 📈🚦 24ч-регулировка ВЫКЛ / ВКЛ — новая пара кнопок (флаг
+  PCT24H_GATE_ENABLED, по умолчанию включено). ВКЛ — сигналы роста/падения
+  фильтруются порогом CUSTOM_PCT_24H по 24ч-изменению (как на Bybit).
+  ВЫКЛ — фильтрация возвращается к прежней схеме (порог current_percent по
+  внутреннему окну current_window), но строка "🌐 24ч: ..." в сообщениях
+  как показывалась, так и продолжает показываться — это чисто
+  информационное поле, отключение регулировки его не прячет.
 
 ═══════════════════════════════════════════════════════
  НОВОЕ v24 — ПОЛНЫЙ ПЕРЕХОД НА BYBIT
@@ -796,6 +832,23 @@ REVERSAL_WINDOW_SEC: int = getattr(config, "REVERSAL_WINDOW_SEC", 3600)  # по 
 NOTIFY_BIG_MOVE_PCT: float = getattr(config, "NOTIFY_BIG_MOVE_PCT", 15.0)
 _notify_cooldown: dict[str, float] = {}   # {sym: last_sent_ts}
 NOTIFY_BIG_MOVE_COOLDOWN_SEC: int = 3600  # не чаще 1 раза в час
+
+# ── v25: скриншот графика в сигналах (кнопки 🖼 График ВЫКЛ/ВКЛ) ──────────────
+CHART_ENABLED: bool = getattr(config, "CHART_ENABLED", True)
+CHART_TF:      str  = getattr(config, "CHART_TF", "Min60")   # 1 час — как на самом Bybit
+CHART_CANDLES: int  = getattr(config, "CHART_CANDLES", 72)   # ~3 суток по 1H
+
+# ── v25: изменение за 24ч как на Bybit (price24hPcnt из тикера, без доп. запроса) ──
+pct24h_cache: dict[str, float] = {}   # {symbol: % изменения за 24ч по Bybit} — для отображения
+# Порог регулировки роста/падения по 24ч-изменению (кнопка 📈 Свой % (24ч) / /set_pct24h), 1–500%
+CUSTOM_PCT_24H: float = getattr(config, "CUSTOM_PCT_24H", 5.0)
+# Вкл/выкл: когда включено, обычные сигналы роста/падения (БЛОК 2) фильтруются
+# порогом CUSTOM_PCT_24H по 24ч-изменению цены (price24hPcnt), а не внутренним
+# порогом current_percent/current_window. Когда выключено — фильтрация как раньше
+# (current_percent/current_window), но поле "🌐 24ч: ..." в сообщениях остаётся.
+PCT24H_GATE_ENABLED: bool = getattr(config, "PCT24H_GATE_ENABLED", True)
+# Режим ожидания ручного ввода числа с клавиатуры (кнопка 📈 Свой % (24ч))
+_awaiting_input: Optional[str] = None
 
 
 def _cache_load_levels():
@@ -1768,6 +1821,147 @@ async def broadcast(text: str, reply_markup=None):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+# ================================================================
+#  v25: СКРИНШОТ ГРАФИКА (генерируется прямо в Python, в реальном
+#  времени, по свежим свечам Bybit 1H — визуально похоже на сам Bybit)
+# ================================================================
+
+_matplotlib_warned = False   # чтобы не спамить лог, если matplotlib не установлен
+
+
+async def generate_chart_png(sym: str) -> Optional[bytes]:
+    """
+    Строит свечной график таймфрейма CHART_TF (по умолчанию 1H, как на самом
+    Bybit) прямо в Python по свежим свечам с Bybit (get_bybit_klines — тот же
+    кэшированный источник, что и для индикаторов, TTL=60с, лишних запросов
+    не создаёт). Тёмная тема + зелёные/красные свечи, похоже на сам Bybit.
+
+    Возвращает None при любой проблеме (нет matplotlib, нет данных и т.п.) —
+    вызывающий код в этом случае просто шлёт обычное текстовое сообщение,
+    сигнал никогда не теряется из-за графика.
+    """
+    global _matplotlib_warned
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+    except Exception as e:
+        if not _matplotlib_warned:
+            log.warning("matplotlib недоступен — графики в сигналах отключены: %s", e)
+            _matplotlib_warned = True
+        return None
+
+    try:
+        data = await get_bybit_klines(sym, CHART_TF, CHART_CANDLES)
+        opens, highs, lows, closes = data["opens"], data["highs"], data["lows"], data["closes"]
+        n = len(closes)
+        if n < 2:
+            return None
+
+        up_color, down_color = "#0ECB81", "#F6465D"
+        bg_color, grid_color, txt_color = "#161A1E", "#2B3139", "#848E9C"
+
+        fig, ax = plt.subplots(figsize=(9, 5), dpi=130)
+        fig.patch.set_facecolor(bg_color)
+        ax.set_facecolor(bg_color)
+
+        lo, hi   = min(lows), max(highs)
+        min_body = max((hi - lo) * 0.0015, 1e-12)
+        width    = 0.62
+
+        for i in range(n):
+            color = up_color if closes[i] >= opens[i] else down_color
+            ax.plot([i, i], [lows[i], highs[i]], color=color, linewidth=1.1, zorder=2, solid_capstyle="round")
+            body_lo = min(opens[i], closes[i])
+            body_h  = max(abs(closes[i] - opens[i]), min_body)
+            ax.add_patch(Rectangle(
+                (i - width / 2, body_lo), width, body_h,
+                facecolor=color, edgecolor=color, linewidth=0.4, zorder=3,
+            ))
+
+        ax.set_xlim(-1, n)
+        pad = (hi - lo) * 0.06 or hi * 0.01 or 1.0
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.grid(True, color=grid_color, linewidth=0.5, alpha=0.55, axis="y")
+        ax.tick_params(colors=txt_color, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(grid_color)
+        ax.set_xticks([])
+
+        last_price = closes[-1]
+        last_color = up_color if closes[-1] >= opens[0] else down_color
+        ax.axhline(last_price, color="#F0B90B", linewidth=0.8, linestyle="--", alpha=0.85, zorder=4)
+        tf_label = RSI_TF_LABELS.get(CHART_TF, CHART_TF)
+        ax.set_title(
+            f"{sym}   •   {tf_label}   •   {last_price:g}",
+            color="#EAECEF", fontsize=12, loc="left", fontweight="bold", pad=10,
+        )
+        ax.text(
+            0.99, 0.02, "Bybit", transform=ax.transAxes, color=txt_color,
+            fontsize=8, ha="right", va="bottom", alpha=0.8,
+        )
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", facecolor=bg_color)
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        log.warning("generate_chart_png(%s): %s", sym, e)
+        return None
+
+
+async def send_photo(chat_id, photo_bytes: bytes, caption: str = "") -> Optional[dict]:
+    try:
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if caption:
+            form.add_field("caption", caption)
+            form.add_field("parse_mode", "HTML")
+        form.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
+        async with _session.post(f"{TG}/sendPhoto", data=form,
+                                  timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            return await resp.json()
+    except Exception as e:
+        log.error("sendPhoto: %s", e)
+        return None
+
+
+async def broadcast_photo(photo_bytes: bytes, caption: str = ""):
+    tasks = [send_photo(cid, photo_bytes, caption) for cid in db_get_subscribers()]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+TELEGRAM_CAPTION_LIMIT = 1024  # официальный лимит Telegram на подпись к фото
+
+
+async def broadcast_with_chart(sym: str, text: str):
+    """
+    Отправляет алерт как фото со свечным графиком 1H (если график включён
+    кнопкой 🖼 и успешно сгенерировался), иначе — полностью безопасный
+    fallback на обычное текстовое сообщение (сигнал никогда не теряется).
+    Если текст длиннее лимита подписи Telegram (актуально для разворотов
+    с длинным списком факторов) — фото уходит без подписи, а следом
+    отдельным сообщением идёт полный текст.
+    """
+    if CHART_ENABLED:
+        try:
+            png = await generate_chart_png(sym)
+        except Exception as e:
+            log.warning("broadcast_with_chart(%s): %s", sym, e)
+            png = None
+        if png:
+            if len(text) <= TELEGRAM_CAPTION_LIMIT:
+                await broadcast_photo(png, caption=text)
+            else:
+                await broadcast_photo(png, caption="")
+                await broadcast(text)
+            return
+    await broadcast(text)
+
+
 def _rsi_signal_status_line(bold: bool = True) -> str:
     """
     Человекочитаемое описание текущего состояния RSI-фильтра роста/падения
@@ -1826,6 +2020,11 @@ def reply_keyboard():
             ["🔄📊 RSI ≥50", "🔄📊 RSI ≥60", "🔄📊 RSI ≥70", "🔄📊 RSI ≥80", "🔄📊 RSI ≥90", "🔄📊 RSI ≥95"],
             # Строка 15 — RSI-гейт разворота: вкл/выкл (полностью отключает порог+ТФ)
             ["🔄🚦 RSI разворота ВЫКЛ", "🔄🚦 RSI разворота ВКЛ"],
+            # Строка 16 — v25: скриншот графика (свечи 1H) в сигналах: вкл/выкл
+            ["🖼 График ВЫКЛ", "🖼 График ВКЛ"],
+            # Строка 17 — v25: регулировка порога роста/падения по изменению за
+            # 24ч (как на Bybit): свой % от 1 до 500 + вкл/выкл самой регулировки
+            ["📈 Свой % (24ч)", "📈🚦 24ч-регулировка ВЫКЛ", "📈🚦 24ч-регулировка ВКЛ"],
         ],
         "resize_keyboard": True,
         "persistent":      True,
@@ -1864,6 +2063,7 @@ def format_growth_alert(
     rsi_tf_label: Optional[str] = None,
     rsi_tf_val:   Optional[float] = None,
     rsi_tf_level: Optional[float] = None,
+    pct24h: Optional[float] = None,
 ) -> str:
     emoji = alert_emoji(growth)
     sign  = "+" if growth > 0 else ""
@@ -1890,6 +2090,8 @@ def format_growth_alert(
         elif accel < 0.7:
             accel_s = f"\n🐢 Замедление: ×{accel:.1f}"
 
+    pct24h_s = f"\n🌐 24ч: <b>{pct24h:+.2f}%</b> (Bybit)" if pct24h is not None else ""
+
     return (
         f"{emoji} <b>СИГНАЛ — {label.upper()}</b>\n\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
@@ -1899,6 +2101,7 @@ def format_growth_alert(
         f"〽️ MACD: <code>{macd_s}</code>"
         f"{rsi_tf_s}"
         f"{accel_s}"
+        f"{pct24h_s}"
         f"{chr(10) + breakout if breakout else ''}"
         f"{chr(10) + day_context if day_context else ''}"
         f"\n\n📋 <code>{sym}</code>"
@@ -1918,6 +2121,7 @@ def format_drop_alert(
     rsi_tf_label: Optional[str] = None,
     rsi_tf_val:   Optional[float] = None,
     rsi_tf_level: Optional[float] = None,
+    pct24h: Optional[float] = None,
 ) -> str:
     a     = abs(growth)
     emoji = "💥" if a >= 20 else "🔥" if a >= 10 else "📉"
@@ -1934,6 +2138,8 @@ def format_drop_alert(
         # никогда не отражала реальную логику фильтрации.
         rsi_tf_s = f"\n📊 RSI {rsi_tf_label}: <code>{rsi_tf_val:.1f}</code>"
 
+    pct24h_s = f"\n🌐 24ч: <b>{pct24h:+.2f}%</b> (Bybit)" if pct24h is not None else ""
+
     return (
         f"{emoji} <b>ПАДЕНИЕ</b>\n\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
@@ -1942,6 +2148,7 @@ def format_drop_alert(
         f"📊 RSI: <code>{rsi_s}</code>{rsi_t}{hint}\n"
         f"〽️ MACD: <code>{macd_s}</code>"
         f"{rsi_tf_s}"
+        f"{pct24h_s}"
         f"{chr(10) + breakout if breakout else ''}"
         f"{chr(10) + day_context if day_context else ''}"
         f"\n\n📋 <code>{sym}</code> #падение"
@@ -1956,6 +2163,7 @@ def format_reversal_alert(
     rev:          dict,
     duration_sec: int = 0,
     window_sec:   int = 3600,
+    pct24h:       Optional[float] = None,
 ) -> str:
     score      = rev["score"]
     max_score  = rev.get("max_score", 20)
@@ -2001,13 +2209,15 @@ def format_reversal_alert(
     candle_s  = f"\n🕯 Паттерн: <b>{candle}</b>" if candle  else ""
     vol_s     = f"\n{_esc(vol_sig)}"              if vol_sig else ""
     day_ctx_s = f"\n{day_ctx}"                    if day_ctx else ""
+    pct24h_s  = f"\n🌐 24ч: <b>{pct24h:+.2f}%</b> (Bybit)" if pct24h is not None else ""
 
     return (
         f"{hdr} <b>РАЗВОРОТ НА ШОРТ</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
-        f"📈 Рост до разворота: <b>+{growth:.2f}%</b> за {_fmt_dur(window_sec)}\n\n"
+        f"📈 Рост до разворота: <b>+{growth:.2f}%</b> за {_fmt_dur(window_sec)}"
+        f"{pct24h_s}\n\n"
         f"🎯 Уверенность: {confidence}  [{score}/{max_score}]\n\n"
         f"<b>Сработавшие факторы ({score}/{max_score}):</b>\n{factors_s}\n\n"
         f"<b>Индикаторы:</b>\n"
@@ -2072,13 +2282,20 @@ async def get_symbols() -> set[str]:
 #  PRICES
 # ================================================================
 
-async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
+async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict]:
     """
     Текущие цены сразу по всем бессрочным USDT-фьючерсам Bybit —
     один HTTP-запрос вместо отдельных вызовов на каждую монету.
+
+    v25: дополнительно разбирает поле price24hPcnt из того же самого ответа
+    тикера (Bybit отдаёт его "бесплатно" вместе с ценой — без единого лишнего
+    HTTP-запроса) — это официальное изменение цены за 24ч, как показывается
+    на самом Bybit. Используется для отображения в алертах и (опционально)
+    для фильтрации сигналов роста/падения по кнопке 📈🚦 24ч-регулировка.
     """
     prices:  dict = {}
     sources: dict = {}
+    pct24h:  dict = {}
     try:
         async with _session.get(
             "https://api.bybit.com/v5/market/tickers",
@@ -2098,11 +2315,17 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict]:
                 if price > 0:
                     prices[sym]  = price
                     sources[sym] = "Bybit"
+                try:
+                    raw_pcnt = item.get("price24hPcnt")
+                    if raw_pcnt not in (None, ""):
+                        pct24h[sym] = float(raw_pcnt) * 100.0
+                except (TypeError, ValueError):
+                    pass
         else:
             log.error("get_prices: retCode=%s msg=%s", data.get("retCode"), data.get("retMsg"))
     except Exception as e:
         log.error("get_prices: %s", e)
-    return prices, sources
+    return prices, sources, pct24h
 
 
 # ================================================================
@@ -2117,7 +2340,7 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    await broadcast("✅ <b>Бот запущен</b> (v23 — 20-факторный разворот)")
+    await broadcast("✅ <b>Бот запущен</b> (v25 — график в сигналах + регулировка по 24ч)")
 
     while True:
         if monitor_paused:
@@ -2140,7 +2363,8 @@ async def monitor():
                     log.info("Монеты обновлены: %d", len(symbols))
                 last_symbols_upd = now
 
-            prices, sources = await get_prices(symbols)
+            prices, sources, pct24h_map = await get_prices(symbols)
+            pct24h_cache.update(pct24h_map)
 
             for sym, price in prices.items():
                 await asyncio.sleep(0)
@@ -2155,6 +2379,7 @@ async def monitor():
 
                 recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
                 source = sources.get(sym, "UNKNOWN")
+                pct24h_val = pct24h_map.get(sym)   # v25: изменение за 24ч как на Bybit (может быть None)
 
                 if len(recent) < MIN_SAMPLES:
                     continue
@@ -2235,6 +2460,7 @@ async def monitor():
                                 sym, price, max(growth, peak_growth), source, rev,
                                 duration_sec=duration,
                                 window_sec=REVERSAL_WINDOW_SEC,
+                                pct24h=pct24h_val,
                             )
                             _reversal_cooldown[sym] = now
                             _reversal_last[sym] = {"price": price, "score": rev["score"], "ts": now}
@@ -2244,7 +2470,7 @@ async def monitor():
                                 rev["stoch_rsi"], rev["bb_pct"],
                                 rev["atr"], rev["target1"], rev["target2"], source,
                             )
-                            await broadcast(rev_text)
+                            await broadcast_with_chart(sym, rev_text)
                             reversal_count += 1
                             if PROM_AVAILABLE:
                                 PROM_REVERSALS.inc()
@@ -2279,7 +2505,18 @@ async def monitor():
                 # ════════════════════════════════════════════════════════════
                 #  БЛОК 2: ОБЫЧНЫЕ АЛЕРТЫ (РОСТ / ПАДЕНИЕ)
                 # ════════════════════════════════════════════════════════════
-                if abs(growth) < current_percent:
+                # v25: при включённой регулировке по 24ч (кнопка 📈🚦) обычные
+                # сигналы роста/падения фильтруются готовым 24ч-изменением цены
+                # с Bybit (price24hPcnt), а не внутренним окном — точно как на
+                # самой бирже. Если регулировка выключена (или Bybit ещё не
+                # прислал 24ч-данные по монете) — прежний порог current_percent
+                # по окну current_window.
+                if PCT24H_GATE_ENABLED and pct24h_val is not None:
+                    gate_metric, active_pct_threshold = pct24h_val, CUSTOM_PCT_24H
+                else:
+                    gate_metric, active_pct_threshold = growth, current_percent
+
+                if abs(gate_metric) < active_pct_threshold:
                     level = _cache_get_level(sym)
                     if level and level["direction"] != direction:
                         _cache_clear_level(sym)
@@ -2307,7 +2544,7 @@ async def monitor():
                     prev_price = level["alert_price"]
                     prev_dir   = level["direction"]
                     if prev_dir == direction:
-                        if abs(price - prev_price) / prev_price * 100 < current_percent:
+                        if abs(price - prev_price) / prev_price * 100 < active_pct_threshold:
                             continue
 
                 vals      = [p for _, p in price_history[sym][-120:]]
@@ -2332,6 +2569,7 @@ async def monitor():
                         duration_sec=duration, breakout=breakout, day_context=day_ctx,
                         rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
                         rsi_tf_level=RSI_SIGNAL_LEVEL if rsi_tf_label_show else None,
+                        pct24h=pct24h_val,
                     )
                 else:
                     text = format_drop_alert(
@@ -2340,12 +2578,13 @@ async def monitor():
                         breakout=breakout, day_context=day_ctx,
                         rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
                         rsi_tf_level=None,  # порог не применяется к падению — только значение RSI
+                        pct24h=pct24h_val,
                     )
 
                 _cache_set_level(sym, price, direction)
                 _alert_cooldown[sym] = now
                 db_save_alert(sym, price, growth, rsi, macd, source)
-                await broadcast(text)
+                await broadcast_with_chart(sym, text)
                 signals_count += 1
 
                 if PROM_AVAILABLE:
@@ -2392,6 +2631,7 @@ async def handle_message(msg: dict):
     global REVERSAL_REPEAT_PRICE_PCT, REVERSAL_REPEAT_SCORE_DELTA
     global RSI_SIGNAL_TF, RSI_SIGNAL_LEVEL, RSI_REVERSAL_TF, RSI_SIGNAL_FILTER_ENABLED
     global RSI_REVERSAL_FILTER_ENABLED
+    global CHART_ENABLED, CUSTOM_PCT_24H, PCT24H_GATE_ENABLED, _awaiting_input
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -2400,7 +2640,7 @@ async def handle_message(msg: dict):
         if text in ("/start", "/subscribe"):
             db_add_subscriber(chat_id)
             await send_message(
-                "🚀 <b>Crypto Alert Bot v23</b>\n\n"
+                "🚀 <b>Crypto Alert Bot v25</b>\n\n"
                 "✅ Вы подписаны на сигналы.\n"
                 "Для отписки: /unsubscribe",
                 chat_id,
@@ -2412,9 +2652,92 @@ async def handle_message(msg: dict):
             await send_message("⛔ Нет доступа к управлению. /subscribe — подписаться на алерты.", chat_id)
         return
 
+    # v25: режим ожидания ручного ввода числа после кнопки 📈 Свой % (24ч).
+    # Проверяется в первую очередь, чтобы обычное сообщение с числом (без
+    # команды) не попало мимо цели ни в один другой обработчик ниже.
+    if _awaiting_input == "custom_pct_24h":
+        _awaiting_input = None
+        try:
+            val = float(text.replace(",", ".").replace("%", "").strip())
+            assert 1.0 <= val <= 500.0
+            CUSTOM_PCT_24H = val
+            status_hint = (
+                f"Гейт по 24ч <b>включён</b> — сигналы роста/падения теперь фильтруются "
+                f"этим порогом по изменению цены за 24ч (как на Bybit)."
+                if PCT24H_GATE_ENABLED else
+                f"⚠️ Гейт по 24ч сейчас <b>выключен</b> (кнопка 📈🚦) — порог сохранён, "
+                f"но пока не применяется, действует обычный порог {current_percent}%."
+            )
+            await send_message(
+                f"✅ Порог изменения за 24ч: <b>{CUSTOM_PCT_24H}%</b>\n{status_hint}",
+                chat_id,
+            )
+        except Exception:
+            await send_message("❌ Введите число от 1 до 500, например: 12.5", chat_id)
+        return
+
+    if text == "📈 Свой % (24ч)":
+        _awaiting_input = "custom_pct_24h"
+        await send_message(
+            f"✏️ Введите порог роста/падения за 24ч, число от <b>1</b> до <b>500</b> "
+            f"(например: 12.5).\nТекущий: <b>{CUSTOM_PCT_24H}%</b>",
+            chat_id,
+        )
+        return
+
+    if text.startswith("/set_pct24h"):
+        try:
+            val = float(text.split()[1].replace(",", "."))
+            assert 1.0 <= val <= 500.0
+            CUSTOM_PCT_24H = val
+            await send_message(f"✅ Порог изменения за 24ч: <b>{CUSTOM_PCT_24H}%</b>", chat_id)
+        except Exception:
+            await send_message(f"❌ /set_pct24h 12.5  (число от 1 до 500)\nТекущее: {CUSTOM_PCT_24H}%", chat_id)
+        return
+
+    if text == "📈🚦 24ч-регулировка ВЫКЛ":
+        PCT24H_GATE_ENABLED = False
+        await send_message(
+            "🚫 Регулировка по 24ч <b>выключена</b> — сигналы роста/падения снова "
+            f"фильтруются обычным порогом (<b>{current_percent}%</b> за окно "
+            f"{current_window // 60} мин). Строка «🌐 24ч: ...» в сигналах "
+            "как показывалась, так и продолжает показываться.",
+            chat_id,
+        )
+        return
+
+    if text == "📈🚦 24ч-регулировка ВКЛ":
+        PCT24H_GATE_ENABLED = True
+        await send_message(
+            f"✅ Регулировка по 24ч <b>включена</b> — сигналы роста/падения теперь "
+            f"фильтруются порогом <b>{CUSTOM_PCT_24H}%</b> по изменению цены за 24ч "
+            f"(как на Bybit, поле price24hPcnt).",
+            chat_id,
+        )
+        return
+
+    if text == "🖼 График ВЫКЛ":
+        CHART_ENABLED = False
+        await send_message(
+            "🚫 Скриншот графика в сигналах <b>выключен</b> — сигналы роста, падения "
+            "и разворота теперь приходят только текстом.",
+            chat_id,
+        )
+        return
+
+    if text == "🖼 График ВКЛ":
+        CHART_ENABLED = True
+        await send_message(
+            f"✅ Скриншот графика в сигналах <b>включён</b> — свечи "
+            f"{RSI_TF_LABELS.get(CHART_TF, CHART_TF)}, как на Bybit, "
+            f"будут прикладываться к сигналам роста, падения и разворота.",
+            chat_id,
+        )
+        return
+
     if text in ("/start", "/menu"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v23</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v25</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
@@ -2422,6 +2745,10 @@ async def handle_message(msg: dict):
             f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
             f"📊 RSI-фильтр РОСТА: {_rsi_signal_status_line()} (падение — без порога, только значение)\n"
             f"🔄📊 RSI-гейт разворота: {_rsi_reversal_status_line()} (не зависит от 20 факторов)\n"
+            f"🖼 График в сигналах: {'<b>ВКЛЮЧЕН</b>' if CHART_ENABLED else '<b>ВЫКЛЮЧЕН</b>'} "
+            f"({RSI_TF_LABELS.get(CHART_TF, CHART_TF)}, как на Bybit)\n"
+            f"📈🚦 Регулировка по 24ч: {'<b>ВКЛЮЧЕНА</b>' if PCT24H_GATE_ENABLED else '<b>ВЫКЛЮЧЕНА</b>'} "
+            f"— порог <b>{CUSTOM_PCT_24H}%</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
@@ -2440,12 +2767,19 @@ async def handle_message(msg: dict):
             f"  🔄📊 RSI ≥50-95 — порог RSI-гейта разворота: уведомление о развороте "
             f"приходит, только если RSI на выбранном ТФ ≥ порога — НЕЗАВИСИМО от "
             f"набранных факторов разворота\n"
+            f"  🖼 График ВЫКЛ/ВКЛ — прикладывать ли скриншот свечного графика "
+            f"{RSI_TF_LABELS.get(CHART_TF, CHART_TF)} (как на Bybit) к сигналам роста/падения/разворота\n"
+            f"  📈 Свой % (24ч) — ввести порог 1–500% для регулировки по 24ч-изменению\n"
+            f"  📈🚦 24ч-регулировка ВЫКЛ/ВКЛ — переключить фильтрацию сигналов "
+            f"роста/падения на изменение цены за 24ч (как на Bybit) или обратно на "
+            f"обычный порог; поле «🌐 24ч: ...» в сообщениях показывается в любом случае\n"
             f"  ⚙️ Настройки разворота — все параметры\n"
             f"  🔄 Полный перезапуск — перезапуск без потери данных\n"
             f"  🆘 Помощь — краткая справка\n\n"
             f"<b>Команды:</b>\n"
             f"  /set_percent 2.5 — порог алертов (%)\n"
             f"  /set_window 60 — период алертов (мин)\n"
+            f"  /set_pct24h 12.5 — порог регулировки по 24ч (1–500%)\n"
             f"  /rev_score 5 — порог факторов разворота\n"
             f"  /rev_growth 5 — % роста для разворота\n"
             f"  /rev_window 60 — период роста разворота (мин)\n"
@@ -2488,12 +2822,15 @@ async def handle_message(msg: dict):
 
     if text in ("🆘 Помощь", "/help"):
         await send_message(
-            f"🚀 <b>Crypto Alert Bot v23 — справка</b>\n\n"
+            f"🚀 <b>Crypto Alert Bot v25 — справка</b>\n\n"
             f"📈 Порог роста: <b>{current_percent}%</b>\n"
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
             f"📊 RSI РОСТА: {_rsi_signal_status_line()} (падение — без порога)\n"
-            f"🔄📊 RSI-гейт разворота: {_rsi_reversal_status_line()} (вне факторов)\n\n"
+            f"🔄📊 RSI-гейт разворота: {_rsi_reversal_status_line()} (вне факторов)\n"
+            f"🖼 График в сигналах: {'ВКЛЮЧЕН' if CHART_ENABLED else 'ВЫКЛЮЧЕН'}\n"
+            f"📈🚦 Регулировка по 24ч: {'ВКЛЮЧЕНА' if PCT24H_GATE_ENABLED else 'ВЫКЛЮЧЕНА'} "
+            f"(порог {CUSTOM_PCT_24H}%)\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
             f"  📉 Разворот 1-25% — мин. рост для шорт-разворота\n"
@@ -2504,6 +2841,10 @@ async def handle_message(msg: dict):
             f"  📊 RSI ТФ / RSI ≥ — таймфрейм и порог RSI для РОСТА (на падение не влияет)\n"
             f"  🔄🚦 RSI разворота ВЫКЛ/ВКЛ — отключить/включить жёсткий RSI-гейт разворота\n"
             f"  🔄📊 RSI ТФ / RSI ≥ — таймфрейм и порог жёсткого RSI-гейта разворота\n"
+            f"  🖼 График ВЫКЛ/ВКЛ — скриншот свечного графика 1H (как на Bybit) в сигналах\n"
+            f"  📈 Свой % (24ч) — ввести порог 1–500% по изменению за 24ч\n"
+            f"  📈🚦 24ч-регулировка ВЫКЛ/ВКЛ — фильтровать рост/падение по 24ч (как на "
+            f"Bybit) или по обычному внутреннему порогу; поле 🌐24ч в сообщениях есть всегда\n"
             f"  ⚙️ Настройки разворота — все параметры детально\n"
             f"  🔄 Полный перезапуск — перезапуск процесса без потери данных\n\n"
             f"Полный список команд: /menu",
@@ -2545,6 +2886,10 @@ async def handle_message(msg: dict):
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
             f"📈 Порог роста: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n"
+            f"🖼 График в сигналах: {'ВКЛЮЧЕН' if CHART_ENABLED else 'ВЫКЛЮЧЕН'} "
+            f"({RSI_TF_LABELS.get(CHART_TF, CHART_TF)})\n"
+            f"📈🚦 Регулировка по 24ч: {'ВКЛЮЧЕНА' if PCT24H_GATE_ENABLED else 'ВЫКЛЮЧЕНА'} "
+            f"(порог {CUSTOM_PCT_24H}%)\n"
             f"⚡ Интервал: {config.INTERVAL} сек\n"
             f"👥 Подписчиков: {len(db_get_subscribers())}\n"
             f"{'⏸ Пауза' if monitor_paused else '▶️ Активен'}",
