@@ -835,8 +835,27 @@ NOTIFY_BIG_MOVE_COOLDOWN_SEC: int = 3600  # не чаще 1 раза в час
 
 # ── v25: скриншот графика в сигналах (кнопки 🖼 График ВЫКЛ/ВКЛ) ──────────────
 CHART_ENABLED: bool = getattr(config, "CHART_ENABLED", True)
-CHART_TF:      str  = getattr(config, "CHART_TF", "Min60")   # 1 час — как на самом Bybit
-CHART_CANDLES: int  = getattr(config, "CHART_CANDLES", 72)   # ~3 суток по 1H
+CHART_TF:      str  = getattr(config, "CHART_TF", "Min60")   # ТФ графика, переключается кнопками 🖼📊
+# Таймфреймы, доступные для переключения кнопками 🖼📊 ТФ (1м/15м/1ч/2ч/4ч/1д)
+CHART_TF_INTERVALS = {
+    "1м":  "Min1",
+    "15м": "Min15",
+    "1ч":  "Min60",
+    "2ч":  "Hour2",
+    "4ч":  "Hour4",
+    "1д":  "Day1",
+}
+CHART_TF_LABELS = {v: k for k, v in CHART_TF_INTERVALS.items()}
+# Кол-во свечей на графике — подобрано под каждый ТФ, чтобы график выглядел
+# как читаемый график на Bybit (не 5 свечей и не 500 нечитаемых точек).
+CHART_TF_CANDLES = {
+    "Min1":  180,   # 3 часа
+    "Min15": 96,    # 24 часа
+    "Min60": 72,    # 3 суток
+    "Hour2": 90,    # ~7.5 суток
+    "Hour4": 90,    # ~15 суток
+    "Day1":  90,    # ~3 месяца
+}
 
 # ── v25: изменение за 24ч как на Bybit (price24hPcnt из тикера, без доп. запроса) ──
 pct24h_cache: dict[str, float] = {}   # {symbol: % изменения за 24ч по Bybit} — для отображения
@@ -896,6 +915,7 @@ BYBIT_INTERVAL_MAP = {
     "Min5":   "5",
     "Min15":  "15",
     "Min60":  "60",
+    "Hour2":  "120",
     "Hour4":  "240",
     "Hour12": "720",
     "Day1":   "D",
@@ -1853,7 +1873,7 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
         return None
 
     try:
-        data = await get_bybit_klines(sym, CHART_TF, CHART_CANDLES)
+        data = await get_bybit_klines(sym, CHART_TF, CHART_TF_CANDLES.get(CHART_TF, 72))
         opens, highs, lows, closes = data["opens"], data["highs"], data["lows"], data["closes"]
         n = len(closes)
         if n < 2:
@@ -1892,7 +1912,7 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
         last_price = closes[-1]
         last_color = up_color if closes[-1] >= opens[0] else down_color
         ax.axhline(last_price, color="#F0B90B", linewidth=0.8, linestyle="--", alpha=0.85, zorder=4)
-        tf_label = RSI_TF_LABELS.get(CHART_TF, CHART_TF)
+        tf_label = CHART_TF_LABELS.get(CHART_TF, CHART_TF)
         ax.set_title(
             f"{sym}   •   {tf_label}   •   {last_price:g}",
             color="#EAECEF", fontsize=12, loc="left", fontweight="bold", pad=10,
@@ -2020,8 +2040,10 @@ def reply_keyboard():
             ["🔄📊 RSI ≥50", "🔄📊 RSI ≥60", "🔄📊 RSI ≥70", "🔄📊 RSI ≥80", "🔄📊 RSI ≥90", "🔄📊 RSI ≥95"],
             # Строка 15 — RSI-гейт разворота: вкл/выкл (полностью отключает порог+ТФ)
             ["🔄🚦 RSI разворота ВЫКЛ", "🔄🚦 RSI разворота ВКЛ"],
-            # Строка 16 — v25: скриншот графика (свечи 1H) в сигналах: вкл/выкл
+            # Строка 16 — v25: скриншот графика (свечи) в сигналах: вкл/выкл
             ["🖼 График ВЫКЛ", "🖼 График ВКЛ"],
+            # Строка 16.1 — v25: таймфрейм графика в сигналах
+            ["🖼📊 ТФ 1м", "🖼📊 ТФ 15м", "🖼📊 ТФ 1ч", "🖼📊 ТФ 2ч", "🖼📊 ТФ 4ч", "🖼📊 ТФ 1д"],
             # Строка 17 — v25: регулировка порога роста/падения по изменению за
             # 24ч (как на Bybit): свой % от 1 до 500 + вкл/выкл самой регулировки
             ["📈 Свой % (24ч)", "📈🚦 24ч-регулировка ВЫКЛ", "📈🚦 24ч-регулировка ВКЛ"],
@@ -2631,7 +2653,7 @@ async def handle_message(msg: dict):
     global REVERSAL_REPEAT_PRICE_PCT, REVERSAL_REPEAT_SCORE_DELTA
     global RSI_SIGNAL_TF, RSI_SIGNAL_LEVEL, RSI_REVERSAL_TF, RSI_SIGNAL_FILTER_ENABLED
     global RSI_REVERSAL_FILTER_ENABLED
-    global CHART_ENABLED, CUSTOM_PCT_24H, PCT24H_GATE_ENABLED, _awaiting_input
+    global CHART_ENABLED, CHART_TF, CUSTOM_PCT_24H, PCT24H_GATE_ENABLED, _awaiting_input
 
     text    = msg.get("text", "").strip()
     chat_id = msg["chat"]["id"]
@@ -2729,8 +2751,27 @@ async def handle_message(msg: dict):
         CHART_ENABLED = True
         await send_message(
             f"✅ Скриншот графика в сигналах <b>включён</b> — свечи "
-            f"{RSI_TF_LABELS.get(CHART_TF, CHART_TF)}, как на Bybit, "
+            f"{CHART_TF_LABELS.get(CHART_TF, CHART_TF)}, как на Bybit, "
             f"будут прикладываться к сигналам роста, падения и разворота.",
+            chat_id,
+        )
+        return
+
+    _chart_tf_map = {
+        "🖼📊 ТФ 1м":  "Min1",
+        "🖼📊 ТФ 15м": "Min15",
+        "🖼📊 ТФ 1ч":  "Min60",
+        "🖼📊 ТФ 2ч":  "Hour2",
+        "🖼📊 ТФ 4ч":  "Hour4",
+        "🖼📊 ТФ 1д":  "Day1",
+    }
+    if text in _chart_tf_map:
+        CHART_TF = _chart_tf_map[text]
+        off_hint = "\n⚠️ График сейчас ВЫКЛЮЧЕН (🖼) — ТФ сохранён, применится, когда включите." \
+            if not CHART_ENABLED else ""
+        await send_message(
+            f"✅ Таймфрейм графика в сигналах: <b>{CHART_TF_LABELS.get(CHART_TF, CHART_TF)}</b>"
+            f"{off_hint}",
             chat_id,
         )
         return
@@ -2746,7 +2787,7 @@ async def handle_message(msg: dict):
             f"📊 RSI-фильтр РОСТА: {_rsi_signal_status_line()} (падение — без порога, только значение)\n"
             f"🔄📊 RSI-гейт разворота: {_rsi_reversal_status_line()} (не зависит от 20 факторов)\n"
             f"🖼 График в сигналах: {'<b>ВКЛЮЧЕН</b>' if CHART_ENABLED else '<b>ВЫКЛЮЧЕН</b>'} "
-            f"({RSI_TF_LABELS.get(CHART_TF, CHART_TF)}, как на Bybit)\n"
+            f"({CHART_TF_LABELS.get(CHART_TF, CHART_TF)}, как на Bybit)\n"
             f"📈🚦 Регулировка по 24ч: {'<b>ВКЛЮЧЕНА</b>' if PCT24H_GATE_ENABLED else '<b>ВЫКЛЮЧЕНА</b>'} "
             f"— порог <b>{CUSTOM_PCT_24H}%</b>\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
@@ -2768,7 +2809,8 @@ async def handle_message(msg: dict):
             f"приходит, только если RSI на выбранном ТФ ≥ порога — НЕЗАВИСИМО от "
             f"набранных факторов разворота\n"
             f"  🖼 График ВЫКЛ/ВКЛ — прикладывать ли скриншот свечного графика "
-            f"{RSI_TF_LABELS.get(CHART_TF, CHART_TF)} (как на Bybit) к сигналам роста/падения/разворота\n"
+            f"{CHART_TF_LABELS.get(CHART_TF, CHART_TF)} (как на Bybit) к сигналам роста/падения/разворота\n"
+            f"  🖼📊 ТФ 1м/15м/1ч/2ч/4ч/1д — таймфрейм графика, который прикладывается к сигналам\n"
             f"  📈 Свой % (24ч) — ввести порог 1–500% для регулировки по 24ч-изменению\n"
             f"  📈🚦 24ч-регулировка ВЫКЛ/ВКЛ — переключить фильтрацию сигналов "
             f"роста/падения на изменение цены за 24ч (как на Bybit) или обратно на "
@@ -2841,7 +2883,8 @@ async def handle_message(msg: dict):
             f"  📊 RSI ТФ / RSI ≥ — таймфрейм и порог RSI для РОСТА (на падение не влияет)\n"
             f"  🔄🚦 RSI разворота ВЫКЛ/ВКЛ — отключить/включить жёсткий RSI-гейт разворота\n"
             f"  🔄📊 RSI ТФ / RSI ≥ — таймфрейм и порог жёсткого RSI-гейта разворота\n"
-            f"  🖼 График ВЫКЛ/ВКЛ — скриншот свечного графика 1H (как на Bybit) в сигналах\n"
+            f"  🖼 График ВЫКЛ/ВКЛ — скриншот свечного графика (как на Bybit) в сигналах\n"
+            f"  🖼📊 ТФ 1м/15м/1ч/2ч/4ч/1д — таймфрейм графика в сигналах\n"
             f"  📈 Свой % (24ч) — ввести порог 1–500% по изменению за 24ч\n"
             f"  📈🚦 24ч-регулировка ВЫКЛ/ВКЛ — фильтровать рост/падение по 24ч (как на "
             f"Bybit) или по обычному внутреннему порогу; поле 🌐24ч в сообщениях есть всегда\n"
@@ -2887,7 +2930,7 @@ async def handle_message(msg: dict):
             f"📈 Порог роста: {current_percent}%\n"
             f"⏱ Период: {current_window // 60} мин\n"
             f"🖼 График в сигналах: {'ВКЛЮЧЕН' if CHART_ENABLED else 'ВЫКЛЮЧЕН'} "
-            f"({RSI_TF_LABELS.get(CHART_TF, CHART_TF)})\n"
+            f"({CHART_TF_LABELS.get(CHART_TF, CHART_TF)})\n"
             f"📈🚦 Регулировка по 24ч: {'ВКЛЮЧЕНА' if PCT24H_GATE_ENABLED else 'ВЫКЛЮЧЕНА'} "
             f"(порог {CUSTOM_PCT_24H}%)\n"
             f"⚡ Интервал: {config.INTERVAL} сек\n"
