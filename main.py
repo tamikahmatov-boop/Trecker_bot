@@ -2628,7 +2628,23 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
             params={"category": "linear"},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
-            data = await r.json()
+            status = r.status
+            raw    = await r.text()
+            if status != 200:
+                log.error(
+                    "get_prices: HTTP %s от Bybit (не 200). Тело ответа (первые 500 симв.): %s",
+                    status, raw[:500].replace("\n", " "),
+                )
+                return prices, sources, pct24h, oi
+            try:
+                data = json.loads(raw)
+            except Exception as je:
+                log.error(
+                    "get_prices: не удалось разобрать JSON (%s). Тело ответа (первые 500 симв.): %s",
+                    je, raw[:500].replace("\n", " "),
+                )
+                return prices, sources, pct24h, oi
+
         if data.get("retCode") == 0:
             for item in data.get("result", {}).get("list", []):
                 sym = item.get("symbol")
@@ -2654,7 +2670,15 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
                 except (TypeError, ValueError):
                     pass
         else:
-            log.error("get_prices: retCode=%s msg=%s", data.get("retCode"), data.get("retMsg"))
+            # v25.3: раньше тут писалось только "retCode=None msg=None", что
+            # никак не объясняло причину — теперь дополнительно печатаем сырое
+            # тело ответа (обрезанное), чтобы было видно РЕАЛЬНУЮ причину:
+            # гео-блокировка IP хостинга Bybit'ом (частое явление на
+            # Railway/Heroku/AWS/GCP), rate-limit, обслуживающая страница и т.п.
+            log.error(
+                "get_prices: retCode=%s msg=%s | тело ответа (первые 500 симв.): %s",
+                data.get("retCode"), data.get("retMsg"), raw[:500].replace("\n", " "),
+            )
     except Exception as e:
         log.error("get_prices: %s", e)
     return prices, sources, pct24h, oi
