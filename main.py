@@ -4,6 +4,52 @@ Crypto Alert Bot — v25
 ЕДИНСТВЕННЫЙ источник данных. MEXC и OKX полностью удалены из кода.
 
 ═══════════════════════════════════════════════════════
+ НОВОЕ v25.2 — «ИЗМЕНЕНИЕ ЗА 24Ч» СТАЛО ОТДЕЛЬНЫМ УВЕДОМЛЕНИЕМ
+═══════════════════════════════════════════════════════
+• Регулировка по 24ч (кнопки 📈 Свой % (24ч) и 📈🚦 24ч-регулировка ВЫКЛ/ВКЛ,
+  а также команда /set_pct24h) теперь управляет ТОЛЬКО отдельным, новым
+  типом уведомления «🌐 ИЗМЕНЕНИЕ ЗА 24Ч» (БЛОК 1.6 в monitor()) — своя
+  логика, свой кулдаун (_pct24h_notify_cooldown, 1 час на монету), не
+  делит cooldown с обычными сигналами.
+• Обычные сигналы РОСТА/ПАДЕНИЯ (БЛОК 2) снова фильтруются ТОЛЬКО
+  внутренним порогом current_percent/current_window — точно как было до
+  v25. Регулировка по 24ч на них больше не влияет никак.
+• Сигнал РАЗВОРОТА (БЛОК 1) как не зависел от порога по 24ч, так и не
+  зависит.
+• Во всех трёх типах сигналов (рост/падение/разворот) строка
+  «🌐 24ч: +X.XX% (Bybit)» остаётся — она информационная и показывается
+  всегда, независимо от состояния кнопок 📈🚦, ровно как и просил запрос.
+
+═══════════════════════════════════════════════════════
+ НОВОЕ v25.1 — ЛИКВИДАЦИИ / OI / МУЛЬТИ-ТФ / КОРРЕЛЯЦИЯ С BTC
+═══════════════════════════════════════════════════════
+Всё ниже — ЧИСТО ИНФОРМАЦИОННЫЕ добавки в текст сигналов роста, падения и
+разворота. Ничего не фильтрует и не блокирует сами сигналы, новых кнопок
+не добавлено — как и было явно попрошено.
+• 🧨 Ликвидации: фоновая задача liquidation_listener() держит одно WS-
+  соединение к Bybit (topic allLiquidation.{symbol}, официальный публичный
+  канал — REST-эндпоинта для истории ликвидаций у Bybit не существует).
+  Копит объём ликвидированных лонгов/шортов в USDT по каждой монете за
+  скользящее окно (30 мин по умолчанию) и добавляет строку вида
+  "🧨 Ликвидации 30м: лонги $12.3K │ шорты $45.6K — шорты доминируют 🟢"
+  в сигналы. Полностью изолирована от остального бота: любая ошибка WS
+  (обрыв, недоступность) просто означает отсутствие строки в сигнале —
+  не влияет ни на мониторинг цен, ни на другие функции, и не считается
+  "падением фонового процесса" (не роняет и не перезапускает весь бот).
+• 📦 Открытый интерес (OI): openInterestValue разбирается из того же
+  тикера Bybit, что и цена/24ч-изменение (без единого лишнего запроса).
+  % изменения OI считается за то же окно, что и рост/падение цены, и
+  добавляется в сигнал с пометкой "подтверждает движение" (OI растёт в
+  ту же сторону) или "шорт-сквиз/закрытие позиций" (OI падает).
+• 🕐 Мульти-ТФ подтверждение: по уже загруженным свечам 1м/5м/15м (без
+  доп. HTTP) проверяется, совпадает ли направление движения на каждом
+  ТФ с направлением сигнала — строка вида "🕐 Подтверждение ТФ: 1м✅ 5м✅
+  15м❌ (2/3)".
+• ₿ Корреляция с BTC: сравнивается рост/падение сигнальной монеты с
+  ростом/падением BTCUSDT за то же окно — помогает отличить движение
+  всего рынка от локального движения по конкретной монете.
+
+═══════════════════════════════════════════════════════
  НОВОЕ v25 — СКРИНШОТ ГРАФИКА + РЕГУЛИРОВКА ПО 24Ч
 ═══════════════════════════════════════════════════════
 • 🖼 Скриншот графика в сигналах: к сигналам РОСТА, ПАДЕНИЯ и РАЗВОРОТА теперь
@@ -833,6 +879,11 @@ NOTIFY_BIG_MOVE_PCT: float = getattr(config, "NOTIFY_BIG_MOVE_PCT", 15.0)
 _notify_cooldown: dict[str, float] = {}   # {sym: last_sent_ts}
 NOTIFY_BIG_MOVE_COOLDOWN_SEC: int = 3600  # не чаще 1 раза в час
 
+# v25.2: отдельный кулдаун для уведомлений "Изменение за 24ч" (БЛОК 1.6) —
+# независим от _alert_cooldown обычных сигналов роста/падения.
+_pct24h_notify_cooldown: dict[str, float] = {}
+PCT24H_NOTIFY_COOLDOWN_SEC: int = 3600
+
 # ── v25: скриншот графика в сигналах (кнопки 🖼 График ВЫКЛ/ВКЛ) ──────────────
 CHART_ENABLED: bool = getattr(config, "CHART_ENABLED", True)
 CHART_TF:      str  = getattr(config, "CHART_TF", "Min60")   # ТФ графика, переключается кнопками 🖼📊
@@ -859,13 +910,26 @@ CHART_TF_CANDLES = {
 
 # ── v25: изменение за 24ч как на Bybit (price24hPcnt из тикера, без доп. запроса) ──
 pct24h_cache: dict[str, float] = {}   # {symbol: % изменения за 24ч по Bybit} — для отображения
-# Порог регулировки роста/падения по 24ч-изменению (кнопка 📈 Свой % (24ч) / /set_pct24h), 1–500%
-CUSTOM_PCT_24H: float = getattr(config, "CUSTOM_PCT_24H", 5.0)
-# Вкл/выкл: когда включено, обычные сигналы роста/падения (БЛОК 2) фильтруются
-# порогом CUSTOM_PCT_24H по 24ч-изменению цены (price24hPcnt), а не внутренним
-# порогом current_percent/current_window. Когда выключено — фильтрация как раньше
-# (current_percent/current_window), но поле "🌐 24ч: ..." в сообщениях остаётся.
-PCT24H_GATE_ENABLED: bool = getattr(config, "PCT24H_GATE_ENABLED", True)
+# v25.2: это ОТДЕЛЬНЫЙ тип уведомления "Изменение за 24ч" (БЛОК 1.6 в monitor()).
+# Кнопки 📈 Свой % (24ч) / 📈🚦 24ч-регулировка / /set_pct24h управляют ТОЛЬКО им
+# и НЕ влияют на обычные сигналы роста/падения (БЛОК 2) и разворот (БЛОК 1) —
+# там строка "🌐 24ч: ..." остаётся чисто информационной независимо от этих кнопок.
+CUSTOM_PCT_24H: float = getattr(config, "CUSTOM_PCT_24H", 5.0)   # порог уведомления, 1–500%
+PCT24H_GATE_ENABLED: bool = getattr(config, "PCT24H_GATE_ENABLED", True)  # вкл/выкл уведомления
+# ── v25.1: доп. рыночные данные в сигналах (только информационно, без
+# фильтрации/блокировки самих сигналов) — открытый интерес, ликвидации,
+# мульти-ТФ подтверждение, корреляция с BTC ────────────────────────────────
+oi_history: dict[str, list[tuple[float, float]]] = {}   # {symbol: [(ts, openInterestValue), ...]}
+
+LIQ_WS_URL         = "wss://stream.bybit.com/v5/public/linear"
+LIQ_WINDOW_SEC     = 1800   # окно суммирования ликвидаций для строки в сигнале (30 мин)
+LIQ_MAX_STORE_SEC  = 3600   # события храним чуть дольше окна, про запас
+LIQ_SUB_CHUNK      = 10     # топиков за один subscribe-запрос (щадяще к лимитам Bybit)
+
+_liq_events: dict[str, list[tuple[float, str, float]]] = {}  # {symbol: [(ts, side, usd_value), ...]}
+_liq_task: asyncio.Task | None = None
+liq_symbols: set[str] = set()   # актуальный набор символов для подписки на ликвидации
+
 # Режим ожидания ручного ввода числа с клавиатуры (кнопка 📈 Свой % (24ч))
 _awaiting_input: Optional[str] = None
 
@@ -1982,6 +2046,147 @@ async def broadcast_with_chart(sym: str, text: str):
     await broadcast(text)
 
 
+# ================================================================
+#  v25.1: ЛИКВИДАЦИИ (Bybit WS allLiquidation.{symbol})
+#  Только данные для строки в сигналах роста/падения/разворота — никаких
+#  новых команд/кнопок/фильтров. Полностью изолированный фоновый процесс:
+#  любая ошибка WS просто означает отсутствие строки в сигнале, остальной
+#  бот не затрагивается.
+# ================================================================
+
+def _fmt_usd(v: float) -> str:
+    if v >= 1_000_000:
+        return f"${v / 1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v / 1_000:.1f}K"
+    return f"${v:.0f}"
+
+
+def _liq_prune(sym: str, now: float):
+    events = _liq_events.get(sym)
+    if not events:
+        return
+    cutoff = now - LIQ_MAX_STORE_SEC
+    kept = [e for e in events if e[0] >= cutoff]
+    if kept:
+        _liq_events[sym] = kept
+    else:
+        _liq_events.pop(sym, None)
+
+
+def get_liq_summary(sym: str, window_sec: int = LIQ_WINDOW_SEC) -> Optional[dict]:
+    """
+    Сводка по ликвидациям монеты за последние window_sec секунд:
+    {"long_usd": ..., "short_usd": ..., "total_usd": ..., "count": ...}.
+    None — если по монете не было ни одного события (WS ещё не успел
+    накопить данные, либо соединение недоступно) — сигналы никогда не
+    ждут эти данные и не блокируются их отсутствием.
+
+    S="Buy"  → ликвидирован ЛОНГ  (принудительная продажа → давление вниз)
+    S="Sell" → ликвидирован ШОРТ (принудительная покупка → давление вверх)
+    (см. официальную документацию Bybit V5 allLiquidation: поле S — это
+    сторона ЛИКВИДИРОВАННОЙ ПОЗИЦИИ, а не сторона исполненного ордера)
+    """
+    events = _liq_events.get(sym)
+    if not events:
+        return None
+    cutoff = time.time() - window_sec
+    long_usd = short_usd = 0.0
+    count = 0
+    for ts, side, usd in events:
+        if ts < cutoff:
+            continue
+        count += 1
+        if side == "Buy":
+            long_usd += usd
+        else:
+            short_usd += usd
+    if count == 0:
+        return None
+    return {"long_usd": long_usd, "short_usd": short_usd, "total_usd": long_usd + short_usd, "count": count}
+
+
+def format_liq_line(sym: str, window_sec: int = LIQ_WINDOW_SEC) -> str:
+    """Готовая строка (с ведущим \\n) для сигнала, либо '' если данных нет."""
+    info = get_liq_summary(sym, window_sec)
+    if not info:
+        return ""
+    long_s, short_s = _fmt_usd(info["long_usd"]), _fmt_usd(info["short_usd"])
+    if info["long_usd"] > info["short_usd"] * 1.2:
+        verdict = " — лонги доминируют 🔴"
+    elif info["short_usd"] > info["long_usd"] * 1.2:
+        verdict = " — шорты доминируют 🟢"
+    else:
+        verdict = ""
+    return f"\n🧨 Ликвидации {_fmt_dur(window_sec)}: лонги {long_s} │ шорты {short_s}{verdict}"
+
+
+async def liquidation_listener():
+    """
+    Держит одно WS-соединение к Bybit (allLiquidation.*) и копит события в
+    _liq_events. При смене списка символов (liq_symbols, обновляется из
+    monitor()) — переподключается, чтобы синхронизировать подписки.
+    Никогда не поднимает исключение наружу — любая ошибка лишь откладывает
+    переподключение (экспоненциальный backoff, максимум 120с).
+    """
+    backoff = 5
+    while True:
+        try:
+            if not liq_symbols or _session is None:
+                await asyncio.sleep(5)
+                continue
+
+            subscribed_for = set(liq_symbols)
+            async with _session.ws_connect(
+                LIQ_WS_URL, heartbeat=20, timeout=aiohttp.ClientTimeout(total=None),
+            ) as ws:
+                log.info("Ликвидации: WS подключен, символов: %d", len(subscribed_for))
+                subs = [f"allLiquidation.{s}" for s in sorted(subscribed_for)]
+                for i in range(0, len(subs), LIQ_SUB_CHUNK):
+                    chunk = subs[i:i + LIQ_SUB_CHUNK]
+                    await ws.send_json({"op": "subscribe", "args": chunk})
+                    await asyncio.sleep(0.15)
+                backoff = 5
+                resub_deadline = time.time() + 1800  # раз в 30 мин — ресинхронизация подписок
+
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            payload = json.loads(msg.data)
+                        except Exception:
+                            continue
+                        topic = payload.get("topic", "")
+                        if topic.startswith("allLiquidation."):
+                            now = time.time()
+                            for item in payload.get("data", []) or []:
+                                try:
+                                    sym   = item.get("s")
+                                    side  = item.get("S")
+                                    qty   = float(item.get("v", 0))
+                                    price = float(item.get("p", 0))
+                                except (TypeError, ValueError):
+                                    continue
+                                if not sym or side not in ("Buy", "Sell") or qty <= 0 or price <= 0:
+                                    continue
+                                _liq_events.setdefault(sym, []).append((now, side, qty * price))
+                                _liq_prune(sym, now)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+
+                    # Символы обновились (monitor() раз в 30 мин тянет новый список)
+                    # или подошёл плановый ресаб — переподключаемся с новыми topics.
+                    if time.time() >= resub_deadline or liq_symbols != subscribed_for:
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("Ликвидации WS: %s (переподключение через %dс)", e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 120)
+            continue
+        await asyncio.sleep(1)
+
+
 def _rsi_signal_status_line(bold: bool = True) -> str:
     """
     Человекочитаемое описание текущего состояния RSI-фильтра роста/падения
@@ -2074,6 +2279,94 @@ def alert_emoji(growth: float) -> str:
     return "🚀" if growth > 0 else "📉"
 
 
+def _btc_window_growth(now: float, window_sec: int) -> Optional[float]:
+    """% изменение BTCUSDT за то же окно, что и у сигнала — для корреляции."""
+    hist = price_history.get("BTCUSDT")
+    if not hist:
+        return None
+    recent = [(t, p) for t, p in hist if now - t <= window_sec]
+    if len(recent) < 2:
+        return None
+    old_p = recent[0][1]
+    if old_p <= 0:
+        return None
+    return (recent[-1][1] - old_p) / old_p * 100
+
+
+def build_extra_market_context(
+    sym: str,
+    growth: float,
+    now: float,
+    klines_1m: dict,
+    klines_5m: dict,
+    klines_15m: dict,
+    oi_val: Optional[float] = None,
+    oi_change_pct: Optional[float] = None,
+) -> str:
+    """
+    v25.1: единый блок доп. рыночных данных для сигналов роста/падения/
+    разворота — мульти-ТФ подтверждение, корреляция с BTC, открытый
+    интерес, ликвидации. Это ЧИСТО ИНФОРМАЦИОННЫЙ блок — ничего не
+    фильтрует и не блокирует сами сигналы, только добавляет контекст.
+    Возвращает строку с ведущим \\n (или '' если добавить нечего).
+    """
+    parts: list[str] = []
+
+    # ── Мульти-ТФ подтверждение (по уже загруженным свечам, без доп. сети) ──
+    def _tf_growth(k: dict) -> Optional[float]:
+        c = (k or {}).get("closes") or []
+        if len(c) < 2 or c[0] == 0:
+            return None
+        return (c[-1] - c[0]) / c[0] * 100
+
+    g1, g5, g15 = _tf_growth(klines_1m), _tf_growth(klines_5m), _tf_growth(klines_15m)
+    marks, confirmed, total_known = [], 0, 0
+    for label, g in (("1м", g1), ("5м", g5), ("15м", g15)):
+        if g is None:
+            marks.append(f"{label}—")
+            continue
+        total_known += 1
+        if (g > 0) == (growth > 0) and abs(g) > 0.01:
+            marks.append(f"{label}✅")
+            confirmed += 1
+        else:
+            marks.append(f"{label}❌")
+    if total_known:
+        parts.append(f"🕐 Подтверждение ТФ: {' '.join(marks)} ({confirmed}/{total_known})")
+
+    # ── Корреляция с BTC ─────────────────────────────────────────────────
+    if sym != "BTCUSDT":
+        btc_g = _btc_window_growth(now, current_window)
+        if btc_g is not None:
+            same_dir = (btc_g > 0) == (growth > 0)
+            if abs(btc_g) >= 1.0 and same_dir:
+                parts.append(f"₿ BTC синхронно: <b>{btc_g:+.2f}%</b> — похоже на движение всего рынка")
+            elif abs(btc_g) < 0.3:
+                parts.append(f"₿ BTC почти не двигался ({btc_g:+.2f}%) — движение локальное, по монете")
+            else:
+                parts.append(f"₿ BTC: {btc_g:+.2f}% ({'та же сторона' if same_dir else 'в противофазе'})")
+
+    # ── Открытый интерес (OI) ────────────────────────────────────────────
+    if oi_val is not None:
+        oi_s = f"📦 OI: <code>{oi_val:,.0f}$</code>".replace(",", " ")
+        if oi_change_pct is not None and abs(oi_change_pct) >= 0.5:
+            same_dir_oi = (oi_change_pct > 0) == (growth > 0)
+            hint = (
+                "подтверждает движение новыми позициями" if (same_dir_oi and oi_change_pct > 0)
+                else "закрытие позиций / шорт-сквиз" if oi_change_pct < 0
+                else "расхождение с ценой"
+            )
+            oi_s += f"  <b>{oi_change_pct:+.2f}%</b> — {hint}"
+        parts.append(oi_s)
+
+    # ── Ликвидации ───────────────────────────────────────────────────────
+    liq_line = format_liq_line(sym)
+    if liq_line:
+        parts.append(liq_line.lstrip("\n"))
+
+    return ("\n" + "\n".join(parts)) if parts else ""
+
+
 def format_growth_alert(
     sym: str, price: float, growth: float,
     rsi: Optional[float], macd: Optional[float], source: str,
@@ -2086,6 +2379,7 @@ def format_growth_alert(
     rsi_tf_val:   Optional[float] = None,
     rsi_tf_level: Optional[float] = None,
     pct24h: Optional[float] = None,
+    extra: Optional[str] = None,
 ) -> str:
     emoji = alert_emoji(growth)
     sign  = "+" if growth > 0 else ""
@@ -2124,6 +2418,7 @@ def format_growth_alert(
         f"{rsi_tf_s}"
         f"{accel_s}"
         f"{pct24h_s}"
+        f"{extra or ''}"
         f"{chr(10) + breakout if breakout else ''}"
         f"{chr(10) + day_context if day_context else ''}"
         f"\n\n📋 <code>{sym}</code>"
@@ -2144,6 +2439,7 @@ def format_drop_alert(
     rsi_tf_val:   Optional[float] = None,
     rsi_tf_level: Optional[float] = None,
     pct24h: Optional[float] = None,
+    extra: Optional[str] = None,
 ) -> str:
     a     = abs(growth)
     emoji = "💥" if a >= 20 else "🔥" if a >= 10 else "📉"
@@ -2171,6 +2467,7 @@ def format_drop_alert(
         f"〽️ MACD: <code>{macd_s}</code>"
         f"{rsi_tf_s}"
         f"{pct24h_s}"
+        f"{extra or ''}"
         f"{chr(10) + breakout if breakout else ''}"
         f"{chr(10) + day_context if day_context else ''}"
         f"\n\n📋 <code>{sym}</code> #падение"
@@ -2186,6 +2483,7 @@ def format_reversal_alert(
     duration_sec: int = 0,
     window_sec:   int = 3600,
     pct24h:       Optional[float] = None,
+    extra:        Optional[str] = None,
 ) -> str:
     score      = rev["score"]
     max_score  = rev.get("max_score", 20)
@@ -2249,7 +2547,8 @@ def format_reversal_alert(
         f"  EMA gap: <code>{ema_s}</code>  │  Wick: <code>{wick_s}</code>"
         f"{candle_s}"
         f"{vol_s}"
-        f"{day_ctx_s}\n\n"
+        f"{day_ctx_s}"
+        f"{extra or ''}\n\n"
         f"<b>🎯 Цели шорта (Фибо):</b>\n"
         f"  Цель 1 (38.2%): {t1_s}\n"
         f"  Цель 2 (50.0%): {t3_s}\n"
@@ -2304,20 +2603,22 @@ async def get_symbols() -> set[str]:
 #  PRICES
 # ================================================================
 
-async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict]:
+async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
     """
     Текущие цены сразу по всем бессрочным USDT-фьючерсам Bybit —
     один HTTP-запрос вместо отдельных вызовов на каждую монету.
 
     v25: дополнительно разбирает поле price24hPcnt из того же самого ответа
-    тикера (Bybit отдаёт его "бесплатно" вместе с ценой — без единого лишнего
-    HTTP-запроса) — это официальное изменение цены за 24ч, как показывается
-    на самом Bybit. Используется для отображения в алертах и (опционально)
-    для фильтрации сигналов роста/падения по кнопке 📈🚦 24ч-регулировка.
+    тикера — официальное изменение цены за 24ч, как показывается на самом
+    Bybit.
+    v25.1: дополнительно разбирает поле openInterestValue (открытый интерес
+    в USDT) — тоже приходит "бесплатно" в том же ответе тикера, без единого
+    лишнего HTTP-запроса.
     """
     prices:  dict = {}
     sources: dict = {}
     pct24h:  dict = {}
+    oi:      dict = {}
     try:
         async with _session.get(
             "https://api.bybit.com/v5/market/tickers",
@@ -2343,11 +2644,17 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict]:
                         pct24h[sym] = float(raw_pcnt) * 100.0
                 except (TypeError, ValueError):
                     pass
+                try:
+                    raw_oi = item.get("openInterestValue")
+                    if raw_oi not in (None, ""):
+                        oi[sym] = float(raw_oi)
+                except (TypeError, ValueError):
+                    pass
         else:
             log.error("get_prices: retCode=%s msg=%s", data.get("retCode"), data.get("retMsg"))
     except Exception as e:
         log.error("get_prices: %s", e)
-    return prices, sources, pct24h
+    return prices, sources, pct24h, oi
 
 
 # ================================================================
@@ -2357,8 +2664,10 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict]:
 async def monitor():
     global current_percent, current_window, signals_count, reversal_count, checks_count, last_check_time
     global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT
+    global liq_symbols
 
     symbols          = await get_symbols()
+    liq_symbols       = set(symbols)   # v25.1: список для подписки на ликвидации (WS)
     last_symbols_upd = time.time()
     _cache_load_levels()
 
@@ -2382,10 +2691,11 @@ async def monitor():
                 new_sym = await get_symbols()
                 if new_sym:
                     symbols = new_sym
+                    liq_symbols = set(symbols)   # v25.1: ресинхронизация подписок на ликвидации
                     log.info("Монеты обновлены: %d", len(symbols))
                 last_symbols_upd = now
 
-            prices, sources, pct24h_map = await get_prices(symbols)
+            prices, sources, pct24h_map, oi_map = await get_prices(symbols)
             pct24h_cache.update(pct24h_map)
 
             for sym, price in prices.items():
@@ -2402,6 +2712,20 @@ async def monitor():
                 recent = [(t, p) for t, p in price_history[sym] if now - t <= current_window]
                 source = sources.get(sym, "UNKNOWN")
                 pct24h_val = pct24h_map.get(sym)   # v25: изменение за 24ч как на Bybit (может быть None)
+
+                # v25.1: открытый интерес (OI) — трекается для ВСЕХ монет каждый тик,
+                # аналогично price_history, чтобы % изменения был доступен для любого
+                # сигнала, который сработает по этой монете (без доп. HTTP-запросов —
+                # значение уже пришло в этом же тикере get_prices).
+                oi_val = oi_map.get(sym)
+                oi_change_pct = None
+                if oi_val is not None:
+                    oi_hist = oi_history.setdefault(sym, [])
+                    oi_hist.append((now, oi_val))
+                    oi_history[sym] = [(t, v) for t, v in oi_hist if now - t <= cutoff]
+                    oi_recent = [(t, v) for t, v in oi_history[sym] if now - t <= current_window]
+                    if len(oi_recent) >= 2 and oi_recent[0][1] > 0:
+                        oi_change_pct = (oi_val - oi_recent[0][1]) / oi_recent[0][1] * 100
 
                 if len(recent) < MIN_SAMPLES:
                     continue
@@ -2483,6 +2807,11 @@ async def monitor():
                                 duration_sec=duration,
                                 window_sec=REVERSAL_WINDOW_SEC,
                                 pct24h=pct24h_val,
+                                extra=build_extra_market_context(
+                                    sym, max(growth, peak_growth), now,
+                                    klines_1m, klines_5m, klines_15m,
+                                    oi_val=oi_val, oi_change_pct=oi_change_pct,
+                                ),
                             )
                             _reversal_cooldown[sym] = now
                             _reversal_last[sym] = {"price": price, "score": rev["score"], "ts": now}
@@ -2525,20 +2854,43 @@ async def monitor():
                         log.info("BigMove notify: %s %+.2f%%", sym, growth)
 
                 # ════════════════════════════════════════════════════════════
+                #  БЛОК 1.6: ОТДЕЛЬНОЕ УВЕДОМЛЕНИЕ ОБ ИЗМЕНЕНИИ ЗА 24Ч (как на Bybit)
+                # ════════════════════════════════════════════════════════════
+                # v25.2: полностью самостоятельный тип уведомления. Кнопки
+                # 📈 Свой % (24ч) и 📈🚦 24ч-регулировка ВЫКЛ/ВКЛ управляют ТОЛЬКО
+                # этим блоком — не влияют на обычные сигналы роста/падения
+                # (БЛОК 2) и не влияют на разворот (БЛОК 1). В сигналах
+                # роста/падения/разворота строка "🌐 24ч: ..." остаётся как
+                # была — чисто информационная, независимо от этой регулировки.
+                if PCT24H_GATE_ENABLED and pct24h_val is not None and abs(pct24h_val) >= CUSTOM_PCT_24H:
+                    last_p24 = _pct24h_notify_cooldown.get(sym, 0)
+                    if now - last_p24 >= PCT24H_NOTIFY_COOLDOWN_SEC:
+                        p24_emoji = "🚀" if pct24h_val > 0 else "📉"
+                        p24_label = "РОСТ" if pct24h_val > 0 else "ПАДЕНИЕ"
+                        rsi_str24 = f"{rsi:.1f}" if rsi is not None else "—"
+                        p24_text = (
+                            f"🌐 <b>ИЗМЕНЕНИЕ ЗА 24Ч — {p24_label}</b> (как на Bybit)\n\n"
+                            f"🪙 <b>{sym}</b>  [{source}]\n"
+                            f"💵 Цена: <code>{price}</code>\n"
+                            f"{p24_emoji} 24ч: <b>{pct24h_val:+.2f}%</b>  "
+                            f"(порог {CUSTOM_PCT_24H}%)\n"
+                            f"📊 RSI: <code>{rsi_str24}</code>\n\n"
+                            f"📋 <code>{sym}</code> #24ч"
+                        )
+                        _pct24h_notify_cooldown[sym] = now
+                        await broadcast(p24_text)
+                        log.info("24h notify: %s %+.2f%% (порог %.1f%%)", sym, pct24h_val, CUSTOM_PCT_24H)
+
+                # ════════════════════════════════════════════════════════════
                 #  БЛОК 2: ОБЫЧНЫЕ АЛЕРТЫ (РОСТ / ПАДЕНИЕ)
                 # ════════════════════════════════════════════════════════════
-                # v25: при включённой регулировке по 24ч (кнопка 📈🚦) обычные
-                # сигналы роста/падения фильтруются готовым 24ч-изменением цены
-                # с Bybit (price24hPcnt), а не внутренним окном — точно как на
-                # самой бирже. Если регулировка выключена (или Bybit ещё не
-                # прислал 24ч-данные по монете) — прежний порог current_percent
-                # по окну current_window.
-                if PCT24H_GATE_ENABLED and pct24h_val is not None:
-                    gate_metric, active_pct_threshold = pct24h_val, CUSTOM_PCT_24H
-                else:
-                    gate_metric, active_pct_threshold = growth, current_percent
+                # v25.2: обычные сигналы роста/падения снова фильтруются ТОЛЬКО
+                # внутренним порогом current_percent/current_window — так же,
+                # как было до v25. Регулировка по 24ч (кнопки 📈🚦) на эти
+                # сигналы больше не влияет — см. БЛОК 1.6 выше.
+                active_pct_threshold = current_percent
 
-                if abs(gate_metric) < active_pct_threshold:
+                if abs(growth) < active_pct_threshold:
                     level = _cache_get_level(sym)
                     if level and level["direction"] != direction:
                         _cache_clear_level(sym)
@@ -2592,6 +2944,10 @@ async def monitor():
                         rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
                         rsi_tf_level=RSI_SIGNAL_LEVEL if rsi_tf_label_show else None,
                         pct24h=pct24h_val,
+                        extra=build_extra_market_context(
+                            sym, growth, now, klines_1m, klines_5m, klines_15m,
+                            oi_val=oi_val, oi_change_pct=oi_change_pct,
+                        ),
                     )
                 else:
                     text = format_drop_alert(
@@ -2601,6 +2957,10 @@ async def monitor():
                         rsi_tf_label=rsi_tf_label_show, rsi_tf_val=rsi_filter_val,
                         rsi_tf_level=None,  # порог не применяется к падению — только значение RSI
                         pct24h=pct24h_val,
+                        extra=build_extra_market_context(
+                            sym, growth, now, klines_1m, klines_5m, klines_15m,
+                            oi_val=oi_val, oi_change_pct=oi_change_pct,
+                        ),
                     )
 
                 _cache_set_level(sym, price, direction)
@@ -2620,7 +2980,7 @@ async def monitor():
             if checks_count % 200 == 0:
                 # Удаляем устаревшие кулдауны
                 stale_ts = now - max(ALERT_COOLDOWN_SEC, REVERSAL_COOLDOWN_SEC) * 3
-                for d in (_alert_cooldown, _reversal_cooldown, _notify_cooldown):
+                for d in (_alert_cooldown, _reversal_cooldown, _notify_cooldown, _pct24h_notify_cooldown):
                     stale = [k for k, v in d.items() if v < stale_ts]
                     for k in stale:
                         d.pop(k, None)
@@ -2630,6 +2990,8 @@ async def monitor():
                 dead = [s for s, h in price_history.items() if not h or h[-1][0] < cutoff2]
                 for s in dead:
                     price_history.pop(s, None)
+                    oi_history.pop(s, None)         # v25.1
+                    _liq_events.pop(s, None)        # v25.1
                 if dead:
                     log.info("price_history: удалено %d мёртвых монет", len(dead))
 
@@ -2674,7 +3036,7 @@ async def handle_message(msg: dict):
             await send_message("⛔ Нет доступа к управлению. /subscribe — подписаться на алерты.", chat_id)
         return
 
-    # v25: режим ожидания ручного ввода числа после кнопки 📈 Свой % (24ч).
+    # v25.2: режим ожидания ручного ввода числа после кнопки 📈 Свой % (24ч).
     # Проверяется в первую очередь, чтобы обычное сообщение с числом (без
     # команды) не попало мимо цели ни в один другой обработчик ниже.
     if _awaiting_input == "custom_pct_24h":
@@ -2684,14 +3046,18 @@ async def handle_message(msg: dict):
             assert 1.0 <= val <= 500.0
             CUSTOM_PCT_24H = val
             status_hint = (
-                f"Гейт по 24ч <b>включён</b> — сигналы роста/падения теперь фильтруются "
-                f"этим порогом по изменению цены за 24ч (как на Bybit)."
+                f"Уведомление об изменении за 24ч <b>включено</b> — придёт отдельным "
+                f"сообщением, как только 24ч-изменение цены (как на Bybit) по какой-то "
+                f"монете превысит этот порог."
                 if PCT24H_GATE_ENABLED else
-                f"⚠️ Гейт по 24ч сейчас <b>выключен</b> (кнопка 📈🚦) — порог сохранён, "
-                f"но пока не применяется, действует обычный порог {current_percent}%."
+                f"⚠️ Уведомление об изменении за 24ч сейчас <b>выключено</b> (кнопка 📈🚦) "
+                f"— порог сохранён, но пока не применяется."
             )
             await send_message(
-                f"✅ Порог изменения за 24ч: <b>{CUSTOM_PCT_24H}%</b>\n{status_hint}",
+                f"✅ Порог отдельного уведомления «Изменение за 24ч»: <b>{CUSTOM_PCT_24H}%</b>\n"
+                f"{status_hint}\n\n"
+                f"На сигналы роста/падения/разворота это НЕ влияет — там строка "
+                f"«🌐 24ч: ...» просто информационная.",
                 chat_id,
             )
         except Exception:
@@ -2701,8 +3067,9 @@ async def handle_message(msg: dict):
     if text == "📈 Свой % (24ч)":
         _awaiting_input = "custom_pct_24h"
         await send_message(
-            f"✏️ Введите порог роста/падения за 24ч, число от <b>1</b> до <b>500</b> "
-            f"(например: 12.5).\nТекущий: <b>{CUSTOM_PCT_24H}%</b>",
+            f"✏️ Введите порог отдельного уведомления «Изменение за 24ч», число от "
+            f"<b>1</b> до <b>500</b> (например: 12.5).\nТекущий: <b>{CUSTOM_PCT_24H}%</b>\n\n"
+            f"На обычные сигналы роста/падения/разворота порог не влияет.",
             chat_id,
         )
         return
@@ -2712,7 +3079,10 @@ async def handle_message(msg: dict):
             val = float(text.split()[1].replace(",", "."))
             assert 1.0 <= val <= 500.0
             CUSTOM_PCT_24H = val
-            await send_message(f"✅ Порог изменения за 24ч: <b>{CUSTOM_PCT_24H}%</b>", chat_id)
+            await send_message(
+                f"✅ Порог отдельного уведомления «Изменение за 24ч»: <b>{CUSTOM_PCT_24H}%</b>",
+                chat_id,
+            )
         except Exception:
             await send_message(f"❌ /set_pct24h 12.5  (число от 1 до 500)\nТекущее: {CUSTOM_PCT_24H}%", chat_id)
         return
@@ -2720,10 +3090,10 @@ async def handle_message(msg: dict):
     if text == "📈🚦 24ч-регулировка ВЫКЛ":
         PCT24H_GATE_ENABLED = False
         await send_message(
-            "🚫 Регулировка по 24ч <b>выключена</b> — сигналы роста/падения снова "
-            f"фильтруются обычным порогом (<b>{current_percent}%</b> за окно "
-            f"{current_window // 60} мин). Строка «🌐 24ч: ...» в сигналах "
-            "как показывалась, так и продолжает показываться.",
+            "🚫 Отдельное уведомление «Изменение за 24ч» <b>выключено</b> — присылаться "
+            "не будет. На сигналы роста/падения/разворота это не влияет — они как "
+            "фильтровались обычным порогом (<b>current_percent</b>), так и фильтруются, "
+            "строка «🌐 24ч: ...» в них как показывалась, так и продолжает показываться.",
             chat_id,
         )
         return
@@ -2731,9 +3101,10 @@ async def handle_message(msg: dict):
     if text == "📈🚦 24ч-регулировка ВКЛ":
         PCT24H_GATE_ENABLED = True
         await send_message(
-            f"✅ Регулировка по 24ч <b>включена</b> — сигналы роста/падения теперь "
-            f"фильтруются порогом <b>{CUSTOM_PCT_24H}%</b> по изменению цены за 24ч "
-            f"(как на Bybit, поле price24hPcnt).",
+            f"✅ Отдельное уведомление «Изменение за 24ч» <b>включено</b> — придёт, как "
+            f"только 24ч-изменение цены (как на Bybit, поле price24hPcnt) по какой-то "
+            f"монете превысит <b>{CUSTOM_PCT_24H}%</b>. На обычные сигналы "
+            f"роста/падения/разворота это не влияет.",
             chat_id,
         )
         return
@@ -2788,9 +3159,13 @@ async def handle_message(msg: dict):
             f"🔄📊 RSI-гейт разворота: {_rsi_reversal_status_line()} (не зависит от 20 факторов)\n"
             f"🖼 График в сигналах: {'<b>ВКЛЮЧЕН</b>' if CHART_ENABLED else '<b>ВЫКЛЮЧЕН</b>'} "
             f"({CHART_TF_LABELS.get(CHART_TF, CHART_TF)}, как на Bybit)\n"
-            f"📈🚦 Регулировка по 24ч: {'<b>ВКЛЮЧЕНА</b>' if PCT24H_GATE_ENABLED else '<b>ВЫКЛЮЧЕНА</b>'} "
-            f"— порог <b>{CUSTOM_PCT_24H}%</b>\n"
+            f"🌐 Уведомление «24ч» (отдельное): {'<b>ВКЛЮЧЕНО</b>' if PCT24H_GATE_ENABLED else '<b>ВЫКЛЮЧЕНО</b>'} "
+            f"— порог <b>{CUSTOM_PCT_24H}%</b> (не влияет на сигналы роста/падения/разворота)\n"
+            f"🧨 Ликвидации WS: {'<b>подключены</b>' if _liq_events else '<b>ещё копят данные…</b>'}\n"
             f"{'⏸ Пауза активна' if monitor_paused else '▶️ Мониторинг активен'}\n\n"
+            f"ℹ️ В сигналы роста/падения/разворота теперь автоматически добавляются: "
+            f"мульти-ТФ подтверждение (1м/5м/15м), корреляция с BTC, открытый интерес "
+            f"и ликвидации — это просто доп. данные в тексте сигнала, без новых кнопок.\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
             f"  📉 Разворот 1-25% — минимальный рост для шорт-разворота\n"
@@ -2811,10 +3186,11 @@ async def handle_message(msg: dict):
             f"  🖼 График ВЫКЛ/ВКЛ — прикладывать ли скриншот свечного графика "
             f"{CHART_TF_LABELS.get(CHART_TF, CHART_TF)} (как на Bybit) к сигналам роста/падения/разворота\n"
             f"  🖼📊 ТФ 1м/15м/1ч/2ч/4ч/1д — таймфрейм графика, который прикладывается к сигналам\n"
-            f"  📈 Свой % (24ч) — ввести порог 1–500% для регулировки по 24ч-изменению\n"
-            f"  📈🚦 24ч-регулировка ВЫКЛ/ВКЛ — переключить фильтрацию сигналов "
-            f"роста/падения на изменение цены за 24ч (как на Bybit) или обратно на "
-            f"обычный порог; поле «🌐 24ч: ...» в сообщениях показывается в любом случае\n"
+            f"  📈 Свой % (24ч) — порог 1–500% для ОТДЕЛЬНОГО уведомления «Изменение "
+            f"за 24ч» (не влияет на сигналы роста/падения/разворота)\n"
+            f"  📈🚦 24ч-регулировка ВЫКЛ/ВКЛ — вкл/выкл этого отдельного уведомления; "
+            f"строка «🌐 24ч: ...» в сигналах роста/падения/разворота показывается "
+            f"всегда, независимо от этой кнопки\n"
             f"  ⚙️ Настройки разворота — все параметры\n"
             f"  🔄 Полный перезапуск — перезапуск без потери данных\n"
             f"  🆘 Помощь — краткая справка\n\n"
@@ -2871,8 +3247,8 @@ async def handle_message(msg: dict):
             f"📊 RSI РОСТА: {_rsi_signal_status_line()} (падение — без порога)\n"
             f"🔄📊 RSI-гейт разворота: {_rsi_reversal_status_line()} (вне факторов)\n"
             f"🖼 График в сигналах: {'ВКЛЮЧЕН' if CHART_ENABLED else 'ВЫКЛЮЧЕН'}\n"
-            f"📈🚦 Регулировка по 24ч: {'ВКЛЮЧЕНА' if PCT24H_GATE_ENABLED else 'ВЫКЛЮЧЕНА'} "
-            f"(порог {CUSTOM_PCT_24H}%)\n\n"
+            f"🌐 Уведомление «24ч» (отдельное): {'ВКЛЮЧЕНО' if PCT24H_GATE_ENABLED else 'ВЫКЛЮЧЕНО'} "
+            f"(порог {CUSTOM_PCT_24H}%, на сигналы роста/падения/разворота не влияет)\n\n"
             f"<b>Кнопки управления:</b>\n"
             f"  📈 0.2%/5%/10%/15%/20% — порог роста/падения алертов\n"
             f"  📉 Разворот 1-25% — мин. рост для шорт-разворота\n"
@@ -2885,9 +3261,9 @@ async def handle_message(msg: dict):
             f"  🔄📊 RSI ТФ / RSI ≥ — таймфрейм и порог жёсткого RSI-гейта разворота\n"
             f"  🖼 График ВЫКЛ/ВКЛ — скриншот свечного графика (как на Bybit) в сигналах\n"
             f"  🖼📊 ТФ 1м/15м/1ч/2ч/4ч/1д — таймфрейм графика в сигналах\n"
-            f"  📈 Свой % (24ч) — ввести порог 1–500% по изменению за 24ч\n"
-            f"  📈🚦 24ч-регулировка ВЫКЛ/ВКЛ — фильтровать рост/падение по 24ч (как на "
-            f"Bybit) или по обычному внутреннему порогу; поле 🌐24ч в сообщениях есть всегда\n"
+            f"  📈 Свой % (24ч) — порог 1–500% ОТДЕЛЬНОГО уведомления «Изменение за 24ч»\n"
+            f"  📈🚦 24ч-регулировка ВЫКЛ/ВКЛ — вкл/выкл этого уведомления; на сигналы "
+            f"роста/падения/разворота (и строку 🌐24ч в них) не влияет\n"
             f"  ⚙️ Настройки разворота — все параметры детально\n"
             f"  🔄 Полный перезапуск — перезапуск процесса без потери данных\n\n"
             f"Полный список команд: /menu",
@@ -2931,7 +3307,7 @@ async def handle_message(msg: dict):
             f"⏱ Период: {current_window // 60} мин\n"
             f"🖼 График в сигналах: {'ВКЛЮЧЕН' if CHART_ENABLED else 'ВЫКЛЮЧЕН'} "
             f"({CHART_TF_LABELS.get(CHART_TF, CHART_TF)})\n"
-            f"📈🚦 Регулировка по 24ч: {'ВКЛЮЧЕНА' if PCT24H_GATE_ENABLED else 'ВЫКЛЮЧЕНА'} "
+            f"🌐 Уведомление «24ч»: {'ВКЛЮЧЕНО' if PCT24H_GATE_ENABLED else 'ВЫКЛЮЧЕНО'} "
             f"(порог {CUSTOM_PCT_24H}%)\n"
             f"⚡ Интервал: {config.INTERVAL} сек\n"
             f"👥 Подписчиков: {len(db_get_subscribers())}\n"
@@ -3643,7 +4019,7 @@ def handle_async_exception(loop, context):
 # ================================================================
 
 async def main():
-    global monitor_task, _session, _shutdown_event
+    global monitor_task, _session, _shutdown_event, _liq_task
 
     _shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -3664,6 +4040,11 @@ async def main():
     async with aiohttp.ClientSession(connector=connector) as session:
         _session     = session
         monitor_task = asyncio.create_task(monitor())
+        # v25.1: ликвидации — полностью изолированная фоновая задача. Специально
+        # НЕ добавляется в список tasks ниже (который слушается через
+        # FIRST_COMPLETED): она сама ловит все свои ошибки и никогда не должна
+        # приводить к перезапуску всего бота, если WS-поток ликвидаций недоступен.
+        _liq_task = asyncio.create_task(liquidation_listener())
 
         # Удаляем вебхук если активен (иначе getUpdates не работает)
         try:
@@ -3734,6 +4115,16 @@ async def main():
             if not t.done():
                 t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+
+        # v25.1: _liq_task не входит в tasks/pending (специально изолирован от
+        # FIRST_COMPLETED выше) — отменяем его отдельно, чтобы не оставить
+        # висящую WS-задачу при штатном завершении процесса.
+        if _liq_task and not _liq_task.done():
+            _liq_task.cancel()
+            try:
+                await _liq_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     log.info("Бот остановлен")
     return graceful
