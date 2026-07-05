@@ -4,6 +4,31 @@ Crypto Alert Bot — v25
 ЕДИНСТВЕННЫЙ источник данных. MEXC и OKX полностью удалены из кода.
 
 ═══════════════════════════════════════════════════════
+ НОВОЕ v25.4 — ФАНДИНГ (СТАВКА ФИНАНСИРОВАНИЯ) ВО ВСЕХ УВЕДОМЛЕНИЯХ
+═══════════════════════════════════════════════════════
+• 💰 Фандинг: get_prices() дополнительно разбирает поля fundingRate и
+  nextFundingTime из того же самого тикера Bybit, что уже используется для
+  цены/24ч-изменения/OI — без единого лишнего HTTP-запроса. fundingRate
+  приходит от Bybit долей (например "0.0001"), переводится в проценты
+  (×100) точно так же, как уже сделано для price24hPcnt — никаких
+  придуманных коэффициентов.
+• Строка "💰 Фандинг: +X.XXXX% — <кто платит кому> · след. через Hч ММм"
+  добавлена во ВСЕ уведомления, где показываются рыночные данные по
+  монете: сигналы РОСТА и ПАДЕНИЯ (БЛОК 2), сигнал РАЗВОРОТА (БЛОК 1) — через
+  общий build_extra_market_context(), и отдельное уведомление
+  "🌐 ИЗМЕНЕНИЕ ЗА 24Ч" (БЛОК 1.6). Знак ставки — как есть у Bybit:
+  положительная → лонги платят шортам, отрицательная → шорты платят лонгам.
+  Строка не показывается только если Bybit не прислал fundingRate для
+  монеты (например, в момент временных сбоев ответа тикера) — это чисто
+  информационное поле, оно ничего не фильтрует и не блокирует сами сигналы,
+  как и OI/ликвидации/24ч-изменение.
+• Мелкие попутные исправления при ревизии кода: pct24h_cache и
+  funding_cache теперь тоже очищаются от "мёртвых" монет вместе с
+  price_history/oi_history/_liq_events (раньше туда попадали значения и
+  оставались там навсегда даже для монет, переставших торговаться —
+  небольшая, но постоянная утечка памяти на долго работающем процессе).
+
+═══════════════════════════════════════════════════════
  НОВОЕ v25.3 — НАСТРОЙКИ ПЕРЕЖИВАЮТ ПЕРЕЗАПУСК, УБРАН СИГНАЛ "КРУПНОЕ ДВИЖЕНИЕ",
  УВЕДОМЛЕНИЯ О НЕРАБОТЕ БОТА
 ═══════════════════════════════════════════════════════
@@ -408,10 +433,14 @@ Crypto Alert Bot — v25
 ═══════════════════════════════════════════════════════
  О CoinGlass
 ═══════════════════════════════════════════════════════
-Интеграция с CoinGlass (ликвидации, открытый интерес, funding rate, long/short
-ratio) НЕ включена в эту версию — требует платного API-ключа CoinGlass.
-Архитектура detect_short_reversal() уже модульная: для добавления CoinGlass
-как 17-го+ фактора достаточно написать async-функцию получения данных и
+Ликвидации, открытый интерес и (с v25.4) funding rate уже реализованы БЕЗ
+CoinGlass — напрямую с публичного API Bybit (WS allLiquidation.{symbol} и
+поля openInterestValue/fundingRate из тикера), без платного ключа.
+Интеграция именно с CoinGlass (например, ради long/short ratio по всему
+рынку или сводных данных сразу по нескольким биржам) НЕ включена в эту
+версию — требует платного API-ключа CoinGlass. Архитектура
+detect_short_reversal() уже модульная: для добавления CoinGlass как
+17-го+ фактора достаточно написать async-функцию получения данных и
 добавить её в get_bybit_klines_multi()-подобный параллельный gather, затем
 добавить блок в detect_short_reversal(). При наличии ключа — обращайтесь,
 добавим этот функционал отдельным патчем.
@@ -988,6 +1017,9 @@ CHART_TF_CANDLES = {
 
 # ── v25: изменение за 24ч как на Bybit (price24hPcnt из тикера, без доп. запроса) ──
 pct24h_cache: dict[str, float] = {}   # {symbol: % изменения за 24ч по Bybit} — для отображения
+
+# ── v25.4: фандинг (ставка финансирования) из того же тикера, без доп. запроса ──
+funding_cache: dict[str, tuple[float, Optional[float]]] = {}   # {symbol: (ставка_%, nextFundingTime_сек)}
 # v25.2: это ОТДЕЛЬНЫЙ тип уведомления "Изменение за 24ч" (БЛОК 1.6 в monitor()).
 # Кнопки 📈 Свой % (24ч) / 📈🚦 24ч-регулировка / /set_pct24h управляют ТОЛЬКО им
 # и НЕ влияют на обычные сигналы роста/падения (БЛОК 2) и разворот (БЛОК 1) —
@@ -2379,6 +2411,45 @@ def _btc_window_growth(now: float, window_sec: int) -> Optional[float]:
     return (recent[-1][1] - old_p) / old_p * 100
 
 
+def format_funding_line(
+    funding_val: Optional[float],
+    funding_next_ts: Optional[float],
+    now: float,
+) -> str:
+    """
+    v25.4: единая строка фандинга (ставки финансирования) для бессрочных
+    фьючерсов Bybit — переиспользуется и в сигналах роста/падения/разворота
+    (через build_extra_market_context), и в отдельном уведомлении
+    "Изменение за 24ч", чтобы формат везде был идентичным.
+
+    funding_val — ставка в % (уже умножена на 100 в get_prices, знак сохранён
+    как есть у Bybit: положительная ставка → лонги платят шортам,
+    отрицательная → шорты платят лонгам).
+    funding_next_ts — время следующей выплаты фандинга (unix-время, секунды),
+    используется только для строки "след. через Xч Yм"; если недоступно —
+    просто не показываем этот фрагмент (не считаем ошибкой).
+
+    Возвращает строку БЕЗ ведущего \\n (или '' если funding_val is None) —
+    вызывающий код сам решает, добавлять ли перенос строки/добавлять в parts.
+    """
+    if funding_val is None:
+        return ""
+    if funding_val > 0.0001:
+        hint = "лонги платят шортам"
+    elif funding_val < -0.0001:
+        hint = "шорты платят лонгам"
+    else:
+        hint = "нейтрально"
+    next_s = ""
+    if funding_next_ts is not None:
+        remain = funding_next_ts - now
+        if remain > 0:
+            h = int(remain // 3600)
+            m = int((remain % 3600) // 60)
+            next_s = f" · след. через {h}ч{m:02d}м"
+    return f"💰 Фандинг: <b>{funding_val:+.4f}%</b> — {hint}{next_s}"
+
+
 def build_extra_market_context(
     sym: str,
     growth: float,
@@ -2388,12 +2459,16 @@ def build_extra_market_context(
     klines_15m: dict,
     oi_val: Optional[float] = None,
     oi_change_pct: Optional[float] = None,
+    funding_val: Optional[float] = None,
+    funding_next_ts: Optional[float] = None,
 ) -> str:
     """
     v25.1: единый блок доп. рыночных данных для сигналов роста/падения/
     разворота — мульти-ТФ подтверждение, корреляция с BTC, открытый
-    интерес, ликвидации. Это ЧИСТО ИНФОРМАЦИОННЫЙ блок — ничего не
-    фильтрует и не блокирует сами сигналы, только добавляет контекст.
+    интерес, ликвидации.
+    v25.4: + фандинг (ставка финансирования, format_funding_line).
+    Это ЧИСТО ИНФОРМАЦИОННЫЙ блок — ничего не фильтрует и не блокирует сами
+    сигналы, только добавляет контекст.
     Возвращает строку с ведущим \\n (или '' если добавить нечего).
     """
     parts: list[str] = []
@@ -2444,6 +2519,11 @@ def build_extra_market_context(
             )
             oi_s += f"  <b>{oi_change_pct:+.2f}%</b> — {hint}"
         parts.append(oi_s)
+
+    # ── Фандинг (ставка финансирования) ─────────────────────────────────
+    funding_line = format_funding_line(funding_val, funding_next_ts, now)
+    if funding_line:
+        parts.append(funding_line)
 
     # ── Ликвидации ───────────────────────────────────────────────────────
     liq_line = format_liq_line(sym)
@@ -2689,7 +2769,7 @@ async def get_symbols() -> set[str]:
 #  PRICES
 # ================================================================
 
-async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
+async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict, dict]:
     """
     Текущие цены сразу по всем бессрочным USDT-фьючерсам Bybit —
     один HTTP-запрос вместо отдельных вызовов на каждую монету.
@@ -2700,11 +2780,20 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
     v25.1: дополнительно разбирает поле openInterestValue (открытый интерес
     в USDT) — тоже приходит "бесплатно" в том же ответе тикера, без единого
     лишнего HTTP-запроса.
+    v25.4: дополнительно разбирает поля fundingRate и nextFundingTime —
+    ставка финансирования (фандинг) для бессрочных фьючерсов, тоже приходит
+    в том же ответе тикера, без единого лишнего HTTP-запроса. fundingRate
+    от Bybit приходит долей (например "0.0001" = 0.01%), поэтому переводим
+    в проценты умножением на 100 — точно так же, как уже сделано для
+    price24hPcnt. nextFundingTime приходит как строка миллисекунд unix-эпохи
+    — переводим в секунды (float), чтобы дальше было удобно сравнивать с
+    time.time().
     """
     prices:  dict = {}
     sources: dict = {}
     pct24h:  dict = {}
     oi:      dict = {}
+    funding: dict = {}   # {symbol: (ставка_в_%, nextFundingTime_в_секундах_или_None)}
     try:
         async with _session.get(
             "https://api.bybit.com/v5/market/tickers",
@@ -2718,7 +2807,7 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
                     "get_prices: HTTP %s от Bybit (не 200). Тело ответа (первые 500 симв.): %s",
                     status, raw[:500].replace("\n", " "),
                 )
-                return prices, sources, pct24h, oi
+                return prices, sources, pct24h, oi, funding
             try:
                 data = json.loads(raw)
             except Exception as je:
@@ -2726,7 +2815,7 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
                     "get_prices: не удалось разобрать JSON (%s). Тело ответа (первые 500 симв.): %s",
                     je, raw[:500].replace("\n", " "),
                 )
-                return prices, sources, pct24h, oi
+                return prices, sources, pct24h, oi, funding
 
         if data.get("retCode") == 0:
             for item in data.get("result", {}).get("list", []):
@@ -2752,6 +2841,20 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
                         oi[sym] = float(raw_oi)
                 except (TypeError, ValueError):
                     pass
+                try:
+                    raw_funding = item.get("fundingRate")
+                    if raw_funding not in (None, ""):
+                        funding_pct = float(raw_funding) * 100.0
+                        raw_next = item.get("nextFundingTime")
+                        next_ts = None
+                        if raw_next not in (None, "", "0"):
+                            try:
+                                next_ts = float(raw_next) / 1000.0
+                            except (TypeError, ValueError):
+                                next_ts = None
+                        funding[sym] = (funding_pct, next_ts)
+                except (TypeError, ValueError):
+                    pass
         else:
             # v25.3: раньше тут писалось только "retCode=None msg=None", что
             # никак не объясняло причину — теперь дополнительно печатаем сырое
@@ -2764,7 +2867,7 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
             )
     except Exception as e:
         log.error("get_prices: %s", e)
-    return prices, sources, pct24h, oi
+    return prices, sources, pct24h, oi, funding
 
 
 # ================================================================
@@ -2787,7 +2890,7 @@ async def monitor():
         "ℹ️ state.json не найден — используются настройки по умолчанию из config.py."
     )
     await broadcast(
-        f"✅ <b>Бот запущен</b> (v25.3)\n{_settings_restored_note}"
+        f"✅ <b>Бот запущен</b> (v25.4)\n{_settings_restored_note}"
     )
 
     while True:
@@ -2812,8 +2915,9 @@ async def monitor():
                     log.info("Монеты обновлены: %d", len(symbols))
                 last_symbols_upd = now
 
-            prices, sources, pct24h_map, oi_map = await get_prices(symbols)
+            prices, sources, pct24h_map, oi_map, funding_map = await get_prices(symbols)
             pct24h_cache.update(pct24h_map)
+            funding_cache.update(funding_map)
 
             for sym, price in prices.items():
                 await asyncio.sleep(0)
@@ -2843,6 +2947,11 @@ async def monitor():
                     oi_recent = [(t, v) for t, v in oi_history[sym] if now - t <= current_window]
                     if len(oi_recent) >= 2 and oi_recent[0][1] > 0:
                         oi_change_pct = (oi_val - oi_recent[0][1]) / oi_recent[0][1] * 100
+
+                # v25.4: фандинг — как и pct24h, чисто информационное значение
+                # из уже полученного тикера (без доп. HTTP-запроса).
+                funding_info = funding_map.get(sym)
+                funding_val, funding_next_ts = funding_info if funding_info else (None, None)
 
                 if len(recent) < MIN_SAMPLES:
                     continue
@@ -2928,6 +3037,7 @@ async def monitor():
                                     sym, max(growth, peak_growth), now,
                                     klines_1m, klines_5m, klines_15m,
                                     oi_val=oi_val, oi_change_pct=oi_change_pct,
+                                    funding_val=funding_val, funding_next_ts=funding_next_ts,
                                 ),
                             )
                             _reversal_cooldown[sym] = now
@@ -2964,13 +3074,18 @@ async def monitor():
                         p24_emoji = "🚀" if pct24h_val > 0 else "📉"
                         p24_label = "РОСТ" if pct24h_val > 0 else "ПАДЕНИЕ"
                         rsi_str24 = f"{rsi:.1f}" if rsi is not None else "—"
+                        # v25.4: та же строка фандинга, что и в остальных уведомлениях —
+                        # чисто информационная, ничего не фильтрует.
+                        funding_line24 = format_funding_line(funding_val, funding_next_ts, now)
+                        funding_s24 = f"\n{funding_line24}" if funding_line24 else ""
                         p24_text = (
                             f"🌐 <b>ИЗМЕНЕНИЕ ЗА 24Ч — {p24_label}</b> (как на Bybit)\n\n"
                             f"🪙 <b>{sym}</b>  [{source}]\n"
                             f"💵 Цена: <code>{price}</code>\n"
                             f"{p24_emoji} 24ч: <b>{pct24h_val:+.2f}%</b>  "
                             f"(порог {CUSTOM_PCT_24H}%)\n"
-                            f"📊 RSI: <code>{rsi_str24}</code>\n\n"
+                            f"📊 RSI: <code>{rsi_str24}</code>"
+                            f"{funding_s24}\n\n"
                             f"📋 <code>{sym}</code> #24ч"
                         )
                         _pct24h_notify_cooldown[sym] = now
@@ -3043,6 +3158,7 @@ async def monitor():
                         extra=build_extra_market_context(
                             sym, growth, now, klines_1m, klines_5m, klines_15m,
                             oi_val=oi_val, oi_change_pct=oi_change_pct,
+                            funding_val=funding_val, funding_next_ts=funding_next_ts,
                         ),
                     )
                 else:
@@ -3056,6 +3172,7 @@ async def monitor():
                         extra=build_extra_market_context(
                             sym, growth, now, klines_1m, klines_5m, klines_15m,
                             oi_val=oi_val, oi_change_pct=oi_change_pct,
+                            funding_val=funding_val, funding_next_ts=funding_next_ts,
                         ),
                     )
 
@@ -3088,6 +3205,8 @@ async def monitor():
                     price_history.pop(s, None)
                     oi_history.pop(s, None)         # v25.1
                     _liq_events.pop(s, None)        # v25.1
+                    pct24h_cache.pop(s, None)        # v25.4: раньше не чистился — медленная утечка памяти
+                    funding_cache.pop(s, None)       # v25.4
                 if dead:
                     log.info("price_history: удалено %d мёртвых монет", len(dead))
 
