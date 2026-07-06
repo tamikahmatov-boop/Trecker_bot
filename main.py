@@ -4,6 +4,33 @@ Crypto Alert Bot — v25
 ЕДИНСТВЕННЫЙ источник данных. MEXC и OKX полностью удалены из кода.
 
 ═══════════════════════════════════════════════════════
+ НОВОЕ v25.8 — ИСПРАВЛЕНЫ ЛОЖНЫЕ ОШИБКИ "editMessageText: HTTP 400" В ЛОГЕ
+═══════════════════════════════════════════════════════
+• ПРИЧИНА: _last_pushed_settings_json (кэш "что уже отправлено в Telegram")
+  — переменная в памяти процесса, она сбрасывается в None при КАЖДОМ
+  перезапуске бота. После рестарта, если настройки не менялись, содержимое
+  закреплённого сообщения в Telegram уже правильное — но бот об этом "не
+  помнит" и всё равно пытается его обновить при первом же save_state()
+  (каждые 30с или сразу после любой кнопки). Telegram в ответ на попытку
+  заменить текст сообщения ТАКИМ ЖЕ текстом отвечает HTTP 400 "message is
+  not modified" — это не сбой, а нормальный ответ API, но раньше он
+  трактовался как ошибка и логировался как WARNING на каждой попытке.
+• ИСПРАВЛЕНО:
+  1) _tg_api_sync теперь отдельно ловит urllib.error.HTTPError и читает
+     тело ответа (раньше при HTTP-ошибке тело терялось, и не было видно
+     настоящую причину — только код HTTP);
+  2) push_state_to_telegram_sync распознаёт "message is not modified" в
+     description ответа и засчитывает это как успех, без warning в лог;
+  3) load_state() теперь сразу после восстановления из Telegram-бэкапа
+     инициализирует _last_pushed_settings_json текущим состоянием (если
+     набор SETTINGS_KEYS не менялся с прошлого пуша) — так что после
+     обычного рестарта без изменения настроек лишний editMessageText вообще
+     не отправляется, а не просто "тихо" получает 400.
+• Функционально ничего не изменилось — резервная копия настроек в Telegram
+  как сохранялась и восстанавливалась при каждом рестарте/редеплое (v25.6),
+  так и продолжает; просто убран ложный шум в логе и лишний HTTP-запрос.
+
+═══════════════════════════════════════════════════════
  НОВОЕ v25.7 — УСТРАНЕНА ПРИЧИНА "ACCESS TOO FREQUENT" ОТ BYBIT, УСКОРЕНИЕ
 ═══════════════════════════════════════════════════════
 • ГЛАВНАЯ ПРИЧИНА блокировки: klines_multi (3 HTTP-запроса — Min1+Min5+
@@ -994,12 +1021,22 @@ def _tg_api_sync(method: str, params: dict, timeout: int = 10) -> Optional[dict]
     старте модуля (load_state вызывается до создания _session) и в
     sync-обработчике сигнала (_handle_signal). Тот же подход уже используется
     в notify_sync() для тех же целей.
-    Возвращает распарсенный JSON-ответ или None при любой ошибке (сеть,
-    таймаут, невалидный JSON) — вызывающий код должен считать отсутствие
-    результата некритичным и просто использовать резервный источник данных.
+
+    v25.8: раньше HTTP-ошибки (4xx/5xx) ловились общим except Exception, из-за
+    чего терялось тело ответа — а у Telegram оно почти всегда содержит
+    осмысленное поле "description" (например, "Bad Request: message is not
+    modified"), которое вызывающему коду важно уметь отличать от настоящего
+    сбоя. Теперь urllib.error.HTTPError обрабатывается отдельно и тело
+    ответа читается и парсится как обычно.
+
+    Возвращает распарсенный JSON-ответ (в т.ч. при HTTP-ошибке, если Telegram
+    прислал JSON-тело с описанием) или None при полном сбое сети/таймауте/
+    невалидном JSON — вызывающий код должен считать отсутствие результата
+    некритичным и просто использовать резервный источник данных.
     """
+    import urllib.error
+    import urllib.request
     try:
-        import urllib.request
         data = json.dumps(params).encode("utf-8")
         req = urllib.request.Request(
             f"{TG}/{method}",
@@ -1008,6 +1045,13 @@ def _tg_api_sync(method: str, params: dict, timeout: int = 10) -> Optional[dict]
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8")
+            return json.loads(body)
+        except Exception:
+            log.warning("_tg_api_sync(%s): HTTP %s (тело не распарсить)", method, e.code)
+            return None
     except Exception as e:
         log.warning("_tg_api_sync(%s): %s", method, e)
         return None
@@ -1054,6 +1098,14 @@ def push_state_to_telegram_sync(force: bool = False) -> None:
             "chat_id": chat_id, "message_id": pinned["message_id"], "text": text,
         })
         ok = bool(result and result.get("ok"))
+        if not ok and result and "not modified" in str(result.get("description", "")).lower():
+            # v25.8: Telegram отвечает 400 "message is not modified", если текст
+            # уже точно такой же, как сейчас закреплён — например, сразу после
+            # рестарта, когда _last_pushed_settings_json ещё пуст (сбросился при
+            # перезапуске процесса), а в Telegram уже лежит актуальный бэкап с
+            # прошлого запуска. Это НЕ ошибка — контент и так уже правильный,
+            # просто считаем пуш успешным и не спамим лог warning'ом.
+            ok = True
     else:
         # Либо ещё никогда не сохраняли, либо закреплено что-то другое
         # (например, владелец сам закрепил постороннее сообщение) — отправляем
@@ -1154,6 +1206,7 @@ def load_state():
     """
     global last_alert_growth
     global _state_restore_source
+    global _last_pushed_settings_json
 
     file_data: Optional[dict] = None
     try:
@@ -1190,6 +1243,23 @@ def load_state():
     else:
         log.info("Ни закреплённого сообщения Telegram, ни state.json не найдено — используются настройки по умолчанию из config.py")
         _state_restore_source = None
+
+    # v25.8: если восстановили из Telegram и бэкап уже содержит ВСЕ текущие
+    # SETTINGS_KEYS (т.е. с прошлого пуша список настраиваемых ключей не
+    # менялся) — сразу считаем это "уже запушенным" состоянием. Без этого
+    # push_state_to_telegram_sync() при первом же save_state() после рестарта
+    # видел бы _last_pushed_settings_json пустым (сбросился при перезапуске
+    # процесса) и пытался бы отправить editMessageText с ТЕМ ЖЕ САМЫМ текстом,
+    # который Telegram и так уже хранит — а Telegram на это отвечает HTTP 400
+    # "message is not modified". Такой ответ теперь и сам по себе трактуется
+    # как успех (см. push_state_to_telegram_sync), но лучше вообще не делать
+    # заведомо бесполезный запрос.
+    if tg_settings and set(SETTINGS_KEYS) <= set(tg_settings.keys()):
+        try:
+            current_settings = {k: globals()[k] for k in SETTINGS_KEYS if k in globals()}
+            _last_pushed_settings_json = json.dumps(current_settings, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            pass
 
     # Если восстановили из локального файла (или вообще не восстановили, но
     # тогда push всё равно отправит текущие дефолты) — сразу же "самолечим"
@@ -3545,7 +3615,7 @@ async def monitor():
     else:
         _settings_restored_note = "ℹ️ Ни резервной копии в Telegram, ни state.json не найдено — используются настройки по умолчанию из config.py."
     await broadcast(
-        f"✅ <b>Бот запущен</b> (v25.7)\n{_settings_restored_note}"
+        f"✅ <b>Бот запущен</b> (v25.8)\n{_settings_restored_note}"
     )
 
     while True:
