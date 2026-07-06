@@ -4,6 +4,34 @@ Crypto Alert Bot — v25
 ЕДИНСТВЕННЫЙ источник данных. MEXC и OKX полностью удалены из кода.
 
 ═══════════════════════════════════════════════════════
+ НОВОЕ v25.6 — НАСТРОЙКИ ПЕРЕЖИВАЮТ ЛЮБОЙ РЕДЕПЛОЙ RAILWAY (НЕ ТОЛЬКО РЕСТАРТ)
+═══════════════════════════════════════════════════════
+• ПРОБЛЕМА, которую этот патч решает: state.json (появился в v25.3) пишется
+  на локальный диск контейнера. На Railway этот диск ЭФЕМЕРНЫЙ — при каждом
+  редеплое (пуш кода, апдейт переменных окружения, ручной Redeploy) контейнер
+  пересоздаётся из образа заново, и state.json вместе с ним пропадает, даже
+  если сам код сохранения работал абсолютно правильно. Раньше это выглядело
+  так: настройки переживают обычный краш/рестарт процесса, но обнуляются
+  именно после редеплоя — то есть в тот момент, когда это больнее всего.
+• РЕШЕНИЕ: теперь каждое изменение настроек кнопками ДОПОЛНИТЕЛЬНО
+  сохраняется в закреплённое сообщение чата бота в Telegram
+  (push_state_to_telegram_sync) — компактный JSON только по SETTINGS_KEYS.
+  Хранилище — серверы Telegram, а не диск контейнера, поэтому это переживает
+  АБСОЛЮТНО ЛЮБОЙ редеплой Railway без необходимости покупать/настраивать
+  Volume. При старте бот сначала пытается восстановить настройки именно
+  оттуда (pull_state_from_telegram_sync) и только если не получилось —
+  откатывается на локальный state.json, и только если нет и его — на
+  значения по умолчанию из config.py. Стартовое сообщение бота теперь честно
+  показывает, ИЗ КАКОГО именно источника восстановлены настройки.
+• last_alert_growth (внутренний кэш антидублирования сигналов, может быть
+  большим) в Telegram-бэкап намеренно НЕ попадает — только в state.json:
+  это не настройка, и его частичная потеря при полном редеплое не критична.
+• Реализация полностью синхронная (urllib, без aiohttp) — как и уже
+  существовавший notify_sync — специально для мест, где ещё нет запущенного
+  event loop/сессии (старт модуля) или где async недоступен (обработчик
+  сигнала SIGTERM/SIGINT).
+
+═══════════════════════════════════════════════════════
  НОВОЕ v25.5 — ДАННЫЕ, НАДЁЖНОСТЬ, HEALTHCHECK, РЕФАКТОРИНГ
 ═══════════════════════════════════════════════════════
 • 💧 Спред bid/ask: строка "Спред: X% (bid/ask)" — показывается только когда
@@ -887,7 +915,8 @@ last_alert_growth: dict = {}
 
 # Список всех настроек, изменяемых кнопками/командами в Telegram. При
 # перезапуске (редеплой, сбой, рестарт контейнера) все они восстанавливаются
-# из state.json, а НЕ сбрасываются на значения по умолчанию из config.py.
+# из state.json / Telegram, а НЕ сбрасываются на значения по умолчанию из
+# config.py.
 SETTINGS_KEYS = [
     "current_percent", "current_window", "monitor_paused",
     "REVERSAL_MIN_SCORE", "REVERSAL_RSI_OB", "REVERSAL_STOCH_OB", "REVERSAL_STOCH_EXT",
@@ -900,10 +929,157 @@ SETTINGS_KEYS = [
     "CHART_ENABLED", "CHART_TF", "CUSTOM_PCT_24H", "PCT24H_GATE_ENABLED",
 ]
 
+# ── v25.6: РЕЗЕРВНАЯ КОПИЯ НАСТРОЕК В ЗАКРЕПЛЁННОМ СООБЩЕНИИ TELEGRAM ────────
+# ПРОБЛЕМА: state.json пишется на локальный диск контейнера. На Railway (и
+# большинстве похожих PaaS) диск контейнера ЭФЕМЕРНЫЙ — он полностью
+# пересоздаётся из образа при каждом редеплое (пуш кода, обновление
+# переменных окружения, ручной "Redeploy" и т.п.), если явно не подключён
+# постоянный Volume. Из-за этого раньше настройки, изменённые кнопками,
+# переживали обычный краш/перезапуск процесса ВНУТРИ одного контейнера, но
+# терялись именно при редеплое — то есть именно тогда, когда это больнее
+# всего заметно.
+# РЕШЕНИЕ: помимо state.json, компактный JSON с настройками (только
+# SETTINGS_KEYS — единицы килобайт, без last_alert_growth, который может
+# быть большим) дополнительно сохраняется в ЗАКРЕПЛЁННОЕ сообщение в чате
+# бота. Telegram-сервера не имеют отношения к диску контейнера Railway,
+# поэтому это переживает АБСОЛЮТНО ЛЮБОЙ редеплой/пересоздание контейнера,
+# без необходимости настраивать Volume на Railway. При старте бот сначала
+# пытается прочитать настройки из этого закреплённого сообщения (наиболее
+# надёжный источник) и только если это не получилось (нет сети на старте,
+# сообщение открепили руками и т.п.) — откатывается на локальный state.json,
+# и только если нет и его — на значения по умолчанию из config.py.
+_STATE_BACKUP_MARKER = "⚙️ CRYPTO_BOT_SETTINGS_BACKUP_V1 — НЕ УДАЛЯТЬ И НЕ ОТКРЕПЛЯТЬ"
+_last_pushed_settings_json: Optional[str] = None
+_state_restore_source: Optional[str] = None   # для стартового сообщения боту — откуда восстановлены настройки
+
+
+def _tg_api_sync(method: str, params: dict, timeout: int = 10) -> Optional[dict]:
+    """
+    Синхронный (urllib, БЕЗ aiohttp) вызов Telegram Bot API — специально для
+    мест, где ещё/уже нет запущенного event loop и aiohttp-сессии: при
+    старте модуля (load_state вызывается до создания _session) и в
+    sync-обработчике сигнала (_handle_signal). Тот же подход уже используется
+    в notify_sync() для тех же целей.
+    Возвращает распарсенный JSON-ответ или None при любой ошибке (сеть,
+    таймаут, невалидный JSON) — вызывающий код должен считать отсутствие
+    результата некритичным и просто использовать резервный источник данных.
+    """
+    try:
+        import urllib.request
+        data = json.dumps(params).encode("utf-8")
+        req = urllib.request.Request(
+            f"{TG}/{method}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning("_tg_api_sync(%s): %s", method, e)
+        return None
+
+
+def push_state_to_telegram_sync(force: bool = False) -> None:
+    """
+    Сохраняет текущие SETTINGS_KEYS в закреплённое сообщение чата
+    config.CHAT_ID. Полностью синхронно (см. _tg_api_sync) — можно звать из
+    любого контекста, включая обработчик сигнала завершения.
+
+    force=False (по умолчанию): если настройки с прошлого успешного пуша не
+    изменились — ничего не отправляет (иначе save_state_loop дёргал бы
+    Telegram API каждые 30с даже без единого изменения настроек, что и
+    бесполезно, и рискует упереться в rate-limit editMessageText).
+    force=True: всегда отправляет, даже если содержимое не изменилось —
+    используется один раз при старте, чтобы "самовылечить" резервную копию,
+    если она восстанавливалась из локального state.json (т.е. в Telegram
+    её либо не было, либо она устарела).
+    """
+    global _last_pushed_settings_json
+    try:
+        settings = {k: globals()[k] for k in SETTINGS_KEYS if k in globals()}
+        settings_json = json.dumps(settings, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        log.exception("push_state_to_telegram_sync: не удалось собрать настройки")
+        return
+
+    if not force and settings_json == _last_pushed_settings_json:
+        return
+
+    text = f"{_STATE_BACKUP_MARKER}\n{settings_json}"
+    chat_id = int(config.CHAT_ID)
+
+    chat_info = _tg_api_sync("getChat", {"chat_id": chat_id})
+    pinned = None
+    if chat_info and chat_info.get("ok"):
+        pinned = (chat_info.get("result") or {}).get("pinned_message")
+
+    if pinned and isinstance(pinned.get("text"), str) and pinned["text"].startswith(_STATE_BACKUP_MARKER):
+        # Уже есть наше закреплённое сообщение — просто обновляем текст,
+        # не плодим новые сообщения и не перепиниваем на каждое изменение.
+        result = _tg_api_sync("editMessageText", {
+            "chat_id": chat_id, "message_id": pinned["message_id"], "text": text,
+        })
+        ok = bool(result and result.get("ok"))
+    else:
+        # Либо ещё никогда не сохраняли, либо закреплено что-то другое
+        # (например, владелец сам закрепил постороннее сообщение) — отправляем
+        # новое сообщение с бэкапом и закрепляем именно его, беззвучно.
+        sent = _tg_api_sync("sendMessage", {"chat_id": chat_id, "text": text})
+        ok = False
+        if sent and sent.get("ok"):
+            msg_id = sent["result"]["message_id"]
+            pin_result = _tg_api_sync("pinChatMessage", {
+                "chat_id": chat_id, "message_id": msg_id, "disable_notification": True,
+            })
+            ok = bool(pin_result and pin_result.get("ok"))
+            if not ok:
+                log.warning(
+                    "push_state_to_telegram_sync: сообщение с бэкапом настроек отправлено, "
+                    "но закрепить не удалось (возможно, боту не хватает прав) — "
+                    "резервная копия всё равно останется читаемой по getChat/пересылке вручную."
+                )
+
+    if ok:
+        _last_pushed_settings_json = settings_json
+    else:
+        log.warning("push_state_to_telegram_sync: не удалось сохранить бэкап настроек в Telegram")
+
+
+def pull_state_from_telegram_sync() -> Optional[dict]:
+    """
+    Читает настройки из закреплённого сообщения чата config.CHAT_ID (см.
+    push_state_to_telegram_sync). Возвращает dict настроек или None, если
+    закреплённого бэкапа нет / его не удалось прочитать / нет сети — в этом
+    случае вызывающий код (load_state) откатывается на локальный state.json.
+    """
+    try:
+        chat_id = int(config.CHAT_ID)
+        chat_info = _tg_api_sync("getChat", {"chat_id": chat_id})
+        if not chat_info or not chat_info.get("ok"):
+            return None
+        pinned = (chat_info.get("result") or {}).get("pinned_message")
+        if not pinned or not isinstance(pinned.get("text"), str):
+            return None
+        text = pinned["text"]
+        if not text.startswith(_STATE_BACKUP_MARKER):
+            return None
+        payload = text[len(_STATE_BACKUP_MARKER):].lstrip("\n")
+        settings = json.loads(payload)
+        if not isinstance(settings, dict):
+            return None
+        return settings
+    except Exception as e:
+        log.warning("pull_state_from_telegram_sync: %s", e)
+        return None
+
 
 def save_state():
     """
-    Сохраняет last_alert_growth И все настройки из SETTINGS_KEYS в state.json.
+    Сохраняет last_alert_growth И все настройки из SETTINGS_KEYS в state.json
+    (быстрый локальный кэш — переживает обычный краш/рестарт процесса внутри
+    одного контейнера), а также в закреплённое сообщение Telegram через
+    push_state_to_telegram_sync (v25.6 — переживает ЛЮБОЙ редеплой Railway,
+    даже с полной пересборкой контейнера).
     Вызывается: периодически (save_state_loop, каждые 30с), сразу после
     обработки каждого сообщения в Telegram (см. handle_message-обёртку ниже)
     и при получении SIGTERM/SIGINT (штатная остановка) — поэтому настройки,
@@ -916,33 +1092,54 @@ def save_state():
             json.dump({"last_alert_growth": last_alert_growth, "settings": settings}, f)
         os.replace(tmp, STATE_FILE)  # атомарная замена — исключает битый файл при краше на середине записи
     except Exception:
-        log.exception("save_state: не удалось сохранить состояние")
+        log.exception("save_state: не удалось сохранить состояние локально")
+    # Пуш в Telegram — намеренно ПОСЛЕ локальной записи и в отдельном try
+    # внутри push_state_to_telegram_sync: сбой сети не должен мешать хотя бы
+    # локальному сохранению, и наоборот.
+    push_state_to_telegram_sync()
 
 
 def load_state():
     """
-    Восстанавливает last_alert_growth и настройки из state.json. ВАЖНО:
-    вызывается из кода НИЖЕ, ПОСЛЕ того как все настройки уже получили
+    Восстанавливает last_alert_growth и настройки. Порядок источников (от
+    самого надёжного к запасному):
+      1) закреплённое сообщение Telegram (push_state_to_telegram_sync) —
+         переживает ЛЮБОЙ редеплой Railway, т.к. хранится не на диске
+         контейнера, а на серверах Telegram;
+      2) локальный state.json — переживает обычный рестарт процесса внутри
+         одного контейнера, но НЕ переживает редеплой на эфемерном диске;
+      3) значения по умолчанию из config.py, если нет ни того, ни другого.
+    last_alert_growth восстанавливается ТОЛЬКО из state.json (в Telegram-
+    бэкап он намеренно не попадает — это внутренний кэш для антидублирования
+    сигналов, может быть большим, и потеря части этих данных при полном
+    редеплое не критична, в отличие от настроек, выставленных кнопками).
+    ВАЖНО: вызывается из кода НИЖЕ, ПОСЛЕ того как все настройки уже получили
     значения по умолчанию из config.py (конец блока GLOBALS) — иначе
     присваивания по умолчанию, идущие после этого места по ходу выполнения
-    модуля, затёрли бы значения, восстановленные из state.json.
-    Отсутствие файла или отдельных ключей в нём — не ошибка: просто
-    остаётся значение по умолчанию из config.py.
+    модуля, затёрли бы восстановленные значения.
     """
     global last_alert_growth
+    global _state_restore_source
+
+    file_data: Optional[dict] = None
     try:
         with open(STATE_FILE) as f:
-            data = json.load(f)
+            file_data = json.load(f)
     except FileNotFoundError:
-        log.info("state.json не найден — используются настройки по умолчанию из config.py")
-        return
+        pass
     except Exception:
-        log.exception("load_state: не удалось прочитать state.json — используются настройки по умолчанию")
-        return
+        log.exception("load_state: не удалось прочитать state.json")
 
-    last_alert_growth = data.get("last_alert_growth", {})
+    last_alert_growth = (file_data or {}).get("last_alert_growth", {})
 
-    settings = data.get("settings", {})
+    tg_settings = pull_state_from_telegram_sync()
+    if tg_settings:
+        settings, source = tg_settings, "закреплённого сообщения Telegram (переживает редеплой Railway)"
+    elif file_data:
+        settings, source = file_data.get("settings", {}), "локального state.json (только в пределах одного контейнера)"
+    else:
+        settings, source = {}, None
+
     restored = []
     for k, v in settings.items():
         if k not in SETTINGS_KEYS:
@@ -954,10 +1151,22 @@ def load_state():
             log.warning("load_state: не удалось восстановить настройку %s", k)
 
     if restored:
-        log.info("Настройки восстановлены из state.json (%d шт.): %s", len(restored), ", ".join(sorted(restored)))
+        log.info("Настройки восстановлены из %s (%d шт.): %s", source, len(restored), ", ".join(sorted(restored)))
+        _state_restore_source = source
+    else:
+        log.info("Ни закреплённого сообщения Telegram, ни state.json не найдено — используются настройки по умолчанию из config.py")
+        _state_restore_source = None
+
+    # Если восстановили из локального файла (или вообще не восстановили, но
+    # тогда push всё равно отправит текущие дефолты) — сразу же "самолечим"
+    # резервную копию в Telegram, чтобы следующий редеплой уже мог
+    # восстановиться из неё, а не из диска, который будет пересоздан.
+    if not tg_settings:
+        push_state_to_telegram_sync(force=True)
 
 # ================================================================
 #  GLOBALS
+
 # ================================================================
 
 TOKEN = config.BOT_TOKEN
@@ -3224,13 +3433,12 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    _settings_restored_note = (
-        "♻️ Настройки восстановлены из state.json (сохранены с прошлого запуска)."
-        if os.path.exists(STATE_FILE) else
-        "ℹ️ state.json не найден — используются настройки по умолчанию из config.py."
-    )
+    if _state_restore_source:
+        _settings_restored_note = f"♻️ Настройки восстановлены из {_state_restore_source}."
+    else:
+        _settings_restored_note = "ℹ️ Ни резервной копии в Telegram, ни state.json не найдено — используются настройки по умолчанию из config.py."
     await broadcast(
-        f"✅ <b>Бот запущен</b> (v25.5)\n{_settings_restored_note}"
+        f"✅ <b>Бот запущен</b> (v25.6)\n{_settings_restored_note}"
     )
 
     while True:
