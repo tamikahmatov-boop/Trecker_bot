@@ -4,6 +4,25 @@ Crypto Alert Bot — v25
 ЕДИНСТВЕННЫЙ источник данных. MEXC и OKX полностью удалены из кода.
 
 ═══════════════════════════════════════════════════════
+ НОВОЕ v25.4 — НАСТРОЙКИ ПЕРЕЖИВАЮТ РЕДЕПЛОЙ НА RAILWAY, ЧИСТКА МЁРТВОГО КОДА
+═══════════════════════════════════════════════════════
+• v25.3 уже сохраняла настройки в state.json, но файл лежал рядом со
+  скриптом — на Railway это эфемерный диск контейнера, который полностью
+  пересоздаётся при каждом редеплое, поэтому state.json/alerts.db/bot.lock
+  бесследно исчезали и настройки всё равно откатывались. Теперь все три
+  файла пишутся в DATA_DIR — путь берётся из переменной окружения
+  RAILWAY_VOLUME_MOUNT_PATH, которую Railway сам проставляет при
+  подключении Volume к сервису. Без подключённого Volume поведение не
+  меняется (файлы по-прежнему рядом со скриптом, как раньше). Требуется
+  один раз вручную подключить Volume к сервису в панели Railway — см.
+  комментарий у DATA_DIR ниже.
+• Убран неиспользуемый код: функции-обёртки get_bybit_closes и
+  get_peak_growth_24h (оставались "для обратной совместимости", но без
+  единого вызова), константа-алиас KLINE_LIMIT, алиас format_alert, и
+  две мёртвые локальные переменные (h_prev, last_color), которые
+  вычислялись, но нигде не читались. Поведение бота не изменилось.
+
+═══════════════════════════════════════════════════════
  НОВОЕ v25.3 — НАСТРОЙКИ ПЕРЕЖИВАЮТ ПЕРЕЗАПУСК, УБРАН СИГНАЛ "КРУПНОЕ ДВИЖЕНИЕ",
  УВЕДОМЛЕНИЯ О НЕРАБОТЕ БОТА
 ═══════════════════════════════════════════════════════
@@ -430,6 +449,9 @@ import signal
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 from typing import Optional
 
@@ -464,6 +486,48 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ================================================================
+#  PERSISTENT DATA DIRECTORY (переживает редеплой на Railway)
+# ================================================================
+#  На Railway файловая система контейнера ЭФЕМЕРНА: при каждом редеплое
+#  (пуш кода, ручной restart, сон/пробуждение и т.п.) поднимается новый
+#  контейнер с чистым диском. Файлы, которые save_state()/db писали рядом
+#  со скриптом (state.json, alerts.db, bot.lock), физически лежали на этом
+#  диске — поэтому исчезали при каждом редеплое, и все настройки, менявшиеся
+#  кнопками, откатывались на значения по умолчанию из config.py, несмотря
+#  на то что сам механизм сохранения работал правильно.
+#
+#  Решение — Railway Volume: постоянный диск, подключаемый к сервису.
+#  При его подключении Railway САМ прокидывает переменную окружения
+#  RAILWAY_VOLUME_MOUNT_PATH с абсолютным путём монтирования (например
+#  "/data"). Все файлы состояния теперь пишутся туда. Если volume не
+#  подключён (например, при локальном запуске) — переменной нет, и файлы,
+#  как и раньше, лежат рядом со скриптом (поведение не меняется).
+#
+#  ЧТО НУЖНО СДЕЛАТЬ В RAILWAY (один раз, руками, в панели проекта):
+#    1. Открыть сервис бота → Command Palette (⌘K / Ctrl+K) → "New Volume"
+#       (или правый клик по сервису на канвасе → "Attach Volume").
+#    2. Указать Mount Path, например /data — значение произвольное, бот
+#       сам подхватит его через переменную окружения.
+#    3. Нажать Deploy/Redeploy. Готово — с этого момента state.json,
+#       alerts.db и bot.lock лежат на постоянном диске и переживают любые
+#       редеплои, рестарты и падения контейнера.
+DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    log.exception("Не удалось создать DATA_DIR=%s — используем текущую директорию", DATA_DIR)
+    DATA_DIR = "."
+
+if DATA_DIR != ".":
+    log.info("Постоянное хранилище (Railway Volume) обнаружено: %s", DATA_DIR)
+else:
+    log.warning(
+        "RAILWAY_VOLUME_MOUNT_PATH не задан — state.json/alerts.db лежат на "
+        "эфемерном диске контейнера и НЕ переживут редеплой на Railway. "
+        "Подключите Volume к сервису, чтобы настройки сохранялись насовсем."
+    )
+
+# ================================================================
 #  SINGLE INSTANCE LOCK
 # ================================================================
 #  Защита от двойного запуска бота с одним BOT_TOKEN.
@@ -475,7 +539,7 @@ log = logging.getLogger(__name__)
 #  любым способом (kill -9, OOM killer, падение питания), поэтому
 #  никаких "зависших" lock-файлов с устаревшим PID не остаётся.
 
-LOCK_FILE = getattr(config, "LOCK_FILE", "bot.lock")
+LOCK_FILE = os.path.join(DATA_DIR, getattr(config, "LOCK_FILE", "bot.lock"))
 _lock_fh = None  # держим файловый дескриптор открытым на всё время жизни процесса
 
 
@@ -525,7 +589,7 @@ def release_single_instance_lock() -> None:
 #  DATABASE
 # ================================================================
 
-DB_FILE = "alerts.db"
+DB_FILE = os.path.join(DATA_DIR, "alerts.db")
 
 # Единое переиспользуемое соединение для всех обращений из основного
 # event-loop потока. Раньше db_connect() открывал НОВОЕ соединение (+ заново
@@ -805,13 +869,34 @@ def db_get_subscribers() -> list[int]:
 # ================================================================
 #  STATE
 # ================================================================
+#  v25.5: настройки теперь дублируются в ЗАКРЕПЛЁННОЕ СООБЩЕНИЕ бота в
+#  Telegram-чате владельца (config.CHAT_ID), а не только в state.json на
+#  диске. Закреплённое сообщение хранится на серверах Telegram, а не в
+#  контейнере — оно переживает АБСОЛЮТНО любой редеплой/рестарт на Railway,
+#  даже без подключённого Volume. state.json остаётся как быстрый локальный
+#  кэш (и как fallback, если Telegram на момент старта недоступен), но
+#  источником истины при восстановлении настроек теперь является именно
+#  закреплённое сообщение — если оно есть, локальный файл игнорируется.
 
-STATE_FILE = "state.json"
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
 last_alert_growth: dict = {}
+
+# message_id закреплённого сообщения с настройками. Кэшируется в памяти на
+# время жизни процесса (найден в load_state() через getChat при старте, либо
+# создан заново в _push_state_to_telegram() при первом сохранении). Хранить
+# его отдельно на диске не нужно — при каждом старте он заново вычитывается
+# из Telegram через getChat().pinned_message.
+_state_message_id: Optional[int] = None
+
+# Откуда фактически были восстановлены настройки при старте (для сообщения
+# "Бот запущен" в monitor()): "tg" — закреплённое сообщение Telegram,
+# "file" — локальный state.json, None — ни там, ни там ничего не нашлось.
+_state_restore_source: Optional[str] = None
 
 # Список всех настроек, изменяемых кнопками/командами в Telegram. При
 # перезапуске (редеплой, сбой, рестарт контейнера) все они восстанавливаются
-# из state.json, а НЕ сбрасываются на значения по умолчанию из config.py.
+# из закреплённого сообщения (или state.json), а НЕ сбрасываются на значения
+# по умолчанию из config.py.
 SETTINGS_KEYS = [
     "current_percent", "current_window", "monitor_paused",
     "REVERSAL_MIN_SCORE", "REVERSAL_RSI_OB", "REVERSAL_STOCH_OB", "REVERSAL_STOCH_EXT",
@@ -824,44 +909,195 @@ SETTINGS_KEYS = [
     "CHART_ENABLED", "CHART_TF", "CUSTOM_PCT_24H", "PCT24H_GATE_ENABLED",
 ]
 
+STATE_MSG_HEADER = "🗂 <b>Настройки бота (служебное сообщение)</b>"
+STATE_MSG_WARNING = (
+    "Не удаляйте и не редактируйте вручную — здесь бот хранит параметры,\n"
+    "изменяемые кнопками, чтобы они переживали редеплой/рестарт на Railway."
+)
+
+
+def _tg_api_sync(method: str, params: dict, timeout: int = 15) -> Optional[dict]:
+    """
+    Синхронный (urllib, без asyncio/aiohttp) вызов Telegram Bot API.
+    Нужен там, где нет доступного event loop или сессии aiohttp: при
+    load_state()/save_state() (последняя вызывается и из синхронного
+    обработчика SIGTERM/SIGINT — см. _handle_signal ниже) и особенно при
+    самом первом вызове load_state() при старте модуля, когда aiohttp-сессия
+    ещё даже не создана. Никогда не бросает исключения наружу — ошибка сети
+    здесь не должна ронять запуск бота.
+    """
+    try:
+        data = urllib.parse.urlencode(params).encode()
+        req = urllib.request.Request(f"{TG}/{method}", data=data)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # Telegram возвращает тело ошибки (например "message is not
+        # modified" или "message to edit not found") даже при HTTP 400 —
+        # вызывающему коду это тело нужно, чтобы отличить "ничего страшного"
+        # от "сообщение реально пропало".
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return None
+    except Exception:
+        log.exception("_tg_api_sync(%s): ошибка запроса к Telegram", method)
+        return None
+
+
+def _format_state_message(payload: dict) -> str:
+    return (
+        f"{STATE_MSG_HEADER}\n"
+        f"{STATE_MSG_WARNING}\n"
+        f"Обновлено: {time.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+        f"<code>{json.dumps(payload, ensure_ascii=False)}</code>"
+    )
+
+
+def _push_state_to_telegram(payload: dict) -> None:
+    """
+    Сохраняет payload в закреплённое сообщение чата config.CHAT_ID: если
+    сообщение уже известно (message_id закэширован) — редактирует его,
+    иначе отправляет новое и закрепляет. Если редактирование не удалось,
+    потому что сообщение было удалено вручную — забывает старый message_id
+    и создаёт сообщение заново, чтобы настройки не потерялись молча.
+    """
+    global _state_message_id
+    text = _format_state_message(payload)
+    chat_id = int(config.CHAT_ID)
+
+    if _state_message_id is not None:
+        result = _tg_api_sync("editMessageText", {
+            "chat_id": chat_id,
+            "message_id": _state_message_id,
+            "text": text,
+            "parse_mode": "HTML",
+        })
+        description = str((result or {}).get("description", "")).lower()
+        if result and (result.get("ok") or "not modified" in description):
+            return
+        log.warning(
+            "_push_state_to_telegram: не удалось отредактировать сообщение %s (%s) — создаю новое",
+            _state_message_id, description or "нет ответа",
+        )
+        _state_message_id = None
+
+    result = _tg_api_sync("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+    if not (result and result.get("ok")):
+        log.warning("_push_state_to_telegram: не удалось отправить служебное сообщение с настройками")
+        return
+
+    msg_id = result["result"]["message_id"]
+    _state_message_id = msg_id
+    pin_result = _tg_api_sync("pinChatMessage", {
+        "chat_id": chat_id, "message_id": msg_id, "disable_notification": True,
+    })
+    if not (pin_result and pin_result.get("ok")):
+        log.warning("_push_state_to_telegram: сообщение отправлено, но не удалось его закрепить")
+
+
+def _pull_state_from_telegram() -> Optional[dict]:
+    """
+    Ищет закреплённое сообщение в чате config.CHAT_ID и вытаскивает из него
+    JSON с настройками (между первой '{' и последней '}' в тексте — не
+    зависит от декоративного текста вокруг). Возвращает None, если
+    закреплённого сообщения нет, оно не наше, или Telegram недоступен —
+    в этом случае load_state() сама откатится на локальный state.json.
+    """
+    global _state_message_id
+    result = _tg_api_sync("getChat", {"chat_id": int(config.CHAT_ID)})
+    if not (result and result.get("ok")):
+        return None
+
+    pinned = result["result"].get("pinned_message")
+    if not pinned:
+        return None
+
+    text = pinned.get("text") or pinned.get("caption") or ""
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        payload = json.loads(text[start:end + 1])
+    except Exception:
+        log.exception("_pull_state_from_telegram: не удалось разобрать JSON из закреплённого сообщения")
+        return None
+
+    _state_message_id = pinned.get("message_id")
+    return payload
+
 
 def save_state():
     """
-    Сохраняет last_alert_growth И все настройки из SETTINGS_KEYS в state.json.
-    Вызывается: периодически (save_state_loop, каждые 30с), сразу после
-    обработки каждого сообщения в Telegram (см. handle_message-обёртку ниже)
-    и при получении SIGTERM/SIGINT (штатная остановка) — поэтому настройки,
-    изменённые кнопками, переживают перезапуск/сбой/редеплой.
+    Сохраняет last_alert_growth И все настройки из SETTINGS_KEYS: сначала
+    быстро в локальный state.json (fallback на случай, если Telegram
+    недоступен прямо в момент сохранения), затем — в закреплённое сообщение
+    Telegram, которое и является настоящим источником истины между
+    редеплоями на Railway. Вызывается: периодически (save_state_loop, каждые
+    30с), сразу после обработки каждого сообщения в Telegram (см.
+    handle_message-обёртку ниже) и при получении SIGTERM/SIGINT (штатная
+    остановка) — поэтому настройки, изменённые кнопками, переживают
+    перезапуск/сбой/редеплой.
     """
+    settings = {k: globals()[k] for k in SETTINGS_KEYS if k in globals()}
+    payload = {"last_alert_growth": last_alert_growth, "settings": settings}
+
     try:
-        settings = {k: globals()[k] for k in SETTINGS_KEYS if k in globals()}
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"last_alert_growth": last_alert_growth, "settings": settings}, f)
+            json.dump(payload, f)
         os.replace(tmp, STATE_FILE)  # атомарная замена — исключает битый файл при краше на середине записи
     except Exception:
-        log.exception("save_state: не удалось сохранить состояние")
+        log.exception("save_state: не удалось сохранить состояние в локальный файл")
+
+    try:
+        _push_state_to_telegram(payload)
+    except Exception:
+        log.exception("save_state: не удалось сохранить состояние в закреплённое сообщение Telegram")
 
 
 def load_state():
     """
-    Восстанавливает last_alert_growth и настройки из state.json. ВАЖНО:
-    вызывается из кода НИЖЕ, ПОСЛЕ того как все настройки уже получили
-    значения по умолчанию из config.py (конец блока GLOBALS) — иначе
-    присваивания по умолчанию, идущие после этого места по ходу выполнения
-    модуля, затёрли бы значения, восстановленные из state.json.
-    Отсутствие файла или отдельных ключей в нём — не ошибка: просто
-    остаётся значение по умолчанию из config.py.
+    Восстанавливает last_alert_growth и настройки. Сначала пробует
+    закреплённое сообщение Telegram (переживает редеплой на Railway без
+    Volume) — если там ничего нет или Telegram недоступен, откатывается на
+    локальный state.json. ВАЖНО: вызывается из кода НИЖЕ, ПОСЛЕ того как все
+    настройки уже получили значения по умолчанию из config.py (конец блока
+    GLOBALS) — иначе присваивания по умолчанию, идущие после этого места по
+    ходу выполнения модуля, затёрли бы восстановленные значения. Отсутствие
+    сообщения/файла или отдельных ключей в них — не ошибка: просто остаётся
+    значение по умолчанию из config.py.
     """
-    global last_alert_growth
+    global last_alert_growth, _state_restore_source
+
+    data = None
+    source = None
     try:
-        with open(STATE_FILE) as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        log.info("state.json не найден — используются настройки по умолчанию из config.py")
-        return
+        data = _pull_state_from_telegram()
+        if data is not None:
+            source = "tg"
     except Exception:
-        log.exception("load_state: не удалось прочитать state.json — используются настройки по умолчанию")
+        log.exception("load_state: ошибка при чтении настроек из Telegram")
+
+    if data is None:
+        try:
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+            source = "file"
+        except FileNotFoundError:
+            data = None
+        except Exception:
+            log.exception("load_state: не удалось прочитать state.json")
+            data = None
+
+    _state_restore_source = source
+
+    if data is None:
+        log.info(
+            "Настройки не найдены ни в закреплённом сообщении Telegram, ни в "
+            "state.json — используются значения по умолчанию из config.py"
+        )
         return
 
     last_alert_growth = data.get("last_alert_growth", {})
@@ -878,7 +1114,8 @@ def load_state():
             log.warning("load_state: не удалось восстановить настройку %s", k)
 
     if restored:
-        log.info("Настройки восстановлены из state.json (%d шт.): %s", len(restored), ", ".join(sorted(restored)))
+        label = "закреплённого сообщения Telegram" if source == "tg" else "state.json"
+        log.info("Настройки восстановлены из %s (%d шт.): %s", label, len(restored), ", ".join(sorted(restored)))
 
 # ================================================================
 #  GLOBALS
@@ -1055,8 +1292,6 @@ _kline_cache: dict[str, dict] = {}
 KLINE_CACHE_TTL  = 60
 KLINE_LIMIT_1M   = 120   # 120 свечей по 1 мин = 2 часа (RSI, BB, StochRSI, паттерны)
 KLINE_LIMIT_5M   = 100   # 100 свечей по 5 мин = 8+ часов (ATR, EMA, MACD, объём)
-# Для обратной совместимости
-KLINE_LIMIT = KLINE_LIMIT_1M
 
 # Внутренние обозначения таймфреймов ("Min1", "Hour4" и т.п.) → интервалы
 # в формате, который принимает Bybit V5 kline API.
@@ -1146,10 +1381,6 @@ async def get_bybit_klines_multi(symbol: str) -> dict:
         "klines_5m":  results[1] if not isinstance(results[1], Exception) else _empty,
         "klines_15m": results[2] if not isinstance(results[2], Exception) else _empty,
     }
-
-
-async def get_bybit_closes(symbol: str, interval: str = "Min1") -> list[float]:
-    return (await get_bybit_klines(symbol, interval))["closes"]
 
 
 # ── Настраиваемые таймфреймы RSI (кнопки 5м/15м/1ч/4ч/12ч/1д) ─────────────────
@@ -1349,7 +1580,6 @@ def detect_candle_pattern(closes: list[float], highs: list[float],
         c_cur   = closes[-1]
         h_cur   = highs[-1]
         l_cur   = lows[-1]
-        h_prev  = highs[-2]
 
         body_cur  = abs(c_cur  - o_cur)
         body_prev = abs(c_prev - o_prev)
@@ -1559,11 +1789,6 @@ def get_peak_growth(sym: str, price: float, window_sec: int = 3600) -> float:
     if low <= 0:
         return 0.0
     return (price - low) / low * 100
-
-
-# Обратная совместимость
-def get_peak_growth_24h(sym: str, price: float) -> float:
-    return get_peak_growth(sym, price, window_sec=86400)
 
 
 def calculate_obv_divergence(closes: list[float], volumes: list[float],
@@ -2060,7 +2285,6 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
         ax.set_xticks([])
 
         last_price = closes[-1]
-        last_color = up_color if closes[-1] >= opens[0] else down_color
         ax.axhline(last_price, color="#F0B90B", linewidth=0.8, linestyle="--", alpha=0.85, zorder=4)
         tf_label = CHART_TF_LABELS.get(CHART_TF, CHART_TF)
         ax.set_title(
@@ -2511,9 +2735,6 @@ def format_growth_alert(
     )
 
 
-format_alert = format_growth_alert  # обратная совместимость
-
-
 def format_drop_alert(
     sym: str, price: float, growth: float,
     rsi: Optional[float], macd: Optional[float], source: str,
@@ -2781,13 +3002,13 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    _settings_restored_note = (
-        "♻️ Настройки восстановлены из state.json (сохранены с прошлого запуска)."
-        if os.path.exists(STATE_FILE) else
-        "ℹ️ state.json не найден — используются настройки по умолчанию из config.py."
-    )
+    _settings_restored_note = {
+        "tg":   "♻️ Настройки восстановлены из закреплённого сообщения Telegram (переживают редеплой на Railway).",
+        "file": "♻️ Настройки восстановлены из локального state.json (сохранены с прошлого запуска).",
+        None:   "ℹ️ Сохранённых настроек не найдено — используются значения по умолчанию из config.py.",
+    }[_state_restore_source]
     await broadcast(
-        f"✅ <b>Бот запущен</b> (v25.3)\n{_settings_restored_note}"
+        f"✅ <b>Бот запущен</b> (v25.5)\n{_settings_restored_note}"
     )
 
     while True:
@@ -4094,7 +4315,7 @@ _shutdown_event: asyncio.Event | None = None
 def notify_sync(text: str) -> None:
     """
     Отправляет сообщение в Telegram БЕЗ asyncio/aiohttp — синхронно, через
-    стандартную библиотеку (urllib). Нужна там, где event loop уже
+    _tg_api_sync() (urllib). Нужна там, где event loop уже
     останавливается/остановлен или сессия aiohttp недоступна: критический
     сбой во внешнем retry-цикле (см. низ файла), сигнал завершения,
     неперехваченное исключение до входа в основной async-код. Никогда не
@@ -4102,15 +4323,11 @@ def notify_sync(text: str) -> None:
     по себе уронить процесс ещё раз.
     """
     try:
-        import urllib.request
-        import urllib.parse
-        data = urllib.parse.urlencode({
+        _tg_api_sync("sendMessage", {
             "chat_id": int(config.CHAT_ID),
             "text": text,
             "parse_mode": "HTML",
-        }).encode()
-        req = urllib.request.Request(f"{TG}/sendMessage", data=data)
-        urllib.request.urlopen(req, timeout=10)
+        })
     except Exception as e:
         try:
             log.warning("notify_sync: не удалось отправить сообщение в Telegram: %s", e)
