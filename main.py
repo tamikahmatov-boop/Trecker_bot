@@ -4,6 +4,35 @@ Crypto Alert Bot — v25
 ЕДИНСТВЕННЫЙ источник данных. MEXC и OKX полностью удалены из кода.
 
 ═══════════════════════════════════════════════════════
+ НОВОЕ v25.3 — НАСТРОЙКИ ПЕРЕЖИВАЮТ ПЕРЕЗАПУСК, УБРАН СИГНАЛ "КРУПНОЕ ДВИЖЕНИЕ",
+ УВЕДОМЛЕНИЯ О НЕРАБОТЕ БОТА
+═══════════════════════════════════════════════════════
+• Все настройки, изменяемые кнопками/командами в Telegram (пороги %, окна,
+  параметры разворота, RSI-фильтры, график, регулировка по 24ч, пауза и
+  т.д. — полный список в SETTINGS_KEYS), теперь сохраняются в state.json и
+  восстанавливаются при следующем запуске. Раньше в state.json попадал
+  только last_alert_growth — после любого перезапуска (сбой, редеплой,
+  рестарт контейнера) все настройки молча откатывались на значения по
+  умолчанию из config.py. Сохранение происходит: сразу после обработки
+  каждого сообщения в Telegram, каждые 30с фоновым save_state_loop, и при
+  получении SIGTERM/SIGINT. Запись в state.json атомарная (через .tmp +
+  os.replace), чтобы падение прямо во время записи не оставило битый файл.
+• Удалён отдельный сигнал «🔔 КРУПНОЕ ДВИЖЕНИЕ — РОСТ/ПАДЕНИЕ» (бывший
+  БЛОК 1.5 в monitor(), кнопка/команда /notify_pct, флаг
+  NOTIFY_BIG_MOVE_PCT). Обычные сигналы роста/падения (БЛОК 2) и разворота
+  (БЛОК 1), а также отдельное уведомление «Изменение за 24ч» (БЛОК 1.6,
+  кнопки 📈 Свой % (24ч) / 📈🚦) — не затронуты и продолжают работать как
+  раньше.
+• Добавлены уведомления в Telegram о том, что бот НЕ работает: при
+  критическом сбое во внешнем retry-цикле, при неожиданном падении
+  фонового процесса, при получении сигнала остановки (SIGTERM/SIGINT) и
+  при штатном завершении процесса. Используется новая функция
+  notify_sync() — работает без asyncio/aiohttp (чистый urllib), поэтому
+  доставляет сообщение, даже если основной event loop и HTTP-сессия уже
+  недоступны. Существующие уведомления (watchdog о зависании monitor(),
+  падение фонового таска) сохранены без изменений.
+
+═══════════════════════════════════════════════════════
  НОВОЕ v25.2 — «ИЗМЕНЕНИЕ ЗА 24Ч» СТАЛО ОТДЕЛЬНЫМ УВЕДОМЛЕНИЕМ
 ═══════════════════════════════════════════════════════
 • Регулировка по 24ч (кнопки 📈 Свой % (24ч) и 📈🚦 24ч-регулировка ВЫКЛ/ВКЛ,
@@ -780,25 +809,76 @@ def db_get_subscribers() -> list[int]:
 STATE_FILE = "state.json"
 last_alert_growth: dict = {}
 
+# Список всех настроек, изменяемых кнопками/командами в Telegram. При
+# перезапуске (редеплой, сбой, рестарт контейнера) все они восстанавливаются
+# из state.json, а НЕ сбрасываются на значения по умолчанию из config.py.
+SETTINGS_KEYS = [
+    "current_percent", "current_window", "monitor_paused",
+    "REVERSAL_MIN_SCORE", "REVERSAL_RSI_OB", "REVERSAL_STOCH_OB", "REVERSAL_STOCH_EXT",
+    "REVERSAL_BB_OB", "REVERSAL_MACD_SLOPE", "REVERSAL_ACCEL", "REVERSAL_HIGH_MARGIN",
+    "REVERSAL_MOMENTUM", "REVERSAL_COOLDOWN_SEC", "REVERSAL_ATR_MULT", "REVERSAL_VOL_RATIO",
+    "REVERSAL_GROWTH_MIN_PCT", "REVERSAL_WINDOW_SEC",
+    "REVERSAL_REPEAT_PRICE_PCT", "REVERSAL_REPEAT_SCORE_DELTA",
+    "RSI_SIGNAL_TF", "RSI_SIGNAL_LEVEL", "RSI_REVERSAL_TF", "RSI_SIGNAL_FILTER_ENABLED",
+    "RSI_REVERSAL_FILTER_ENABLED",
+    "CHART_ENABLED", "CHART_TF", "CUSTOM_PCT_24H", "PCT24H_GATE_ENABLED",
+]
+
 
 def save_state():
+    """
+    Сохраняет last_alert_growth И все настройки из SETTINGS_KEYS в state.json.
+    Вызывается: периодически (save_state_loop, каждые 30с), сразу после
+    обработки каждого сообщения в Telegram (см. handle_message-обёртку ниже)
+    и при получении SIGTERM/SIGINT (штатная остановка) — поэтому настройки,
+    изменённые кнопками, переживают перезапуск/сбой/редеплой.
+    """
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({"last_alert_growth": last_alert_growth}, f)
+        settings = {k: globals()[k] for k in SETTINGS_KEYS if k in globals()}
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"last_alert_growth": last_alert_growth, "settings": settings}, f)
+        os.replace(tmp, STATE_FILE)  # атомарная замена — исключает битый файл при краше на середине записи
     except Exception:
-        pass
+        log.exception("save_state: не удалось сохранить состояние")
 
 
 def load_state():
+    """
+    Восстанавливает last_alert_growth и настройки из state.json. ВАЖНО:
+    вызывается из кода НИЖЕ, ПОСЛЕ того как все настройки уже получили
+    значения по умолчанию из config.py (конец блока GLOBALS) — иначе
+    присваивания по умолчанию, идущие после этого места по ходу выполнения
+    модуля, затёрли бы значения, восстановленные из state.json.
+    Отсутствие файла или отдельных ключей в нём — не ошибка: просто
+    остаётся значение по умолчанию из config.py.
+    """
     global last_alert_growth
     try:
         with open(STATE_FILE) as f:
-            last_alert_growth = json.load(f).get("last_alert_growth", {})
+            data = json.load(f)
+    except FileNotFoundError:
+        log.info("state.json не найден — используются настройки по умолчанию из config.py")
+        return
     except Exception:
-        pass
+        log.exception("load_state: не удалось прочитать state.json — используются настройки по умолчанию")
+        return
 
+    last_alert_growth = data.get("last_alert_growth", {})
 
-load_state()
+    settings = data.get("settings", {})
+    restored = []
+    for k, v in settings.items():
+        if k not in SETTINGS_KEYS:
+            continue
+        try:
+            globals()[k] = v
+            restored.append(k)
+        except Exception:
+            log.warning("load_state: не удалось восстановить настройку %s", k)
+
+    if restored:
+        log.info("Настройки восстановлены из state.json (%d шт.): %s", len(restored), ", ".join(sorted(restored)))
 
 # ================================================================
 #  GLOBALS
@@ -877,11 +957,6 @@ REVERSAL_GROWTH_MIN_PCT: float = getattr(config, "REVERSAL_GROWTH_MIN_PCT", 5.0)
 # Период для расчёта пикового роста разворота (кнопки 5м/30м/1ч/4ч/1д)
 REVERSAL_WINDOW_SEC: int = getattr(config, "REVERSAL_WINDOW_SEC", 3600)  # по умолчанию 1 час
 
-# Порог уведомлений о росте/падении (задаётся через /notify_pct или автоматически = current_percent)
-NOTIFY_BIG_MOVE_PCT: float = getattr(config, "NOTIFY_BIG_MOVE_PCT", 15.0)
-_notify_cooldown: dict[str, float] = {}   # {sym: last_sent_ts}
-NOTIFY_BIG_MOVE_COOLDOWN_SEC: int = 3600  # не чаще 1 раза в час
-
 # v25.2: отдельный кулдаун для уведомлений "Изменение за 24ч" (БЛОК 1.6) —
 # независим от _alert_cooldown обычных сигналов роста/падения.
 _pct24h_notify_cooldown: dict[str, float] = {}
@@ -935,6 +1010,14 @@ liq_symbols: set[str] = set()   # актуальный набор символо
 
 # Режим ожидания ручного ввода числа с клавиатуры (кнопка 📈 Свой % (24ч))
 _awaiting_input: Optional[str] = None
+
+# Восстанавливаем last_alert_growth и все настройки (SETTINGS_KEYS) из
+# state.json ЗДЕСЬ — после того, как все настройки выше уже получили значения
+# по умолчанию из config.py. Если state.json есть (бот уже когда-то работал
+# и был остановлен/упал/перезапущен) — восстановленные значения перекрывают
+# значения по умолчанию, и все настройки, изменённые кнопками, переживают
+# перезапуск/сбой/редеплой.
+load_state()
 
 
 def _cache_load_levels():
@@ -2690,7 +2773,7 @@ async def get_prices(symbols: set[str]) -> tuple[dict, dict, dict, dict]:
 
 async def monitor():
     global current_percent, current_window, signals_count, reversal_count, checks_count, last_check_time
-    global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT
+    global REVERSAL_GROWTH_MIN_PCT
     global liq_symbols
 
     symbols          = await get_symbols()
@@ -2698,7 +2781,14 @@ async def monitor():
     last_symbols_upd = time.time()
     _cache_load_levels()
 
-    await broadcast("✅ <b>Бот запущен</b> (v25 — график в сигналах + регулировка по 24ч)")
+    _settings_restored_note = (
+        "♻️ Настройки восстановлены из state.json (сохранены с прошлого запуска)."
+        if os.path.exists(STATE_FILE) else
+        "ℹ️ state.json не найден — используются настройки по умолчанию из config.py."
+    )
+    await broadcast(
+        f"✅ <b>Бот запущен</b> (v25.3)\n{_settings_restored_note}"
+    )
 
     while True:
         if monitor_paused:
@@ -2858,29 +2948,6 @@ async def monitor():
                             continue  # не дублируем обычным алертом
 
                 # ════════════════════════════════════════════════════════════
-                #  БЛОК 1.5: УВЕДОМЛЕНИЕ О БОЛЬШОМ РОСТЕ / ПАДЕНИИ (15% и т.п.)
-                # ════════════════════════════════════════════════════════════
-                if NOTIFY_BIG_MOVE_PCT > 0 and abs(growth) >= NOTIFY_BIG_MOVE_PCT:
-                    last_notif = _notify_cooldown.get(sym, 0)
-                    if now - last_notif >= NOTIFY_BIG_MOVE_COOLDOWN_SEC:
-                        direction_emoji = "🚀" if growth > 0 else "📉"
-                        move_label = "РОСТ" if growth > 0 else "ПАДЕНИЕ"
-                        rsi_str = f"{rsi:.1f}" if rsi is not None else "—"
-                        dur_str = _fmt_dur(calculate_growth_duration(recent))
-                        notif_text = (
-                            f"🔔 <b>КРУПНОЕ ДВИЖЕНИЕ — {move_label}</b>\n\n"
-                            f"🪙 <b>{sym}</b>  [{source}]\n"
-                            f"💵 Цена: <code>{price}</code>\n"
-                            f"{direction_emoji} {move_label}: <b>{growth:+.2f}%</b> "
-                            f"за {dur_str}\n"
-                            f"📊 RSI: <code>{rsi_str}</code>\n\n"
-                            f"📋 <code>{sym}</code> #большое_движение"
-                        )
-                        _notify_cooldown[sym] = now
-                        await broadcast(notif_text)
-                        log.info("BigMove notify: %s %+.2f%%", sym, growth)
-
-                # ════════════════════════════════════════════════════════════
                 #  БЛОК 1.6: ОТДЕЛЬНОЕ УВЕДОМЛЕНИЕ ОБ ИЗМЕНЕНИИ ЗА 24Ч (как на Bybit)
                 # ════════════════════════════════════════════════════════════
                 # v25.2: полностью самостоятельный тип уведомления. Кнопки
@@ -3009,7 +3076,7 @@ async def monitor():
             if checks_count % 200 == 0:
                 # Удаляем устаревшие кулдауны
                 stale_ts = now - max(ALERT_COOLDOWN_SEC, REVERSAL_COOLDOWN_SEC) * 3
-                for d in (_alert_cooldown, _reversal_cooldown, _notify_cooldown, _pct24h_notify_cooldown):
+                for d in (_alert_cooldown, _reversal_cooldown, _pct24h_notify_cooldown):
                     stale = [k for k, v in d.items() if v < stale_ts]
                     for k in stale:
                         d.pop(k, None)
@@ -3036,11 +3103,25 @@ async def monitor():
 # ================================================================
 
 async def handle_message(msg: dict):
+    """
+    Тонкая обёртка: после КАЖДОГО обработанного сообщения (независимо от
+    того, какая кнопка/команда сработала и через какой early-return внутри
+    _handle_message_impl это произошло) сохраняет все настройки в state.json.
+    Так любое изменение через кнопку сохраняется сразу же, а не только раз в
+    30с из save_state_loop — и переживает перезапуск/сбой/редеплой.
+    """
+    try:
+        await _handle_message_impl(msg)
+    finally:
+        save_state()
+
+
+async def _handle_message_impl(msg: dict):
     global current_percent, current_window, monitor_paused
     global REVERSAL_MIN_SCORE, REVERSAL_RSI_OB, REVERSAL_STOCH_OB, REVERSAL_STOCH_EXT
     global REVERSAL_BB_OB, REVERSAL_MACD_SLOPE, REVERSAL_ACCEL, REVERSAL_HIGH_MARGIN
     global REVERSAL_MOMENTUM, REVERSAL_COOLDOWN_SEC, REVERSAL_ATR_MULT, REVERSAL_VOL_RATIO
-    global REVERSAL_GROWTH_MIN_PCT, NOTIFY_BIG_MOVE_PCT, REVERSAL_WINDOW_SEC
+    global REVERSAL_GROWTH_MIN_PCT, REVERSAL_WINDOW_SEC
     global REVERSAL_REPEAT_PRICE_PCT, REVERSAL_REPEAT_SCORE_DELTA
     global RSI_SIGNAL_TF, RSI_SIGNAL_LEVEL, RSI_REVERSAL_TF, RSI_SIGNAL_FILTER_ENABLED
     global RSI_REVERSAL_FILTER_ENABLED
@@ -3183,7 +3264,6 @@ async def handle_message(msg: dict):
             f"⏱ Период алертов: <b>{current_window // 60} мин</b>\n"
             f"🔄 Порог разворота: <b>{REVERSAL_MIN_SCORE}/20 факторов</b>\n"
             f"📉 Рост для разворота: <b>{REVERSAL_GROWTH_MIN_PCT}%</b> за <b>{_fmt_dur(REVERSAL_WINDOW_SEC)}</b>\n"
-            f"🔔 Уведомление движения: <b>{NOTIFY_BIG_MOVE_PCT}%</b>\n"
             f"📊 RSI-фильтр РОСТА: {_rsi_signal_status_line()} (падение — без порога, только значение)\n"
             f"🔄📊 RSI-гейт разворота: {_rsi_reversal_status_line()} (не зависит от 20 факторов)\n"
             f"🖼 График в сигналах: {'<b>ВКЛЮЧЕН</b>' if CHART_ENABLED else '<b>ВЫКЛЮЧЕН</b>'} "
@@ -3230,7 +3310,6 @@ async def handle_message(msg: dict):
             f"  /rev_score 5 — порог факторов разворота\n"
             f"  /rev_growth 5 — % роста для разворота\n"
             f"  /rev_window 60 — период роста разворота (мин)\n"
-            f"  /notify_pct 15 — порог уведомлений движения (%)\n"
             f"  /rev_cooldown 5 — кулдаун разворота (мин)\n"
             f"  /restart — перезапуск мониторинга",
             chat_id,
@@ -3328,7 +3407,6 @@ async def handle_message(msg: dict):
             f"🔄 Разворотов: {reversal_count}\n"
             f"🔄 Порог разворота: {REVERSAL_MIN_SCORE}/20\n"
             f"📉 Рост для разворота: {REVERSAL_GROWTH_MIN_PCT}% за {_fmt_dur(REVERSAL_WINDOW_SEC)}\n"
-            f"🔔 Уведомление движения: {NOTIFY_BIG_MOVE_PCT}%\n"
             f"📊 RSI сигналов: {_rsi_signal_status_line(bold=False)}\n"
             f"🔄📊 RSI разворота: {_rsi_reversal_status_line(bold=False)}\n"
             f"🔄 Кулдаун разворота: {REVERSAL_COOLDOWN_SEC // 60} мин\n"
@@ -3361,7 +3439,6 @@ async def handle_message(msg: dict):
         _cache_clear_all()
         _reversal_cooldown.clear()
         _reversal_last.clear()
-        _notify_cooldown.clear()
         await send_message("🗑 Кулдауны, уровни и история разворотов сброшены", chat_id)
         return
 
@@ -3417,20 +3494,6 @@ async def handle_message(msg: dict):
             f"ℹ️ Разворотный детектор сработает если рост ≥ {REVERSAL_GROWTH_MIN_PCT}%",
             chat_id,
         )
-        return
-
-    if text.startswith("/notify_pct"):
-        try:
-            val = float(text.split()[1])
-            assert 1.0 <= val <= 100.0
-            NOTIFY_BIG_MOVE_PCT = val
-            _notify_cooldown.clear()
-            await send_message(f"✅ Уведомление о движении: <b>≥ {val}%</b>", chat_id)
-        except Exception:
-            await send_message(
-                f"❌ /notify_pct 15   (текущее: {NOTIFY_BIG_MOVE_PCT}%)\n"
-                f"Диапазон: 1–100", chat_id
-            )
         return
 
     if text.startswith("/rev_growth"):
@@ -4028,9 +4091,37 @@ async def watchdog():
 _shutdown_event: asyncio.Event | None = None
 
 
+def notify_sync(text: str) -> None:
+    """
+    Отправляет сообщение в Telegram БЕЗ asyncio/aiohttp — синхронно, через
+    стандартную библиотеку (urllib). Нужна там, где event loop уже
+    останавливается/остановлен или сессия aiohttp недоступна: критический
+    сбой во внешнем retry-цикле (см. низ файла), сигнал завершения,
+    неперехваченное исключение до входа в основной async-код. Никогда не
+    бросает исключения наружу — по дизайну "бот не работает" не должно само
+    по себе уронить процесс ещё раз.
+    """
+    try:
+        import urllib.request
+        import urllib.parse
+        data = urllib.parse.urlencode({
+            "chat_id": int(config.CHAT_ID),
+            "text": text,
+            "parse_mode": "HTML",
+        }).encode()
+        req = urllib.request.Request(f"{TG}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        try:
+            log.warning("notify_sync: не удалось отправить сообщение в Telegram: %s", e)
+        except Exception:
+            pass
+
+
 def _handle_signal(sig):
     log.info("Signal %s — завершение", sig)
     save_state()
+    notify_sync(f"🛑 <b>Бот останавливается</b> (сигнал {getattr(sig, 'name', sig)}) — настройки сохранены.")
     if _shutdown_event:
         _shutdown_event.set()
 
@@ -4173,17 +4264,21 @@ try:
                 # ручная остановка на Railway) — процесс должен реально
                 # завершиться, а не запускаться заново сам на себя.
                 log.info("Штатная остановка — процесс завершается")
+                notify_sync("🛑 <b>Бот остановлен</b> (штатное завершение процесса).")
                 break
             # Один из фоновых тасков упал/вышел неожиданно (см. лог выше) —
             # ведём себя так же, как при необработанном исключении: пауза,
             # чтобы не уйти в горячий цикл рестартов, если сбой повторяется
             # на каждой итерации (например, сразу после старта).
             log.warning("Внутренний перезапуск после сбоя фонового таска — пауза 10с")
+            notify_sync("🔴 <b>Бот сейчас не работает</b> — внутренний перезапуск после сбоя фонового процесса. Настройки сохранены, перезапуск через 10с...")
             time.sleep(10)
         except KeyboardInterrupt:
+            notify_sync("🛑 <b>Бот остановлен</b> вручную (Ctrl+C).")
             break
         except Exception as e:
             log.exception("Критическая ошибка: %s", e)
+            notify_sync(f"🔴 <b>Бот сейчас не работает</b> — критическая ошибка:\n<code>{_esc(str(e))[:500]}</code>\nАвтоматический перезапуск через 10с...")
             time.sleep(10)
 finally:
     db_close()
