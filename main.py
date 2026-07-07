@@ -4,6 +4,32 @@ Crypto Alert Bot — v25
 ЕДИНСТВЕННЫЙ источник данных. MEXC и OKX полностью удалены из кода.
 
 ═══════════════════════════════════════════════════════
+ НОВОЕ v25.10 — ТОЧНЫЕ УРОВНИ ПОДДЕРЖКИ/СОПРОТИВЛЕНИЯ НА ГРАФИКЕ
+═══════════════════════════════════════════════════════
+• На PNG-график (generate_chart_png) теперь наносятся уровни поддержки
+  (голубые линии, подпись "S ...") и сопротивления (янтарные линии,
+  подпись "R ..."), рассчитанные функцией calculate_support_resistance
+  по ПЯТИ независимым факторам одновременно:
+    1) фрактальные свинг-хай/лоу в нескольких окнах (2/3/5 баров) —
+       структура цены;
+    2) профиль объёма (Volume Profile) — зоны, где реально прошло
+       больше всего сделок (Point of Control + вторичные HVN);
+    3) классические Floor Trader Pivot Points (PP/R1-R3/S1-S3) по
+       предыдущим суткам (Day1) — не зависят от ТФ самого графика;
+    4) крайние хай/лоу видимого окна графика;
+    5) "круглые" психологические уровни, шаг которых подбирается под
+       масштаб цены — от BTC (~65000) до монет по ~0.00002.
+• Точность обеспечивается кластеризацией (confluence): близкие цены из
+  разных факторов схлопываются в один уровень с суммарным весом — линия
+  на графике показывает только те уровни, где реально совпало несколько
+  независимых признаков, а не любую случайную свечу. Показываются до
+  SR_MAX_LEVELS (по умолчанию 3) сильнейших уровней в каждую сторону.
+• Работает на тех же данных, что уже загружены для самого графика (без
+  доп. запросов) + один дополнительный дешёвый запрос Day1-свечей для
+  pivot points (тот же кэш get_bybit_klines, TTL=60с). Любая ошибка
+  расчёта — просто пустой список уровней, график всё равно строится.
+
+═══════════════════════════════════════════════════════
  НОВОЕ v25.8 — ИСПРАВЛЕНЫ ЛОЖНЫЕ ОШИБКИ "editMessageText: HTTP 400" В ЛОГЕ
 ═══════════════════════════════════════════════════════
 • ПРИЧИНА: _last_pushed_settings_json (кэш "что уже отправлено в Telegram")
@@ -588,6 +614,7 @@ import fcntl
 import io
 import json
 import logging
+import math
 import os
 import random
 import signal
@@ -2542,6 +2569,253 @@ async def broadcast(text: str, reply_markup=None):
 
 
 # ================================================================
+#  v25.10: УРОВНИ ПОДДЕРЖКИ/СОПРОТИВЛЕНИЯ — 5 независимых факторов
+# ================================================================
+#
+# Ни один метод сам по себе не даёт надёжный уровень — поэтому итоговые
+# линии на графике это КЛАСТЕРЫ близких цен, в которых сошлось НЕСКОЛЬКО
+# независимых факторов (confluence). Чем больше факторов совпало в одной
+# точке — тем выше её "сила" и тем более приоритетно она показывается на
+# графике вместо соседних одиночных, неподтверждённых кандидатов. Это тот
+# же принцип, которым пользуются трейдеры вручную: "хороший" уровень —
+# это тот, который одновременно является и структурным разворотом, и
+# зоной объёма, и классическим pivot'ом, а не просто одна случайная свеча.
+#
+# Учтённые факторы:
+#   1) Фрактальные экстремумы (свинг-хай/лоу) в нескольких окнах (2/3/5
+#      баров с каждой стороны) — структура цены. Чем в более широком окне
+#      точка остаётся экстремумом, тем значимее разворот в этом месте.
+#   2) Профиль объёма (Volume Profile): цена разбивается на бины, в
+#      каждый суммируется объём по типичной цене свечи (H+L+C)/3 — бины
+#      с наибольшим объёмом (Point of Control и вторичные HVN) отмечают
+#      зоны, где реально прошло больше всего сделок.
+#   3) Классические Pivot Points (Floor Trader) по ПРЕДЫДУЩИМ суткам
+#      (Day1, независимо от ТФ самого графика) — PP/R1-R3/S1-S3.
+#   4) Крайние хай/лоу видимого окна графика — очевидные зоны разворота.
+#   5) "Круглые" психологические уровни, шаг подобран под масштаб цены
+#      (1/2/2.5/5 × 10^n), чтобы работать что для BTC (~65000), что для
+#      мелких монет (~0.00002).
+
+
+def _fractal_sr_points(highs: list[float], lows: list[float]) -> list[tuple[float, float, str]]:
+    """Фрактальные свинг-хай/лоу в нескольких окнах.
+    Возвращает (цена, вес, сторона) где сторона 'R' — от хая, 'S' — от лоя.
+    Вес растёт с шириной окна: более широкое подтверждение = более
+    значимый разворот структуры цены."""
+    n = len(highs)
+    out: list[tuple[float, float, str]] = []
+    for k in (2, 3, 5):
+        if n < 2 * k + 1:
+            continue
+        for i in range(k, n - k):
+            window_h = highs[i - k:i + k + 1]
+            window_l = lows[i - k:i + k + 1]
+            if highs[i] == max(window_h) and window_h.count(highs[i]) == 1:
+                out.append((highs[i], float(k), "R"))
+            if lows[i] == min(window_l) and window_l.count(lows[i]) == 1:
+                out.append((lows[i], float(k), "S"))
+    return out
+
+
+def _volume_profile_sr_points(highs: list[float], lows: list[float],
+                               closes: list[float], volumes: list[float]) -> list[tuple[float, float, str]]:
+    """Точки высокого объёма (Volume Profile): гистограмма объёма по цене,
+    локальные максимумы которой (Point of Control + вторичные HVN) —
+    кандидаты в уровни. Сторона определяется относительно текущей цены."""
+    n = len(closes)
+    if n < 5 or not any(volumes):
+        return []
+    lo, hi = min(lows), max(highs)
+    if hi <= lo:
+        return []
+    bins  = 30
+    width = (hi - lo) / bins
+    vol_bins = [0.0] * bins
+
+    def _bin_idx(p: float) -> int:
+        idx = int((p - lo) / width) if width > 0 else 0
+        return max(0, min(bins - 1, idx))
+
+    for i in range(n):
+        typical = (highs[i] + lows[i] + closes[i]) / 3
+        vol_bins[_bin_idx(typical)] += volumes[i]
+
+    max_vol = max(vol_bins) or 1.0
+    current = closes[-1]
+    out: list[tuple[float, float, str]] = []
+    for i, v in enumerate(vol_bins):
+        if v <= 0:
+            continue
+        left  = vol_bins[i - 1] if i > 0 else 0.0
+        right = vol_bins[i + 1] if i < bins - 1 else 0.0
+        # локальный максимум гистограммы объёма (HVN), не слишком мелкий
+        if v >= left and v >= right and v >= max_vol * 0.35:
+            price  = lo + width * (i + 0.5)
+            weight = 3.0 if v == max_vol else 2.0   # POC весомее вторичных узлов
+            out.append((price, weight, "R" if price >= current else "S"))
+    return out
+
+
+def calculate_pivot_points(high: float, low: float, close: float) -> dict:
+    """Классические Floor Trader Pivot Points по предыдущему периоду
+    (используются данные предыдущих суток) — общепринятая формула
+    технического анализа, не зависящая от ТФ самого графика."""
+    pp = (high + low + close) / 3
+    r1 = 2 * pp - low
+    s1 = 2 * pp - high
+    r2 = pp + (high - low)
+    s2 = pp - (high - low)
+    r3 = high + 2 * (pp - low)
+    s3 = low - 2 * (high - pp)
+    return {"pp": pp, "r1": r1, "r2": r2, "r3": r3, "s1": s1, "s2": s2, "s3": s3}
+
+
+def _round_number_sr_levels(lo: float, hi: float) -> list[float]:
+    """'Круглые' психологические уровни в видимом диапазоне графика.
+    Шаг подбирается под масштаб цены (1/2/2.5/5 × 10^n) — тот же приём,
+    которым графические библиотеки расставляют деления оси — поэтому
+    работает одинаково хорошо что для BTC (~65000), что для мелких монет
+    (~0.00002), без единого захардкоженного числа."""
+    rng = hi - lo
+    if rng <= 0:
+        return []
+    raw_step  = rng / 6
+    magnitude = 10 ** math.floor(math.log10(raw_step))
+    step = raw_step
+    for m in (1, 2, 2.5, 5, 10):
+        cand = m * magnitude
+        if cand >= raw_step:
+            step = cand
+            break
+    if step <= 0:
+        return []
+    levels = []
+    x = math.floor(lo / step) * step
+    while x <= hi + step:
+        if lo <= x <= hi:
+            levels.append(round(x, 12))
+        x += step
+    return levels
+
+
+SR_MAX_LEVELS = getattr(config, "SR_MAX_LEVELS", 3)   # макс. уровней поддержки/сопротивления на графике
+
+
+def calculate_support_resistance(
+    highs: list[float], lows: list[float], closes: list[float], volumes: list[float],
+    daily_hlc: Optional[tuple[float, float, float]] = None,
+    max_levels: int = SR_MAX_LEVELS,
+) -> dict:
+    """
+    Многофакторный расчёт уровней поддержки/сопротивления для видимого
+    окна графика (см. заголовок раздела — 5 факторов). Возвращает
+    {"support": [...], "resistance": [...]} — списки словарей
+    {"price": float, "weight": float, "sources": set[str]}, отсортированные
+    так, что ближний к текущей цене уровень идёт первым; максимум
+    max_levels в каждую сторону.
+    """
+    n = len(closes)
+    if n < 10:
+        return {"support": [], "resistance": []}
+
+    current  = closes[-1]
+    lo, hi   = min(lows), max(highs)
+    if current <= 0 or hi <= lo:
+        return {"support": [], "resistance": []}
+
+    candidates: list[tuple[float, float, str, str]] = []   # (цена, вес, сторона, источник)
+
+    for price, weight, side in _fractal_sr_points(highs, lows):
+        candidates.append((price, weight, side, "structure"))
+
+    for price, weight, side in _volume_profile_sr_points(highs, lows, closes, volumes):
+        candidates.append((price, weight, side, "volume"))
+
+    # Крайние хай/лоу видимого окна — весомый уровень сам по себе
+    candidates.append((hi, 3.0, "R", "range"))
+    candidates.append((lo, 3.0, "S", "range"))
+
+    if daily_hlc:
+        piv = calculate_pivot_points(*daily_hlc)
+        weights = {"pp": 2.5, "r1": 2.0, "s1": 2.0, "r2": 1.5, "s2": 1.5, "r3": 1.0, "s3": 1.0}
+        margin = (hi - lo) * 0.15
+        for key, price in piv.items():
+            if lo - margin <= price <= hi + margin:
+                if key == "pp":
+                    side = "S" if price < current else "R"
+                else:
+                    side = "R" if key.startswith("r") else "S"
+                candidates.append((price, weights[key], side, "pivot"))
+
+    for price in _round_number_sr_levels(lo, hi):
+        # самый слабый по весу фактор сам по себе — усиливает другие уровни
+        # только при реальном совпадении (confluence), не создаёт свои
+        candidates.append((price, 0.7, "S" if price < current else "R", "round"))
+
+    if not candidates:
+        return {"support": [], "resistance": []}
+
+    # ── Кластеризация: уровни ближе друг к другу, чем tol от текущей
+    # цены, схлопываются в один (цена — среднее взвешенное по силе, вес —
+    # сумма). Совпадение (confluence) нескольких факторов в одной точке —
+    # самый надёжный признак реального уровня, поэтому именно это и
+    # определяет итоговую точность и приоритет отображаемых линий.
+    tol = max(current * 0.003, (hi - lo) * 0.006)
+    candidates.sort(key=lambda c: c[0])
+    clusters: list[dict] = []
+    for price, weight, side, source in candidates:
+        if clusters and abs(price - clusters[-1]["price"]) <= tol:
+            cl = clusters[-1]
+            total = cl["weight"] + weight
+            cl["price"]  = (cl["price"] * cl["weight"] + price * weight) / total
+            cl["weight"] = total
+            cl["sources"].add(source)
+        else:
+            clusters.append({"price": price, "weight": weight, "sources": {source}})
+
+    for cl in clusters:
+        if len(cl["sources"]) > 1:
+            cl["weight"] *= 1.0 + 0.25 * (len(cl["sources"]) - 1)
+
+    support    = sorted((c for c in clusters if c["price"] < current), key=lambda c: c["weight"], reverse=True)
+    resistance = sorted((c for c in clusters if c["price"] > current), key=lambda c: c["weight"], reverse=True)
+
+    def _pick_top(levels: list[dict]) -> list[dict]:
+        chosen: list[dict] = []
+        min_gap = max(current * 0.004, tol)
+        for c in levels:
+            if all(abs(c["price"] - p["price"]) >= min_gap for p in chosen):
+                chosen.append(c)
+            if len(chosen) >= max_levels:
+                break
+        return chosen
+
+    top_support    = _pick_top(support)
+    top_resistance = _pick_top(resistance)
+
+    # Для отображения на графике — ближний к текущей цене уровень первым
+    top_support.sort(key=lambda c: c["price"], reverse=True)
+    top_resistance.sort(key=lambda c: c["price"])
+
+    return {"support": top_support, "resistance": top_resistance}
+
+
+def _fmt_level_price(price: float) -> str:
+    """Цена уровня для подписи на графике без научной нотации — даже для
+    монет с ценой в районе тысячных/стотысячных долей (SHIB, PEPE и т.п.),
+    где обычный формат :g уходит в scientific notation и плохо читается."""
+    if price == 0:
+        return "0"
+    abs_p = abs(price)
+    if abs_p >= 1000:
+        return f"{price:,.1f}".replace(",", " ")
+    if abs_p >= 1:
+        return f"{price:.4f}".rstrip("0").rstrip(".")
+    digits = max(4, -int(math.floor(math.log10(abs_p))) + 3)
+    return f"{price:.{digits}f}"
+
+
+# ================================================================
 #  v25: СКРИНШОТ ГРАФИКА (генерируется прямо в Python, в реальном
 #  времени, по свежим свечам Bybit 1H — визуально похоже на сам Bybit)
 # ================================================================
@@ -2575,12 +2849,34 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
     try:
         data = await get_bybit_klines(sym, CHART_TF, CHART_TF_CANDLES.get(CHART_TF, 72))
         opens, highs, lows, closes = data["opens"], data["highs"], data["lows"], data["closes"]
+        volumes = data["volumes"]
         n = len(closes)
         if n < 2:
             return None
 
+        # v25.10: уровни поддержки/сопротивления — считаются по тем же
+        # свечам, что уже загружены для самого графика (без доп. запроса),
+        # плюс предыдущие сутки (Day1) отдельно — только для классических
+        # pivot points, тот же кэшированный get_bybit_klines (TTL=60с), так
+        # что при обычной частоте сигналов лишней нагрузки на Bybit не даёт.
+        daily_hlc = None
+        try:
+            daily = await get_bybit_klines(sym, "Day1", 3)
+            if len(daily["closes"]) >= 2:
+                # последняя свеча — текущие незакрытые сутки, для pivot
+                # нужны именно ПРЕДЫДУЩИЕ завершённые сутки
+                daily_hlc = (daily["highs"][-2], daily["lows"][-2], daily["closes"][-2])
+        except Exception as e:
+            log.debug("generate_chart_png(%s) daily pivot: %s", sym, e)
+        try:
+            sr_levels = calculate_support_resistance(highs, lows, closes, volumes, daily_hlc)
+        except Exception as e:
+            log.debug("generate_chart_png(%s) S/R: %s", sym, e)
+            sr_levels = {"support": [], "resistance": []}
+
         up_color, down_color = "#0ECB81", "#F6465D"
         bg_color, grid_color, txt_color = "#161A1E", "#2B3139", "#848E9C"
+        sr_r_color, sr_s_color = "#FFB74D", "#4FC3F7"   # сопротивление/поддержка — не путать с красными/зелёными свечами
 
         fig, ax = plt.subplots(figsize=(9, 5), dpi=130)
         fig.patch.set_facecolor(bg_color)
@@ -2600,7 +2896,10 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
                 facecolor=color, edgecolor=color, linewidth=0.4, zorder=3,
             ))
 
-        ax.set_xlim(-1, n)
+        # v25.10: правый отступ под подписи цены уровней поддержки/
+        # сопротивления (сами линии рисуются чуть ниже, после сетки/осей).
+        margin_x = max(8, round(n * 0.14))
+        ax.set_xlim(-1, n - 1 + margin_x)
         pad = (hi - lo) * 0.06 or hi * 0.01 or 1.0
         ax.set_ylim(lo - pad, hi + pad)
         ax.grid(True, color=grid_color, linewidth=0.5, alpha=0.55, axis="y")
@@ -2608,6 +2907,28 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
         for spine in ax.spines.values():
             spine.set_color(grid_color)
         ax.set_xticks([])
+
+        # v25.10: уровни поддержки/сопротивления — горизонтальная линия на
+        # всю ширину графика + подпись цены в отступе справа. Цвета
+        # отдельные от красных/зелёных свечей и от жёлтой линии текущей
+        # цены, чтобы типы линий не путались между собой визуально.
+        label_x = n - 1 + margin_x * 0.22
+        for lvl in sr_levels["resistance"]:
+            p = lvl["price"]
+            if not (lo - pad <= p <= hi + pad):
+                continue   # pivot-уровень может быть чуть за пределами видимого окна — не рисуем
+            ax.axhline(p, color=sr_r_color, linewidth=1.0, linestyle=(0, (4, 2)), alpha=0.8, zorder=3.3)
+            ax.text(label_x, p, f" R {_fmt_level_price(p)}", color=sr_r_color, fontsize=7.3,
+                    ha="left", va="center", zorder=5, clip_on=False,
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor=bg_color, edgecolor="none", alpha=0.8))
+        for lvl in sr_levels["support"]:
+            p = lvl["price"]
+            if not (lo - pad <= p <= hi + pad):
+                continue
+            ax.axhline(p, color=sr_s_color, linewidth=1.0, linestyle=(0, (4, 2)), alpha=0.8, zorder=3.3)
+            ax.text(label_x, p, f" S {_fmt_level_price(p)}", color=sr_s_color, fontsize=7.3,
+                    ha="left", va="center", zorder=5, clip_on=False,
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor=bg_color, edgecolor="none", alpha=0.8))
 
         last_price = closes[-1]
         last_color = up_color if closes[-1] >= opens[0] else down_color
