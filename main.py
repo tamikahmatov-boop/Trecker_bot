@@ -1525,7 +1525,18 @@ def _cache_clear_all():
 
 _kline_cache: dict[str, dict] = {}
 KLINE_CACHE_TTL  = 60
-KLINE_LIMIT_1M   = 120   # 120 свечей по 1 мин = 2 часа (RSI, BB, StochRSI, паттерны)
+KLINE_LIMIT_1M   = 250   # 250 свечей по 1 мин (RSI, BB, StochRSI, паттерны).
+# v25.9: было 120 — этого хватало для большинства индикаторов, но RSI считается
+# рекурсивным экспоненциальным сглаживанием Уайлдера (RMA), которое зависит от
+# ВСЕЙ предшествующей истории, а не только от последних window свечей. Чем
+# короче поданная история, тем сильнее финальное значение RSI отличается от
+# "истинного" (того, что показывает график Bybit/TradingView, посчитанный по
+# практически неограниченной глубине истории). При window=12 (alpha=1/12)
+# влияние точки начала расчёта затухает как (11/12)^n — на n≈250 остаточная
+# погрешность порядка 1e-8, то есть RSI(12) на 250 свечах фактически совпадает
+# со значением на графике Bybit с точностью до округления. На 120 свечах
+# остаточная погрешность была на несколько порядков больше и в моменте могла
+# давать заметное расхождение с биржевым RSI.
 KLINE_LIMIT_5M   = 100   # 100 свечей по 5 мин = 8+ часов (ATR, EMA, MACD, объём)
 # Для обратной совместимости
 KLINE_LIMIT = KLINE_LIMIT_1M
@@ -1613,7 +1624,10 @@ async def get_bybit_klines(symbol: str, interval: str = "Min1", limit: int = KLI
     return data
 
 
-KLINE_LIMIT_15M  = 60    # 60 свечей по 15 мин = 15 часов (старший таймфрейм RSI, OBV)
+KLINE_LIMIT_15M  = 250   # 250 свечей по 15 мин (старший таймфрейм RSI, OBV).
+# v25.9: было 60 — увеличено по той же причине, что и KLINE_LIMIT_1M выше:
+# RSI(12) на Min15 сходится к биржевому значению только при достаточно длинной
+# истории для рекурсивного сглаживания Уайлдера.
 
 
 async def get_bybit_klines_multi(symbol: str) -> dict:
@@ -1649,8 +1663,14 @@ RSI_TF_INTERVALS = {
 RSI_TF_LABELS = {v: k for k, v in RSI_TF_INTERVALS.items()}
 RSI_TF_LABELS["Min1"] = "1м"
 RSI_TF_LIMIT = {
-    "Min1": 120, "Min5": 100, "Min15": 60, "Min60": 60,
-    "Hour4": 60, "Hour12": 60, "Day1": 60,
+    # v25.9: лимиты подняты до 250 свечей на каждом ТФ (было 60-120). RSI —
+    # рекурсивное экспоненциальное сглаживание Уайлдера, зависящее от ВСЕЙ
+    # истории; на коротких сериях (60-120 свечей) значение заметно отличалось
+    # от того, что показывает график Bybit. На 250 свечах остаточное влияние
+    # точки старта расчёта пренебрежимо мало, и RSI(12) практически точно
+    # совпадает с биржевым.
+    "Min1": 250, "Min5": 250, "Min15": 250, "Min60": 250,
+    "Hour4": 250, "Hour12": 250, "Day1": 250,
 }
 
 
@@ -1665,7 +1685,7 @@ def _resample_closes(closes: list[float], group: int) -> list[float]:
     return [trimmed[i + group - 1] for i in range(0, n, group)]
 
 
-async def get_rsi_for_tf(symbol: str, interval: str, window: int = 14) -> Optional[float]:
+async def get_rsi_for_tf(symbol: str, interval: str, window: int = 12) -> Optional[float]:
     """
     Точный RSI с биржи Bybit (linear-фьючерсы) для выбранного через кнопки
     таймфрейма. Использует тот же TTL-кэш свечей (60с), поэтому повторное
@@ -1674,7 +1694,10 @@ async def get_rsi_for_tf(symbol: str, interval: str, window: int = 14) -> Option
     (берётся реальная цена закрытия каждой 3-й 4-часовой свечи).
     """
     if interval == "Hour12":
-        data = await get_bybit_klines(symbol, "Hour4", 180)
+        # v25.9: 750 свечей Hour4 / 3 = 250 свечей Hour12 (было 180/3=60) —
+        # столько же глубины истории, сколько у остальных ТФ в RSI_TF_LIMIT,
+        # для той же сходимости RSI(12) к биржевому значению.
+        data = await get_bybit_klines(symbol, "Hour4", 750)
         closes = _resample_closes(data["closes"], 3)
         if len(closes) < window + 1:
             return None
@@ -1694,7 +1717,7 @@ async def get_rsi_for_tf(symbol: str, interval: str, window: int = 14) -> Option
 MIN_SAMPLES = 10
 
 
-def calculate_rsi(prices: list[float], window: int = 14) -> Optional[float]:
+def calculate_rsi(prices: list[float], window: int = 12) -> Optional[float]:
     try:
         if len(prices) < window + 1:
             return None
@@ -1706,7 +1729,7 @@ def calculate_rsi(prices: list[float], window: int = 14) -> Optional[float]:
         return None
 
 
-def calculate_stoch_rsi(prices: list[float], window: int = 14) -> Optional[float]:
+def calculate_stoch_rsi(prices: list[float], window: int = 12) -> Optional[float]:
     """StochRSI: позиция RSI в его собственном диапазоне. >0.8 = перекупленность."""
     try:
         if len(prices) < window * 2 + 1:
@@ -1892,7 +1915,7 @@ def calculate_fibonacci_levels(high: float, low: float) -> dict:
     }
 
 
-def calculate_rsi_divergence(prices: list[float], window: int = 14,
+def calculate_rsi_divergence(prices: list[float], window: int = 12,
                               lookback: int = 10) -> bool:
     """Медвежья дивергенция: цена = новый хай, RSI = ниже предыдущего пика."""
     try:
@@ -1961,7 +1984,7 @@ def calculate_volume_signal(sym: str) -> Optional[str]:
     return None
 
 
-def calculate_rsi_trend(prices: list[float], window: int = 14) -> Optional[str]:
+def calculate_rsi_trend(prices: list[float], window: int = 12) -> Optional[str]:
     try:
         if len(prices) < window + 3:
             return None
@@ -2115,7 +2138,7 @@ def calculate_lower_highs(highs: list[float], window: int = 5) -> bool:
         return False
 
 
-def calculate_rsi_higher_tf(prices_15m: list[float], window: int = 14) -> Optional[float]:
+def calculate_rsi_higher_tf(prices_15m: list[float], window: int = 12) -> Optional[float]:
     """
     RSI на 15m свечах — аппроксимация «старшего таймфрейма».
     Перекупленность >75 на 15m при уже высоком 1m RSI — сильный сигнал.
