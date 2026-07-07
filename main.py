@@ -1717,12 +1717,62 @@ async def get_rsi_for_tf(symbol: str, interval: str, window: int = 12) -> Option
 MIN_SAMPLES = 10
 
 
+def _wilder_rma(series: pd.Series, window: int) -> pd.Series:
+    """
+    Классическое сглаживание Уайлдера (RMA) — ТОЧНО как ta.rma() в Pine Script
+    TradingView, на чьей чарт-библиотеке построены графики Bybit (включая
+    встроенный индикатор RSI):
+        rma[0]   = SMA(src, window)              — затравка: простое среднее
+                                                     первых `window` значений
+        rma[i]   = alpha*src[i] + (1-alpha)*rma[i-1],  alpha = 1/window
+    v25.10: раньше использовалась RSIIndicator из пакета `ta`, где pandas
+    ewm(adjust=False) стартует с затравки rma[0] = src[0] (фактически 0,
+    т.к. это первый gain/loss после diff()). Это НЕ то же самое, что делает
+    TradingView/Bybit — отсюда систематическое расхождение значений RSI
+    с биржей, даже на длинной истории (влияние неверной затравки затухает
+    экспоненциально, но полностью не исчезает и заметно на коротких сериях).
+    С SMA-затравкой результат совпадает с биржевым/TradingView RSI.
+    """
+    s = series.reset_index(drop=True).astype(float)
+    n = len(s)
+    result = pd.Series([float("nan")] * n)
+    if n < window:
+        return result
+    alpha = 1.0 / window
+    prev = float(s.iloc[:window].mean())
+    result.iloc[window - 1] = prev
+    for i in range(window, n):
+        prev = alpha * float(s.iloc[i]) + (1 - alpha) * prev
+        result.iloc[i] = prev
+    return result
+
+
+def _rsi_series(prices: list[float], window: int) -> pd.Series:
+    """Полная серия RSI, посчитанная классическим методом Уайлдера (см.
+    _wilder_rma) — совпадает с тем, что показывает график Bybit/TradingView
+    при том же периоде. Индекс серии сброшен (0..n-2), т.к. diff() съедает
+    первую свечу."""
+    s    = pd.Series(prices, dtype=float)
+    diff = s.diff().dropna().reset_index(drop=True)
+    gain = diff.clip(lower=0)
+    loss = -diff.clip(upper=0)
+    avg_gain = _wilder_rma(gain, window)
+    avg_loss = _wilder_rma(loss, window)
+    rs  = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(avg_loss != 0, 100.0)          # down==0 → RSI=100 (как в TradingView)
+    rsi = rsi.mask((avg_loss != 0) & (avg_gain == 0), 0.0)  # up==0 & down!=0 → RSI=0
+    return rsi.dropna()
+
+
 def calculate_rsi(prices: list[float], window: int = 12) -> Optional[float]:
     try:
         if len(prices) < window + 1:
             return None
-        s   = pd.Series(prices)
-        val = RSIIndicator(close=s, window=window).rsi().iloc[-1]
+        rsi = _rsi_series(prices, window)
+        if rsi.empty:
+            return None
+        val = rsi.iloc[-1]
         return None if pd.isna(val) else round(float(val), 2)
     except Exception as e:
         log.error("RSI error: %s", e)
@@ -1734,8 +1784,7 @@ def calculate_stoch_rsi(prices: list[float], window: int = 12) -> Optional[float
     try:
         if len(prices) < window * 2 + 1:
             return None
-        s          = pd.Series(prices)
-        rsi_series = RSIIndicator(close=s, window=window).rsi().dropna()
+        rsi_series = _rsi_series(prices, window)
         if len(rsi_series) < window:
             return None
         rsi_min = rsi_series.rolling(window).min().iloc[-1]
@@ -1921,8 +1970,7 @@ def calculate_rsi_divergence(prices: list[float], window: int = 12,
     try:
         if len(prices) < window + lookback + 1:
             return False
-        s          = pd.Series(prices)
-        rsi_series = RSIIndicator(close=s, window=window).rsi().dropna()
+        rsi_series = _rsi_series(prices, window)
         if len(rsi_series) < lookback:
             return False
         price_now  = prices[-1]
@@ -1988,8 +2036,7 @@ def calculate_rsi_trend(prices: list[float], window: int = 12) -> Optional[str]:
     try:
         if len(prices) < window + 3:
             return None
-        s   = pd.Series(prices)
-        rsi = RSIIndicator(close=s, window=window).rsi().dropna()
+        rsi = _rsi_series(prices, window)
         if len(rsi) < 3:
             return None
         delta = rsi.iloc[-1] - rsi.iloc[-3]
