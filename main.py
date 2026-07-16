@@ -2709,7 +2709,8 @@ SR_MAX_LEVELS = getattr(config, "SR_MAX_LEVELS", 3)   # макс. уровней
 # WALL_CACHE_TTL, по умолчанию 15с) — не нагружает Bybit на каждый тик,
 # так как вызывается только при построении графика (по сигналу/команде).
 WALL_ORDERBOOK_DEPTH = getattr(config, "WALL_ORDERBOOK_DEPTH", 200)   # глубина стакана (уровней с каждой стороны)
-WALL_TOP_N            = getattr(config, "WALL_TOP_N", 4)              # макс. "стен" с каждой стороны на графике
+WALL_TOP_N            = getattr(config, "WALL_TOP_N", 4)              # макс. "стен" с каждой стороны на графике свечей
+WALL_NEAREST_N        = getattr(config, "WALL_NEAREST_N", 5)          # v25.12: макс. ближайших "стен" с каждой стороны на отдельном графике /walls
 WALL_MIN_USD          = getattr(config, "WALL_MIN_USD", 20_000)       # мин. объём заявки в USDT, чтобы считаться "стеной"
 WALL_MIN_REL_MULT     = getattr(config, "WALL_MIN_REL_MULT", 3.0)     # мин. во сколько раз крупнее медианной заявки в стакане
 WALL_CACHE_TTL        = getattr(config, "WALL_CACHE_TTL", 15)         # сек., кэш ответа стакана
@@ -2760,32 +2761,57 @@ async def get_bybit_orderbook(symbol: str, limit: int = WALL_ORDERBOOK_DEPTH) ->
     return data
 
 
+def _qualifying_walls(levels: list[tuple[float, float]]) -> list[dict]:
+    """
+    Общий фильтр "это реально стена": объём в USDT >= WALL_MIN_USD И объём
+    в базовой монете превышает медианный размер заявки на переданных
+    уровнях стакана минимум в WALL_MIN_REL_MULT раз. Используется как для
+    графика со свечами (в пределах видимого окна цен), так и для отдельного
+    графика ближайших заявок (по всему стакану) — логика одна и та же.
+    """
+    if not levels:
+        return []
+    qtys = sorted(q for _, q in levels)
+    mid = len(qtys) // 2
+    median_qty = qtys[mid] if len(qtys) % 2 else (qtys[mid - 1] + qtys[mid]) / 2
+    median_qty = median_qty or 1e-12
+    out = []
+    for p, q in levels:
+        usd = p * q
+        if usd >= WALL_MIN_USD and q >= median_qty * WALL_MIN_REL_MULT:
+            out.append({"price": p, "qty": q, "usd": usd})
+    return out
+
+
 def find_large_limit_orders(orderbook: dict, lo: float, hi: float) -> dict:
     """
-    Выделяет из стакана заявки, достаточно крупные, чтобы считаться
-    "стеной": одновременно (1) объём в USDT >= WALL_MIN_USD И (2) объём в
-    базовой монете превышает медианный размер заявки в стакане минимум в
-    WALL_MIN_REL_MULT раз — то есть реально выделяется на фоне остальных
-    заявок, а не просто "большая монета с высокой ценой". Возвращает не
-    более WALL_TOP_N сильнейших заявок с каждой стороны, только внутри
-    видимого диапазона цен графика [lo, hi].
+    Не более WALL_TOP_N сильнейших (по объёму в USDT) "стен" с каждой
+    стороны, только внутри видимого диапазона цен графика [lo, hi] —
+    используется для наложения на свечной график.
     """
     out = {"bids": [], "asks": []}
     for side in ("bids", "asks"):
         levels = [(p, q) for p, q in orderbook.get(side, []) if lo <= p <= hi]
-        if not levels:
-            continue
-        qtys = sorted(q for _, q in levels)
-        mid = len(qtys) // 2
-        median_qty = qtys[mid] if len(qtys) % 2 else (qtys[mid - 1] + qtys[mid]) / 2
-        median_qty = median_qty or 1e-12
-        walls = []
-        for p, q in levels:
-            usd = p * q
-            if usd >= WALL_MIN_USD and q >= median_qty * WALL_MIN_REL_MULT:
-                walls.append({"price": p, "qty": q, "usd": usd})
+        walls = _qualifying_walls(levels)
         walls.sort(key=lambda w: w["usd"], reverse=True)
         out[side] = walls[:WALL_TOP_N]
+    return out
+
+
+def find_nearest_large_limit_orders(orderbook: dict, current_price: float, n: int = WALL_NEAREST_N) -> dict:
+    """
+    v25.12: та же самая логика отбора "это реально стена" (см.
+    _qualifying_walls), но без ограничения по видимому окну цен графика —
+    берётся ВЕСЬ загруженный стакан, а результат — это n БЛИЖАЙШИХ к
+    текущей цене крупных заявок с каждой стороны (bid и ask отдельно),
+    отсортированных по цене от текущей цены наружу. Используется для
+    отдельного графика /walls.
+    """
+    out = {"bids": [], "asks": []}
+    for side in ("bids", "asks"):
+        walls = _qualifying_walls(list(orderbook.get(side, [])))
+        walls.sort(key=lambda w: abs(w["price"] - current_price))
+        out[side] = walls[:n]
     return out
 
 
@@ -3070,6 +3096,114 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
         return buf.getvalue()
     except Exception as e:
         log.warning("generate_chart_png(%s): %s", sym, e)
+        return None
+
+
+async def generate_orderbook_wall_chart(sym: str) -> Optional[bytes]:
+    """
+    v25.12: ОТДЕЛЬНЫЙ график — только 5 (WALL_NEAREST_N) ближайших к текущей
+    цене крупных лимитных заявок с каждой стороны (bid/ask), горизонтальные
+    полосы-"бары", отсортированные по цене. Логика отбора "это реально
+    стена" — та же самая, что и на свечном графике (см. _qualifying_walls):
+    объём >= WALL_MIN_USD USDT И объём в базовой монете >= медианного
+    объёма заявки в стакане * WALL_MIN_REL_MULT. У каждой полосы подписана
+    ТОЧНАЯ ЦЕНА заявки и её объём в USD. Текущая цена показана отдельной
+    пунктирной линией с подписью.
+
+    Возвращает None при любой проблеме (нет matplotlib, нет стакана, нет ни
+    одной заявки, прошедшей фильтр и т.п.) — вызывающий код в этом случае
+    просто сообщает, что подходящих крупных заявок сейчас нет.
+    """
+    global _matplotlib_warned
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        if not _matplotlib_warned:
+            log.warning("matplotlib недоступен — графики в сигналах отключены: %s", e)
+            _matplotlib_warned = True
+        return None
+
+    try:
+        ob = await get_bybit_orderbook(sym)
+        if not ob["bids"] and not ob["asks"]:
+            return None
+
+        best_bid = max((p for p, _ in ob["bids"]), default=None)
+        best_ask = min((p for p, _ in ob["asks"]), default=None)
+        if best_bid and best_ask:
+            current_price = (best_bid + best_ask) / 2
+        else:
+            current_price = best_bid or best_ask
+        if not current_price:
+            return None
+
+        walls = find_nearest_large_limit_orders(ob, current_price, WALL_NEAREST_N)
+        if not walls["bids"] and not walls["asks"]:
+            return None
+
+        bg_color, grid_color, txt_color = "#161A1E", "#2B3139", "#848E9C"
+        wall_bid_color, wall_ask_color = "#26E07F", "#FF5C5C"
+
+        # Сверху вниз — от самой высокой цены (дальние ask) к самой низкой
+        # (дальние bid), текущая цена — граница между ask- и bid-заявками.
+        rows = (
+            [("ask", w) for w in sorted(walls["asks"], key=lambda w: w["price"], reverse=True)]
+            + [("bid", w) for w in sorted(walls["bids"], key=lambda w: w["price"], reverse=True)]
+        )
+        n_rows = len(rows)
+        max_usd = max((w["usd"] for _, w in rows), default=0) or 1.0
+
+        fig, ax = plt.subplots(figsize=(8, max(3.2, 0.62 * n_rows + 1.4)), dpi=130)
+        fig.patch.set_facecolor(bg_color)
+        ax.set_facecolor(bg_color)
+
+        for i, (side, w) in enumerate(rows):
+            y = n_rows - 1 - i   # первая строка (самая высокая цена) — сверху
+            color = wall_ask_color if side == "ask" else wall_bid_color
+            width = w["usd"] if side == "ask" else -w["usd"]
+            ax.barh(y, width, color=color, alpha=0.85, height=0.6, zorder=3)
+            price_txt = _fmt_level_price(w["price"])
+            label = f"{price_txt}   {_fmt_usd(w['usd'])}"
+            if side == "ask":
+                ax.text(width + max_usd * 0.02, y, label, color=color, fontsize=8.5,
+                        ha="left", va="center", zorder=4)
+            else:
+                ax.text(width - max_usd * 0.02, y, label, color=color, fontsize=8.5,
+                        ha="right", va="center", zorder=4)
+
+        ax.axvline(0, color=grid_color, linewidth=1.0, zorder=2)
+        ax.set_xlim(-max_usd * 1.55, max_usd * 1.55)
+        ax.set_ylim(-1, n_rows)
+        ax.set_yticks([])
+        ax.set_xticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        ax.text(-max_usd * 1.5, n_rows - 0.3, "🧱 SELL (ask)", color=wall_ask_color,
+                fontsize=9, ha="left", va="top", fontweight="bold")
+        ax.text(max_usd * 1.5, n_rows - 0.3, "🧱 BUY (bid)", color=wall_bid_color,
+                fontsize=9, ha="right", va="top", fontweight="bold")
+
+        cur_price_txt = _fmt_level_price(current_price)
+        ax.set_title(
+            f"{sym}   •   крупные заявки в стакане   •   цена {cur_price_txt}",
+            color="#EAECEF", fontsize=11.5, loc="left", fontweight="bold", pad=10,
+        )
+        ax.text(
+            0.99, -0.06, "Bybit orderbook", transform=ax.transAxes, color=txt_color,
+            fontsize=8, ha="right", va="top", alpha=0.8,
+        )
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", facecolor=bg_color)
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        log.warning("generate_orderbook_wall_chart(%s): %s", sym, e)
         return None
 
 
@@ -4636,6 +4770,33 @@ async def _handle_message_impl(msg: dict):
         await send_message(f"💰 <b>{sym_q}</b>\n{line}", chat_id)
         return
 
+    if text.startswith("/walls"):
+        # v25.12: отдельный график — 5 ближайших к текущей цене крупных
+        # лимитных заявок (стен) с каждой стороны стакана. Логика отбора
+        # "это реально стена" — та же, что и на обычном свечном графике.
+        parts_cmd = text.split()
+        if len(parts_cmd) < 2:
+            await send_message("❌ Использование: /walls BTCUSDT", chat_id)
+            return
+        sym_q = parts_cmd[1].upper()
+        if not sym_q.endswith("USDT"):
+            sym_q += "USDT"
+        try:
+            png = await generate_orderbook_wall_chart(sym_q)
+        except Exception as e:
+            log.warning("/walls %s: %s", sym_q, e)
+            png = None
+        if not png:
+            await send_message(
+                f"❌ Сейчас нет крупных лимитных заявок (≥ ${WALL_MIN_USD:,.0f}, минимум "
+                f"в {WALL_MIN_REL_MULT:g}× больше медианной заявки в стакане) по "
+                f"<b>{sym_q}</b>, либо стакан недоступен.".replace(",", " "),
+                chat_id,
+            )
+            return
+        await send_photo(chat_id, png)
+        return
+
     if text == "📈🚦 24ч-регулировка ВЫКЛ":
         PCT24H_GATE_ENABLED = False
         await send_message(
@@ -4814,7 +4975,8 @@ async def _handle_message_impl(msg: dict):
             f"  ⚙️ Настройки разворота — все параметры детально\n"
             f"  🔄 Полный перезапуск — перезапуск процесса без потери данных\n\n"
             f"<b>Доп. команды:</b>\n"
-            f"  /funding BTCUSDT — текущая ставка фандинга по монете вручную\n\n"
+            f"  /funding BTCUSDT — текущая ставка фандинга по монете вручную\n"
+            f"  /walls BTCUSDT — 5 ближайших крупных лимитных заявок в стакане с ценами\n\n"
             f"Полный список команд: /menu",
             chat_id,
         )
