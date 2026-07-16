@@ -2714,6 +2714,7 @@ WALL_NEAREST_N        = getattr(config, "WALL_NEAREST_N", 5)          # v25.12: 
 WALL_MIN_USD          = getattr(config, "WALL_MIN_USD", 20_000)       # мин. объём заявки в USDT, чтобы считаться "стеной"
 WALL_MIN_REL_MULT     = getattr(config, "WALL_MIN_REL_MULT", 3.0)     # мин. во сколько раз крупнее медианной заявки в стакане
 WALL_CACHE_TTL        = getattr(config, "WALL_CACHE_TTL", 15)         # сек., кэш ответа стакана
+ALERT_WALLS_N         = getattr(config, "ALERT_WALLS_N", 3)           # v25.13: макс. ближайших "стен" с каждой стороны в тексте уведомлений роста/падения/24ч
 
 
 async def _fetch_bybit_orderbook(symbol: str, limit: int = WALL_ORDERBOOK_DEPTH) -> dict:
@@ -2813,6 +2814,48 @@ def find_nearest_large_limit_orders(orderbook: dict, current_price: float, n: in
         walls.sort(key=lambda w: abs(w["price"] - current_price))
         out[side] = walls[:n]
     return out
+
+
+async def format_walls_alert_line(sym: str, current_price: float) -> str:
+    """
+    v25.13: компактная строка "🧱 Крупные заявки: SELL ..., BUY ..." с
+    ТОЧНЫМИ ЦЕНАМИ ближайших к текущей цене крупных лимитных заявок (не
+    более ALERT_WALLS_N с каждой стороны) — для уведомлений роста/падения/
+    24ч. Логика отбора "это реально стена" ровно та же, что и на графиках
+    (см. _qualifying_walls): объём >= WALL_MIN_USD USDT И объём в базовой
+    монете >= медианного объёма заявки в стакане * WALL_MIN_REL_MULT.
+    Данные — тот же кэшированный get_bybit_orderbook (TTL=15с), что и у
+    графиков — лишнего запроса на каждый сигнал не создаёт, если график
+    уже запрашивал стакан по этой монете недавно.
+    Возвращает "" при любой проблеме (нет данных, нет подходящих заявок) —
+    остальной текст уведомления при этом не меняется и не теряется.
+    """
+    try:
+        ob = await get_bybit_orderbook(sym)
+        if not ob["bids"] and not ob["asks"]:
+            return ""
+        walls = find_nearest_large_limit_orders(ob, current_price, ALERT_WALLS_N)
+        if not walls["bids"] and not walls["asks"]:
+            return ""
+        parts = []
+        asks_sorted = sorted(walls["asks"], key=lambda w: w["price"])
+        bids_sorted = sorted(walls["bids"], key=lambda w: w["price"], reverse=True)
+        if asks_sorted:
+            asks_txt = ", ".join(
+                f"{_fmt_level_price(w['price'])} ({_fmt_usd(w['usd'])})" for w in asks_sorted
+            )
+            parts.append(f"SELL {asks_txt}")
+        if bids_sorted:
+            bids_txt = ", ".join(
+                f"{_fmt_level_price(w['price'])} ({_fmt_usd(w['usd'])})" for w in bids_sorted
+            )
+            parts.append(f"BUY {bids_txt}")
+        if not parts:
+            return ""
+        return "\n🧱 Крупные заявки: " + "  |  ".join(parts)
+    except Exception as e:
+        log.debug("format_walls_alert_line(%s): %s", sym, e)
+        return ""
 
 
 def calculate_support_resistance(
@@ -4447,6 +4490,7 @@ async def monitor():
                             # реальном срабатывании сигнала (не на каждый тик по каждой
                             # монете) — экономит запросы и не задерживает основной цикл.
                             lsr_info = await get_long_short_ratio(sym)
+                            walls_line_rev = await format_walls_alert_line(sym, price)
                             rev_text = format_reversal_alert(
                                 sym, price, max(growth, peak_growth), source, rev,
                                 duration_sec=duration,
@@ -4458,7 +4502,7 @@ async def monitor():
                                     oi_val=oi_val, oi_change_pct=oi_change_pct,
                                     funding_val=funding_val, funding_next_ts=funding_next_ts,
                                     spread_info=spread_info, lsr=lsr_info,
-                                ),
+                                ) + walls_line_rev,
                             )
                             _reversal_cooldown[sym] = now
                             _reversal_last[sym] = {"price": price, "score": rev["score"], "ts": now}
@@ -4503,6 +4547,7 @@ async def monitor():
                         extra24 = "".join(
                             f"\n{line}" for line in (funding_line24, cvd_line24, lsr_line24, spread_line24) if line
                         )
+                        extra24 += await format_walls_alert_line(sym, price)
                         p24_text = (
                             f"🌐 <b>ИЗМЕНЕНИЕ ЗА 24Ч — {p24_label}</b> (как на Bybit)\n\n"
                             f"🪙 <b>{sym}</b>  [{source}]\n"
@@ -4575,6 +4620,7 @@ async def monitor():
                 # v25.5: Long/Short Ratio — только сейчас, при реальном срабатывании
                 # обычного сигнала роста/падения (не на каждый тик по каждой монете).
                 lsr_info = await get_long_short_ratio(sym)
+                walls_line = await format_walls_alert_line(sym, price)
                 if direction == 1:
                     text = format_growth_alert(
                         sym, price, growth, rsi, macd, source,
@@ -4588,7 +4634,7 @@ async def monitor():
                             oi_val=oi_val, oi_change_pct=oi_change_pct,
                             funding_val=funding_val, funding_next_ts=funding_next_ts,
                             spread_info=spread_info, lsr=lsr_info,
-                        ),
+                        ) + walls_line,
                     )
                 else:
                     text = format_drop_alert(
@@ -4603,7 +4649,7 @@ async def monitor():
                             oi_val=oi_val, oi_change_pct=oi_change_pct,
                             funding_val=funding_val, funding_next_ts=funding_next_ts,
                             spread_info=spread_info, lsr=lsr_info,
-                        ),
+                        ) + walls_line,
                     )
 
                 _cache_set_level(sym, price, direction)
