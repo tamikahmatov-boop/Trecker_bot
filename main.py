@@ -2700,6 +2700,94 @@ def _round_number_sr_levels(lo: float, hi: float) -> list[float]:
 
 SR_MAX_LEVELS = getattr(config, "SR_MAX_LEVELS", 3)   # макс. уровней поддержки/сопротивления на графике
 
+# ================================================================
+#  v25.11: КРУПНЫЕ ЛИМИТНЫЕ ЗАЯВКИ (СТЕНЫ) В СТАКАНЕ — НА ГРАФИК
+# ================================================================
+# Показывает на графике реальные крупные лимитные заявки (bid/ask "стены")
+# из стакана Bybit (category=linear), а не расчётные уровни S/R. Данные —
+# отдельный дешёвый запрос /v5/market/orderbook с коротким кэшем (TTL
+# WALL_CACHE_TTL, по умолчанию 15с) — не нагружает Bybit на каждый тик,
+# так как вызывается только при построении графика (по сигналу/команде).
+WALL_ORDERBOOK_DEPTH = getattr(config, "WALL_ORDERBOOK_DEPTH", 200)   # глубина стакана (уровней с каждой стороны)
+WALL_TOP_N            = getattr(config, "WALL_TOP_N", 4)              # макс. "стен" с каждой стороны на графике
+WALL_MIN_USD          = getattr(config, "WALL_MIN_USD", 20_000)       # мин. объём заявки в USDT, чтобы считаться "стеной"
+WALL_MIN_REL_MULT     = getattr(config, "WALL_MIN_REL_MULT", 3.0)     # мин. во сколько раз крупнее медианной заявки в стакане
+WALL_CACHE_TTL        = getattr(config, "WALL_CACHE_TTL", 15)         # сек., кэш ответа стакана
+
+
+async def _fetch_bybit_orderbook(symbol: str, limit: int = WALL_ORDERBOOK_DEPTH) -> dict:
+    """
+    Возвращает {"bids": [(price, qty), ...], "asks": [(price, qty), ...]}
+    (список уровней стакана Bybit, category=linear). Пустые списки при
+    любой ошибке/блокировке — вызывающий код никогда не падает и просто
+    не рисует стены на графике.
+    """
+    empty = {"bids": [], "asks": []}
+    if _bybit_block_active():
+        return empty
+    try:
+        async with _get_bybit_sem():
+            async with _session.get(
+                "https://api.bybit.com/v5/market/orderbook",
+                params={"category": "linear", "symbol": symbol, "limit": str(limit)},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                status = r.status
+                raw    = await r.text()
+        if _looks_like_bybit_block(status, raw):
+            _note_bybit_block(raw)
+            return empty
+        data = json.loads(raw)
+        if data.get("retCode") == 0:
+            result = data.get("result", {}) or {}
+            bids = [(float(p), float(q)) for p, q in result.get("b", []) if float(q) > 0]
+            asks = [(float(p), float(q)) for p, q in result.get("a", []) if float(q) > 0]
+            return {"bids": bids, "asks": asks}
+    except Exception as e:
+        log.debug("Bybit orderbook %s: %s", symbol, e)
+    return empty
+
+
+async def get_bybit_orderbook(symbol: str, limit: int = WALL_ORDERBOOK_DEPTH) -> dict:
+    cache_key = f"ob:{symbol}:{limit}"
+    now       = time.time()
+    cached    = _kline_cache.get(cache_key)
+    if cached and now - cached["ts"] < WALL_CACHE_TTL:
+        return cached["data"]
+    data = await _fetch_bybit_orderbook(symbol, limit)
+    if data["bids"] or data["asks"]:
+        _kline_cache[cache_key] = {"ts": now, "data": data}
+    return data
+
+
+def find_large_limit_orders(orderbook: dict, lo: float, hi: float) -> dict:
+    """
+    Выделяет из стакана заявки, достаточно крупные, чтобы считаться
+    "стеной": одновременно (1) объём в USDT >= WALL_MIN_USD И (2) объём в
+    базовой монете превышает медианный размер заявки в стакане минимум в
+    WALL_MIN_REL_MULT раз — то есть реально выделяется на фоне остальных
+    заявок, а не просто "большая монета с высокой ценой". Возвращает не
+    более WALL_TOP_N сильнейших заявок с каждой стороны, только внутри
+    видимого диапазона цен графика [lo, hi].
+    """
+    out = {"bids": [], "asks": []}
+    for side in ("bids", "asks"):
+        levels = [(p, q) for p, q in orderbook.get(side, []) if lo <= p <= hi]
+        if not levels:
+            continue
+        qtys = sorted(q for _, q in levels)
+        mid = len(qtys) // 2
+        median_qty = qtys[mid] if len(qtys) % 2 else (qtys[mid - 1] + qtys[mid]) / 2
+        median_qty = median_qty or 1e-12
+        walls = []
+        for p, q in levels:
+            usd = p * q
+            if usd >= WALL_MIN_USD and q >= median_qty * WALL_MIN_REL_MULT:
+                walls.append({"price": p, "qty": q, "usd": usd})
+        walls.sort(key=lambda w: w["usd"], reverse=True)
+        out[side] = walls[:WALL_TOP_N]
+    return out
+
 
 def calculate_support_resistance(
     highs: list[float], lows: list[float], closes: list[float], volumes: list[float],
@@ -2877,6 +2965,7 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
         up_color, down_color = "#0ECB81", "#F6465D"
         bg_color, grid_color, txt_color = "#161A1E", "#2B3139", "#848E9C"
         sr_r_color, sr_s_color = "#FFB74D", "#4FC3F7"   # сопротивление/поддержка — не путать с красными/зелёными свечами
+        wall_bid_color, wall_ask_color = "#26E07F", "#FF5C5C"  # крупные лимитные заявки (стены стакана): bid/ask
 
         fig, ax = plt.subplots(figsize=(9, 5), dpi=130)
         fig.patch.set_facecolor(bg_color)
@@ -2899,7 +2988,8 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
         # v25.10: правый отступ под подписи цены уровней поддержки/
         # сопротивления (сами линии рисуются чуть ниже, после сетки/осей).
         margin_x = max(8, round(n * 0.14))
-        ax.set_xlim(-1, n - 1 + margin_x)
+        margin_x_left = max(6, round(n * 0.11))   # v25.11: отступ слева под подписи стен стакана
+        ax.set_xlim(-1 - margin_x_left, n - 1 + margin_x)
         pad = (hi - lo) * 0.06 or hi * 0.01 or 1.0
         ax.set_ylim(lo - pad, hi + pad)
         ax.grid(True, color=grid_color, linewidth=0.5, alpha=0.55, axis="y")
@@ -2907,6 +2997,17 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
         for spine in ax.spines.values():
             spine.set_color(grid_color)
         ax.set_xticks([])
+
+        # v25.11: крупные лимитные заявки (стены) из реального стакана Bybit —
+        # отдельный лёгкий запрос с коротким кэшем (см. get_bybit_orderbook),
+        # любая ошибка просто даёт пустые списки, график всё равно строится.
+        walls = {"bids": [], "asks": []}
+        try:
+            ob = await get_bybit_orderbook(sym)
+            if ob["bids"] or ob["asks"]:
+                walls = find_large_limit_orders(ob, lo - pad, hi + pad)
+        except Exception as e:
+            log.debug("generate_chart_png(%s) walls: %s", sym, e)
 
         # v25.10: уровни поддержки/сопротивления — горизонтальная линия на
         # всю ширину графика + подпись цены в отступе справа. Цвета
@@ -2929,6 +3030,24 @@ async def generate_chart_png(sym: str) -> Optional[bytes]:
             ax.text(label_x, p, f" S {_fmt_level_price(p)}", color=sr_s_color, fontsize=7.3,
                     ha="left", va="center", zorder=5, clip_on=False,
                     bbox=dict(boxstyle="round,pad=0.15", facecolor=bg_color, edgecolor="none", alpha=0.8))
+
+        # v25.11: рисуем стены отдельно от S/R — сплошная (не пунктирная)
+        # линия на всю ширину + подпись СЛЕВА от графика (у S/R подпись
+        # справа), чтобы визуально не путать расчётные уровни S/R с реальными
+        # крупными заявками в стакане. Толщина/прозрачность растёт вместе с
+        # объёмом заявки в USDT.
+        wall_label_x = -1 - margin_x_left * 0.22
+        max_wall_usd = max([w["usd"] for w in walls["bids"] + walls["asks"]], default=0)
+        for side, color, tag in (("bids", wall_bid_color, "🧱 BUY"), ("asks", wall_ask_color, "🧱 SELL")):
+            for w in walls[side]:
+                p = w["price"]
+                rel = (w["usd"] / max_wall_usd) if max_wall_usd else 1.0
+                lw = 1.3 + rel * 2.2
+                alpha = 0.5 + rel * 0.35
+                ax.axhline(p, color=color, linewidth=lw, alpha=min(alpha, 0.9), zorder=3.2)
+                ax.text(wall_label_x, p, f"{tag} {_fmt_usd(w['usd'])} ", color=color,
+                        fontsize=7, ha="right", va="center", zorder=5, clip_on=False,
+                        bbox=dict(boxstyle="round,pad=0.15", facecolor=bg_color, edgecolor="none", alpha=0.75))
 
         last_price = closes[-1]
         last_color = up_color if closes[-1] >= opens[0] else down_color
