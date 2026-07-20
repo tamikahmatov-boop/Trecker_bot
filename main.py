@@ -4555,7 +4555,7 @@ async def monitor():
                         )
                         extra24 += await format_walls_alert_line(sym, price)
                         p24_text = (
-                            f"🌐 <b>ИЗМЕНЕНИЕ ЗА 24Ч — {p24_label}</b> (как на Bybit)\n\n"
+                            f"🌐 <b>ИЗМЕНЕНИЕ ЗА 24Ч {sym} {pct24h_val:+.2f}% — {p24_label}</b> (как на Bybit)\n\n"
                             f"🪙 <b>{sym}</b>  [{source}]\n"
                             f"💵 Цена: <code>{price}</code>\n"
                             f"{p24_emoji} 24ч: <b>{pct24h_val:+.2f}%</b>  "
