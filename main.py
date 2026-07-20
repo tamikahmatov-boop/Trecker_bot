@@ -3817,14 +3817,17 @@ def build_extra_market_context(
     return ("\n" + "\n".join(parts)) if parts else ""
 
 
-def format_pct24h_line(pct24h: Optional[float]) -> str:
+def format_pct24h_line(pct24h: Optional[float], sym: Optional[str] = None) -> str:
     """
     v25.5: раньше эта же строка была продублирована один-в-один в
     format_growth_alert и format_drop_alert (и по смыслу в БЛОКе 1.6) —
     вынесена в общий хелпер. Возвращает строку С ведущим \\n (или '' если
     значения нет) — используется как есть внутри f-строк тех же форматов.
     """
-    return f"\n🌐 24ч: <b>{pct24h:+.2f}%</b> (Bybit)" if pct24h is not None else ""
+    if pct24h is None:
+        return ""
+    lead = f"<b>{sym} {pct24h:+.2f}%</b> " if sym else ""
+    return f"\n{lead}🌐 24ч: <b>{pct24h:+.2f}%</b> (Bybit)"
 
 
 def _fmt_macd_value(macd: Optional[float]) -> str:
@@ -3891,11 +3894,10 @@ def format_growth_alert(
         elif accel < 0.7:
             accel_s = f"\n🐢 Замедление: ×{accel:.1f}"
 
-    pct24h_s = format_pct24h_line(pct24h)
+    pct24h_s = format_pct24h_line(pct24h, sym)
 
-    head24_s = f" | 24ч: {pct24h:+.2f}%" if pct24h is not None else ""
     return (
-        f"<b>{sym} {sign}{growth:.2f}%{head24_s}</b>\n"
+        f"<b>{sym} {sign}{growth:.2f}%</b>\n"
         f"{emoji} <b>СИГНАЛ — {label.upper()}</b>\n\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
@@ -3941,11 +3943,10 @@ def format_drop_alert(
     # никогда не отражала реальную логику фильтрации.
     rsi_tf_s = format_rsi_tf_line(rsi_tf_label, rsi_tf_val, rsi_tf_level=None)
 
-    pct24h_s = format_pct24h_line(pct24h)
+    pct24h_s = format_pct24h_line(pct24h, sym)
 
-    head24_s = f" | 24ч: {pct24h:+.2f}%" if pct24h is not None else ""
     return (
-        f"<b>{sym} {growth:.2f}%{head24_s}</b>\n"
+        f"<b>{sym} {growth:.2f}%</b>\n"
         f"{emoji} <b>ПАДЕНИЕ</b>\n\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
@@ -4016,11 +4017,10 @@ def format_reversal_alert(
     candle_s  = f"\n🕯 Паттерн: <b>{candle}</b>" if candle  else ""
     vol_s     = f"\n{_esc(vol_sig)}"              if vol_sig else ""
     day_ctx_s = f"\n{day_ctx}"                    if day_ctx else ""
-    pct24h_s  = format_pct24h_line(pct24h)
+    pct24h_s  = format_pct24h_line(pct24h, sym)
 
-    head24_s = f" | 24ч: {pct24h:+.2f}%" if pct24h is not None else ""
     return (
-        f"<b>{sym} +{growth:.2f}%{head24_s}</b>\n"
+        f"<b>{sym} +{growth:.2f}%</b>\n"
         f"{hdr} <b>РАЗВОРОТ НА ШОРТ</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
