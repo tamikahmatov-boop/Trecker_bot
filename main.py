@@ -3826,8 +3826,8 @@ def format_pct24h_line(pct24h: Optional[float], sym: Optional[str] = None) -> st
     """
     if pct24h is None:
         return ""
-    lead = f"<b>{sym} {pct24h:+.2f}%</b> " if sym else ""
-    return f"\n{lead}🌐 24ч: <b>{pct24h:+.2f}%</b> (Bybit)"
+    coin_pct = f" {sym} {pct24h:+.2f}%" if sym else ""
+    return f"\n🌐 <b>ИЗМЕНЕНИЕ ЗА 24ч{coin_pct}</b>: <b>{pct24h:+.2f}%</b> (Bybit)"
 
 
 def _fmt_macd_value(macd: Optional[float]) -> str:
