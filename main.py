@@ -3894,6 +3894,7 @@ def format_growth_alert(
     pct24h_s = format_pct24h_line(pct24h)
 
     return (
+        f"<b>{sym} {sign}{growth:.2f}%</b>\n"
         f"{emoji} <b>СИГНАЛ — {label.upper()}</b>\n\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
@@ -3942,6 +3943,7 @@ def format_drop_alert(
     pct24h_s = format_pct24h_line(pct24h)
 
     return (
+        f"<b>{sym} {growth:.2f}%</b>\n"
         f"{emoji} <b>ПАДЕНИЕ</b>\n\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
         f"💵 Цена: <code>{price}</code>\n"
@@ -4015,6 +4017,7 @@ def format_reversal_alert(
     pct24h_s  = format_pct24h_line(pct24h)
 
     return (
+        f"<b>{sym} +{growth:.2f}%</b>\n"
         f"{hdr} <b>РАЗВОРОТ НА ШОРТ</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 <b>{sym}</b>  [{source}]\n"
